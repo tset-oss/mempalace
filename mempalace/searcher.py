@@ -756,6 +756,7 @@ def search_memories(
     candidate_strategy: str = "vector",
     collection_name: str = None,
     team: str = None,
+    restrict_ids: list = None,
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 

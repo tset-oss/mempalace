@@ -418,6 +418,41 @@ not just local config.
 
 ---
 
+### `mempalace_entities`
+
+*Central HTTP server only (`postgres` backend).* Navigate the team vault's
+entity index — the inverted index of which entities (people, projects,
+services) appear in which drawers, maintained incrementally as drawers are
+filed and seeded by `mempalace_kg_add`.
+
+- with `entity` → the drawers that mention it (ids + wing/room) and a count.
+  Pair with `mempalace_search(entity=...)` to retrieve the verbatim content.
+- without `entity` → the vault's most-mentioned entities, optionally scoped to a
+  `wing`. `min_count` (default 2) filters one-off extraction noise.
+
+Use it to answer "what/who do we know about X" and to find the exact entity name
+to scope a search by. On a local (`chroma`) install the entity index does not
+exist (use `mempalace mine` + search there); the tool reports `available: false`.
+
+**Parameters:**
+
+- `entity` (string, optional) — entity to look up. Omit to list top entities.
+- `wing` (string, optional) — scope the listing to one wing.
+- `min_count` (integer, optional, default 2) — listing only: minimum drawers an
+  entity must appear in. Pass 1 to see everything.
+- `limit` (integer, optional, default 50) — max entities in the listing.
+- `vault` (string, optional) — team vault to inspect (central deployments).
+
+**Returns:** with `entity` → `{ backend, vault, entity, drawer_count, drawers[], hint }`;
+without → `{ backend, vault, wing, entities[], count }`. On `chroma` →
+`{ available: false, backend, reason }`.
+
+The `entity` parameter on `mempalace_search` uses this same index to scope a
+semantic query to one entity's drawers — verbatim recall narrowed to "what we
+know about X".
+
+---
+
 ### `mempalace_switch_team`
 
 *Central HTTP server only (`mempalace serve`).* Set the active team vault for

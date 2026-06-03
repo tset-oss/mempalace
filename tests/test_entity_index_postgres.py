@@ -145,3 +145,62 @@ def test_write_path_helper_indexes_against_live_db(backend, team, monkeypatch):
     # And the delete helper clears them.
     m._unindex_drawer_entities(team, ["dX", "dY"])
     assert m._get_entity_index(team).drawers_for_entity("Zelda") == []
+
+
+def test_query_restrict_ids_prefilters_candidates(team):
+    """PostgresCollection.query(restrict_ids=...) restricts the candidate set."""
+    import hashlib
+
+    from mempalace.backends import PalaceRef
+
+    def _embed(texts):
+        out = []
+        for t in texts:
+            h = hashlib.sha256(t.encode()).digest()
+            v = [0.0] * 384
+            for i in range(32):
+                v[i] = h[i] / 255.0
+            out.append(v)
+        return out
+
+    b = PostgresBackend(dsn=_dsn(), embedder=_embed)
+    try:
+        col = b.get_collection(
+            palace=PalaceRef(id="x", namespace=team),
+            collection_name="mempalace_drawers",
+            create=True,
+        )
+        col.upsert(
+            ids=["a", "b", "c"],
+            documents=["alpha", "beta", "gamma"],
+            metadatas=[{}, {}, {}],
+        )
+        res = col.query(query_texts=["alpha"], n_results=10, restrict_ids=["a", "c"])
+        ids = set(res.ids[0])
+        assert ids <= {"a", "c"}  # 'b' excluded by the id pre-filter
+        assert "a" in ids
+    finally:
+        b.close()  # the `team` fixture drops the schema on teardown
+
+
+def test_tool_entities_lists_and_looks_up(backend, team, monkeypatch):
+    """The mempalace_entities tool reads the live per-vault index."""
+    import mempalace.mcp_server as m
+
+    monkeypatch.setenv("MEMPALACE_BACKEND", "postgres")
+    monkeypatch.setattr("mempalace.palace._resolve_backend", lambda cfg: backend)
+    monkeypatch.setattr(m, "_entity_index_by_team", {})
+    monkeypatch.setattr(m, "_resolve_team", lambda v=None: team)
+
+    m._index_drawer_entities(
+        team, ["d1", "d2"], "Dana Dana met about Ingest Ingest today.", "people", "r"
+    )
+
+    looked_up = m.tool_entities(entity="Dana")
+    assert {r["drawer_id"] for r in looked_up["drawers"]} == {"d1", "d2"}
+    assert looked_up["drawer_count"] == 2
+
+    listing = m.tool_entities()  # min_count default 2; both appear in d1 and d2
+    names = {e["entity"] for e in listing["entities"]}
+    assert "Dana" in names
+    assert "Ingest" in names

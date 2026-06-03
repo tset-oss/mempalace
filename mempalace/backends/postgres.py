@@ -454,6 +454,7 @@ class PostgresCollection(BaseCollection):
         where=None,
         where_document=None,
         include=None,
+        restrict_ids=None,
     ) -> QueryResult:
         _validate_where(where)
         if (query_texts is None) == (query_embeddings is None):
@@ -496,6 +497,13 @@ class PostgresCollection(BaseCollection):
                         if frag:
                             where_parts.append(frag)
                             params.extend(tr.params)
+                    # Optional id pre-filter (entity-scoped search): restrict the
+                    # candidate set to specific drawer ids before the vector rank,
+                    # so an entity's drawers are considered even when they are
+                    # vector-distant from the query text.
+                    if restrict_ids is not None:
+                        where_parts.append("id = ANY(%s)")
+                        params.append(list(restrict_ids))
                     wd = _where_document_clause(where_document, params)
                     if wd:
                         where_parts.append(wd)

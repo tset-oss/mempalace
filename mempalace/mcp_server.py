@@ -1195,6 +1195,7 @@ def tool_search(
     min_similarity: float = None,
     context: str = None,
     vault: str = None,
+    entity: str = None,
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
@@ -1220,6 +1221,22 @@ def tool_search(
     # stays ``None`` there (the namespace is ignored downstream anyway).
     search_team = _resolve_team(vault) if _config.backend != "chroma" else None
 
+    # Entity-scoped recall (central/postgres only): narrow the candidate set to
+    # the drawers that mention `entity` before the vector rank, so an entity's
+    # drawers are considered even when vector-distant from the query text. On
+    # chroma `entity` is ignored (no per-vault index). A known filter that
+    # matches nothing returns an empty result rather than the unscoped search.
+    restrict_ids = None
+    if entity and _config.backend != "chroma":
+        try:
+            rows = _get_entity_index(search_team).drawers_for_entity(entity)
+            restrict_ids = [r["drawer_id"] for r in rows]
+        except Exception:
+            logger.debug("entity filter resolution failed (best-effort)", exc_info=True)
+            restrict_ids = None
+        if restrict_ids == []:
+            return {"query": query, "entity": entity, "results": [], "count": 0}
+
     # Ensure the vector-disabled probe has been run via the safe
     # sqlite/pickle path before we touch chromadb. Calling _get_client()
     # here would defeat the fallback — it constructs a PersistentClient
@@ -1239,6 +1256,7 @@ def tool_search(
         vector_disabled=_vector_disabled,
         collection_name=_config.collection_name,
         team=search_team,
+        restrict_ids=restrict_ids,
     )
     if _config.backend == "chroma" and _is_transient_index_error(result):
         # Post-bulk-write HNSW flush window (#1315): drop caches, give
@@ -1344,6 +1362,57 @@ def tool_list_vaults():
         "vaults": teams,
         "hint": "Pass vault='<team>' to read/write another team's vault, or vault='all' to search across all.",
     }
+
+
+def tool_entities(
+    entity: str = None, wing: str = None, min_count: int = 2, limit: int = 50, vault: str = None
+):
+    """Navigate the per-vault entity index (central server only).
+
+    With ``entity``: the drawers that mention it (ids + wing/room) — the entry
+    point for entity-scoped recall; pair with ``mempalace_search(entity=...)``
+    for the verbatim content. Without ``entity``: the vault's most-mentioned
+    entities, scoped to ``wing`` if given. ``min_count`` (overview only, default
+    2) filters one-off extraction noise; pass 1 to see everything. On the local
+    chroma backend the entity index does not exist (use ``mempalace mine`` +
+    search there).
+    """
+    if _config.backend == "chroma":
+        return {
+            "available": False,
+            "backend": "chroma",
+            "reason": "The entity index is a central-server feature; "
+            "on local installs use mempalace mine + search.",
+        }
+    try:
+        wing = _sanitize_optional_name(wing, "wing")
+    except ValueError as e:
+        return {"error": str(e)}
+    team = _resolve_team(vault)
+    try:
+        idx = _get_entity_index(team)
+        if entity:
+            rows = idx.drawers_for_entity(entity)
+            return {
+                "backend": _config.backend,
+                "vault": team,
+                "entity": entity,
+                "drawer_count": len({r["drawer_id"] for r in rows}),
+                "drawers": rows,
+                "hint": f"Pass entity='{entity}' to mempalace_search for the verbatim content.",
+            }
+        top = idx.top_entities(
+            wing=wing, min_count=max(1, int(min_count)), limit=max(1, min(int(limit), 500))
+        )
+        return {
+            "backend": _config.backend,
+            "vault": team,
+            "wing": wing or "all",
+            "entities": top,
+            "count": len(top),
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def tool_check_duplicate(content: str, threshold: float = 0.9):
@@ -2703,10 +2772,38 @@ TOOLS = {
                     "type": "string",
                     "description": "Team vault to search (central/postgres deployments only). Omit for this machine's primary team; '<team>' for a specific team; 'all' to search every team vault. Ignored on local installs.",
                 },
+                "entity": {
+                    "type": "string",
+                    "description": "Scope recall to drawers that mention this entity (a person, project, or service) before ranking. Use when the user names a specific entity. Central/postgres deployments only; ignored on local installs.",
+                },
             },
             "required": ["query"],
         },
         "handler": tool_search,
+    },
+    "mempalace_entities": {
+        "description": "Navigate the team's entity index (central/postgres deployments only). With 'entity': the drawers mentioning it (pair with mempalace_search entity= for the verbatim text). Without 'entity': the vault's most-mentioned entities. Use to answer 'what/who do we know about X' and to find the right entity name to scope a search by.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "entity": {
+                    "type": "string",
+                    "description": "Entity to look up (person/project/service). Omit to list the vault's top entities.",
+                },
+                "wing": {"type": "string", "description": "Filter the top-entities listing to a wing (optional)"},
+                "min_count": {
+                    "type": "integer",
+                    "description": "Top-entities listing only: minimum drawers an entity must appear in (default 2, filters one-off noise). Pass 1 to see everything.",
+                },
+                "limit": {"type": "integer", "description": "Max entities in the listing (default 50)"},
+                "vault": {
+                    "type": "string",
+                    "description": "Team vault to inspect (omit for your primary; '<team>' for another team).",
+                },
+            },
+            "required": [],
+        },
+        "handler": tool_entities,
     },
     "mempalace_check_duplicate": {
         "description": "Check if content already exists in the palace before filing",
