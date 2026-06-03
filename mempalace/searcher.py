@@ -794,6 +794,10 @@ def search_memories(
               When ``max_distance > 0.0`` is also set, BM25-only candidates
               are skipped — they have no vector distance and would silently
               violate the requested distance threshold.
+        restrict_ids: Optional list of drawer ids to restrict the candidate set
+            to before ranking (entity-scoped recall). Applied to the drawer
+            floor query only; ``None`` (default) leaves search unscoped. Honored
+            by the Postgres backend; the chroma path does not set it.
     """
     # Validate the strategy eagerly so invalid values fail the same way
     # regardless of whether the call routes through the vector path or
@@ -834,6 +838,11 @@ def search_memories(
         dkwargs = {
             "query_texts": [query],
             "n_results": n_results * 3,  # over-fetch for re-ranking
+            # Entity-scoped recall: restrict the drawer-floor candidate set to
+            # these ids before the vector rank (None = unscoped; closets stay an
+            # unrestricted ranking signal). Postgres honors it; chroma accepts
+            # and ignores it (entity= is postgres-only).
+            "restrict_ids": restrict_ids,
             "include": ["documents", "metadatas", "distances"],
         }
         if where:

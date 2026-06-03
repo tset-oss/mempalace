@@ -251,3 +251,58 @@ def test_backfill_populates_and_is_idempotent(backend, team):
     # Idempotent: a second backfill does not duplicate rows.
     idx.backfill(_FakeCol(rows), extract)
     assert {r["drawer_id"] for r in idx.drawers_for_entity("Dana")} == {"d1", "d2"}
+
+
+def test_search_memories_scopes_to_restrict_ids(team, monkeypatch):
+    """Regression: search_memories must thread restrict_ids into the drawer query.
+
+    Drives searcher.search_memories against a live drawers collection and asserts
+    a drawer outside the restrict set is excluded — the seam where the entity=
+    filter was silently dropped (accepted to query, never forwarded).
+    """
+    import hashlib
+
+    import mempalace.searcher as searcher
+    from mempalace.backends import PalaceRef
+
+    def _embed(texts):
+        out = []
+        for t in texts:
+            h = hashlib.sha256(t.encode()).digest()
+            v = [0.0] * 384
+            for i in range(32):
+                v[i] = h[i] / 255.0
+            out.append(v)
+        return out
+
+    backend = PostgresBackend(dsn=_dsn(), embedder=_embed)
+    try:
+        col = backend.get_collection(
+            palace=PalaceRef(id=team, namespace=team),
+            collection_name="mempalace_drawers",
+            create=True,
+        )
+        col.upsert(
+            ids=["a", "b", "c"],
+            documents=["alpha alpha", "beta beta", "gamma gamma"],
+            metadatas=[{"wing": "w", "room": "r"}] * 3,
+        )
+        # search_memories resolves these from its own namespace.
+        monkeypatch.setattr(searcher, "get_collection", lambda *a, **k: col)
+        monkeypatch.setattr(
+            searcher,
+            "get_closets_collection",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no closets")),
+        )
+
+        scoped = searcher.search_memories(
+            "beta", palace_path="ignored", n_results=10, restrict_ids=["a", "c"]
+        )
+        texts = " ".join(r.get("text", "") for r in scoped.get("results", []))
+        assert "beta" not in texts  # 'b' is outside the restrict set -> excluded
+
+        unscoped = searcher.search_memories("beta", palace_path="ignored", n_results=10)
+        texts2 = " ".join(r.get("text", "") for r in unscoped.get("results", []))
+        assert "beta" in texts2  # control: visible without the filter
+    finally:
+        backend.close()

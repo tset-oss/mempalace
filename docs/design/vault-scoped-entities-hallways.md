@@ -117,9 +117,10 @@ AGE provisioning.
   `PostgresCollection.query` (it has id-restriction only in get/delete today).
 - **`mempalace_entities`** navigator — `entity=` returns the verbatim drawers
   mentioning it (ids + wing/room); no entity returns the vault's top entities by
-  occurrence count. **Noise-gated**: a minimum occurrence count, and once the
-  vault's `kg_entities` is non-empty, the "top entities" list is restricted to
-  the kg-seeded ∩ extracted set so curated names dominate over regex frequency.
+  occurrence count. **Noise-gated** by a minimum occurrence count (`min_count`,
+  default 2) so one-off extraction noise stays out of the overview. (A further
+  kg-seeded-intersection refinement is possible but deferred until the min-count
+  gate proves insufficient.)
 
 ### Committed caller (so the data is not inert again)
 

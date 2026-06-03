@@ -77,10 +77,6 @@ class PostgresEntityIndex:
                     )
             self._ensured = True
 
-    def close(self) -> None:
-        # Connections belong to the shared backend pool; nothing to close here.
-        return None
-
     def _invalidate_known(self) -> None:
         self._known_cache = None
 

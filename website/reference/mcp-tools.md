@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for the 31 core MCP tools. The central HTTP server
+Detailed parameter schemas for the 32 core MCP tools. The central HTTP server
 (`mempalace serve`) additionally exposes `mempalace_switch_team` for per-session
 team-vault routing (documented below).
 
@@ -58,6 +58,8 @@ Semantic search. Returns verbatim drawer content with similarity scores.
 | `limit` | integer | No | Max results (default: 5) |
 | `wing` | string | No | Filter by wing |
 | `room` | string | No | Filter by room |
+| `vault` | string | No | Team vault to search (central/postgres only): omit for your primary, `<team>` for one team, `all` to sweep every vault. Ignored on local installs. |
+| `entity` | string | No | Scope recall to drawers mentioning this entity before ranking (central/postgres only; not supported with `vault: "all"`). See `mempalace_entities`. |
 
 **Returns:** `{ query, filters, results: [{ text, wing, room, source_file, similarity }] }`
 

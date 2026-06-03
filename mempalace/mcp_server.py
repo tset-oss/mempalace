@@ -1215,6 +1215,13 @@ def tool_search(
     # vault="all"            -> search every team vault, returned per-vault.
     # vault="<team>"         -> that team's vault.
     if _config.backend != "chroma" and vault and vault.lower() == "all":
+        if entity:
+            # Entity ids are vault-local; an `entity=` filter is meaningless
+            # across all vaults. Reject rather than silently ignore it.
+            return {
+                "error": "entity= is not supported with vault='all'. Search one "
+                "vault at a time (omit vault, or set a specific team)."
+            }
         return _search_all_vaults(sanitized["clean_query"], wing, room, limit, dist)
     # Resolve the vault to search: explicit ``vault=`` > per-session active team
     # (header / switch_team) > process default. Chroma is single-vault, so team

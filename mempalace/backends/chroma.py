@@ -1091,6 +1091,10 @@ class ChromaCollection(BaseCollection):
         where=None,
         where_document=None,
         include=None,
+        # Accepted for query-contract parity with the Postgres backend. The
+        # entity= scoping that sets this is postgres-only, so it is always None
+        # here; chroma ignores it.
+        restrict_ids=None,
     ) -> QueryResult:
         _validate_where(where)
         _validate_where(where_document)
