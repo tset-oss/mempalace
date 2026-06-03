@@ -1230,6 +1230,119 @@ def cmd_team(args):
     print("\nSet with:  mempalace team set <name> [--database-url URL]")
 
 
+class _BearerAuthASGI:
+    """ASGI wrapper enforcing a shared static ``Authorization: Bearer`` token.
+
+    Wraps the FastMCP streamable-HTTP app. Only HTTP requests are gated; the
+    ``lifespan`` scope (which boots the FastMCP session manager) and any other
+    scope type pass straight through. The token is compared in constant time so
+    the check does not leak length/byte information via timing.
+    """
+
+    def __init__(self, app, token: str):
+        self._app = app
+        self._expected = f"Bearer {token}"
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            import hmac
+
+            headers = dict(scope.get("headers") or [])
+            provided = headers.get(b"authorization", b"").decode("latin-1")
+            if not hmac.compare_digest(provided, self._expected):
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 401,
+                        "headers": [
+                            (b"content-type", b"application/json"),
+                            (b"www-authenticate", b"Bearer"),
+                        ],
+                    }
+                )
+                await send(
+                    {"type": "http.response.body", "body": b'{"error":"unauthorized"}'}
+                )
+                return
+        await self._app(scope, receive, send)
+
+
+def cmd_serve(args):
+    """Run the MCP server: local stdio, or the central streamable-HTTP host.
+
+    ``mempalace serve``                              — stdio (local, default)
+    ``mempalace serve --transport streamable-http``  — central HTTP server at /mcp
+
+    ``--default-team`` seeds the process-global default vault (the bottom of the
+    per-session resolution chain: vault arg > switch_team > X-Mempalace-Team
+    header > this default). ``--auth-token`` (or ``MEMPALACE_AUTH_TOKEN``) turns
+    on shared static bearer-token auth for the HTTP transport.
+    """
+    if getattr(args, "default_team", None):
+        name = args.default_team.strip().lower()
+        if not re.fullmatch(r"[a-z0-9_]{1,40}", name):
+            print(
+                "--default-team must be 1-40 lowercase letters, digits or "
+                "underscores (e.g. frontend)."
+            )
+            return
+        # MempalaceConfig.team reads MEMPALACE_TEAM, so set it before building.
+        os.environ["MEMPALACE_TEAM"] = name
+
+    try:
+        from .mcp_fastmcp import build_server
+    except ImportError as e:
+        print(f"The 'serve' extra is required: pip install 'mempalace[serve]'  ({e})")
+        return
+
+    server = build_server()
+
+    if args.transport == "stdio":
+        print("Starting MemPalace MCP server (stdio)...", file=sys.stderr)
+        server.run(transport="stdio")
+        return
+
+    # streamable-http — the central, team-vaulted server.
+    host, port = args.host, args.port
+    token = getattr(args, "auth_token", None) or os.environ.get("MEMPALACE_AUTH_TOKEN")
+
+    server.settings.host = host
+    server.settings.port = port
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        # Only when binding beyond localhost (e.g. the central server on
+        # 0.0.0.0): the SDK's default Host allow-list permits localhost only, so
+        # it would reject LAN / reverse-proxy Host headers. Relax it here and
+        # rely on the bearer token + the org network boundary. For a localhost
+        # bind we keep the SDK's DNS-rebinding protection on.
+        try:
+            from mcp.server.transport_security import TransportSecuritySettings
+
+            server.settings.transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=False
+            )
+        except ImportError:
+            pass
+
+    cfg = MempalaceConfig()
+    print("MemPalace MCP server (transport: streamable-http)")
+    print(f"  URL:          http://{host}:{port}/mcp")
+    print(f"  backend:      {cfg.backend}")
+    print(f"  default team: {cfg.team or 'default'}")
+    print(f"  auth:         {'bearer token required' if token else 'OPEN (no token set)'}")
+    if not token:
+        print(
+            "  WARNING: no --auth-token / MEMPALACE_AUTH_TOKEN — the server is "
+            "UNAUTHENTICATED. Set a token before exposing it beyond localhost."
+        )
+
+    import uvicorn
+
+    app = server.streamable_http_app()
+    if token:
+        app = _BearerAuthASGI(app, token)
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
 def main():
     """CLI entry point for the ``mempalace`` console script.
 
@@ -1651,6 +1764,34 @@ def main():
     )
     team_sub.add_parser("list", help="List team vaults on the central server")
 
+    p_serve = sub.add_parser(
+        "serve", help="Run the MCP server (stdio, or central streamable-http)"
+    )
+    p_serve.add_argument(
+        "--transport",
+        choices=["stdio", "streamable-http"],
+        default="stdio",
+        help="stdio = local IDE (default); streamable-http = central HTTP server.",
+    )
+    p_serve.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind address for streamable-http (default: 127.0.0.1; use 0.0.0.0 to expose).",
+    )
+    p_serve.add_argument(
+        "--port", type=int, default=8080, help="Port for streamable-http (default: 8080)."
+    )
+    p_serve.add_argument(
+        "--default-team",
+        dest="default_team",
+        help="Process-global default vault (sets MEMPALACE_TEAM); the bottom of the routing chain.",
+    )
+    p_serve.add_argument(
+        "--auth-token",
+        dest="auth_token",
+        help="Shared static bearer token for streamable-http (or set MEMPALACE_AUTH_TOKEN).",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1692,6 +1833,7 @@ def main():
         "repair-status": cmd_repair_status,
         "migrate": cmd_migrate,
         "status": cmd_status,
+        "serve": cmd_serve,
     }
     dispatch[args.command](args)
 

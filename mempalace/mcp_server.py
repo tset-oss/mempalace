@@ -20,6 +20,7 @@ Tools (maintenance):
   mempalace_reconnect       — force cache invalidation and reconnect after external writes
 """
 
+import contextvars
 import os
 import sys
 
@@ -173,6 +174,72 @@ if _args.palace:
 
 _config = MempalaceConfig()
 
+# --- Per-session team-vault routing (central HTTP server) ----------------
+# The active team for the *current request*, set per-call by the FastMCP
+# server wrapper (``mcp_fastmcp``) from ``session.active_team`` (switch_team)
+# or the ``X-Mempalace-Team`` request header. Default ``None``: the stdio /
+# legacy JSON-RPC loop (:func:`main`) never sets it, so :func:`_resolve_team`
+# falls back to the process-global ``_config.team`` and every existing code
+# path behaves exactly as before. This is the only piece of per-session state
+# the tool handlers read; everything else stays process-global.
+_active_team_var: contextvars.ContextVar = contextvars.ContextVar(
+    "mempalace_active_team", default=None
+)
+
+
+# Canonical team-name rule — the single source of truth, reused by
+# mcp_fastmcp's header / switch_team validation. A team maps to the Postgres
+# schema ``team_<slug>``. This pattern is exactly the fixed-point set of
+# backends.postgres.sanitize_team (``re.sub([^a-z0-9_], "_").strip("_")``): no
+# leading/trailing underscore, ``[a-z0-9_]`` body, 1-40 chars. Matching the
+# fixed-point set (not just ``[a-z0-9_]+``) means a validated slug passes
+# sanitize_team UNCHANGED, so the vault reported to the caller, the KG cache
+# key, and "is this vault known" membership can never disagree with the schema
+# the data physically lives in. Keeping the resolver STRICT (reject, never
+# silently rewrite) is what makes that guarantee hold.
+_TEAM_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_]{0,38}[a-z0-9])?$")
+
+
+def _valid_team(value):
+    """Return *value* as a canonical team slug, or ``None`` if it is not one.
+
+    ``primary`` / ``default`` / blank mean "no override" (``None``). A value
+    outside the ``[a-z0-9_]`` slug class (e.g. a typo, a hyphen, or a stray
+    header) is rejected (``None``) rather than silently rewritten, so it falls
+    back to the configured default instead of routing to a surprise vault.
+    """
+    if not value:
+        return None
+    t = str(value).strip().lower()
+    if t in ("primary", "default") or not _TEAM_SLUG_RE.match(t):
+        return None
+    return t
+
+
+def _canonical_default_team():
+    """Canonicalise the trusted process default the way the backend would.
+
+    ``_config.team`` comes from ``--default-team`` / ``MEMPALACE_TEAM`` / config
+    (trusted), so unlike the strict-validated override paths it is normalised
+    (collapse to ``[a-z0-9_]``, cap length) to match the schema slug rather than
+    rejected.
+    """
+    raw = re.sub(r"[^a-z0-9_]+", "_", (_config.team or "default").strip().lower()).strip("_")
+    return (raw or "default")[:40]
+
+
+def _resolve_team(explicit=None):
+    """Resolve which team vault this call routes to (server-mode only).
+
+    Order, highest priority first: explicit ``vault=`` / ``team=`` argument >
+    per-session active team (``switch_team`` / ``X-Mempalace-Team`` header, via
+    :data:`_active_team_var`) > the process default (:func:`_canonical_default_team`).
+    The returned value is always a canonical ``[a-z0-9_]`` slug — identical to
+    the Postgres schema slug the backend derives from it.
+    """
+    return _valid_team(explicit) or _valid_team(_active_team_var.get()) or _canonical_default_team()
+
+
 _kg_by_path: dict[str, KnowledgeGraph] = {}
 _kg_cache_lock = threading.Lock()
 _palace_flag_given: bool = bool(_args.palace)
@@ -238,7 +305,7 @@ def _get_kg(canonical_path=None) -> KnowledgeGraph:
         from .knowledge_graph_postgres import PostgresKnowledgeGraph
         from .palace import _resolve_backend
 
-        team = _config.team or "default"
+        team = _resolve_team()
         key = f"pgkg::{team}"
         kg = _kg_by_path.get(key)
         if kg is not None:
@@ -526,9 +593,13 @@ def _get_collection(create=False, team=None):
         from .backends import CollectionNotInitializedError, PalaceNotFoundError
         from .palace import get_collection as _palace_get_collection
 
+        # Route to the call's explicit ``team`` if given, else the per-session
+        # active team (header / switch_team), else the process default. Every
+        # read/modify tool reaches its vault through this single resolution.
+        resolved_team = _resolve_team(team)
         try:
             return _palace_get_collection(
-                _config.palace_path, _config.collection_name, create=create, team=team
+                _config.palace_path, _config.collection_name, create=create, team=resolved_team
             )
         except (PalaceNotFoundError, CollectionNotInitializedError):
             return None
@@ -935,9 +1006,10 @@ def tool_search(
     # vault="<team>"         -> that team's vault.
     if _config.backend != "chroma" and vault and vault.lower() == "all":
         return _search_all_vaults(sanitized["clean_query"], wing, room, limit, dist)
-    search_team = None
-    if _config.backend != "chroma" and vault and vault.lower() not in ("primary", "default"):
-        search_team = vault.strip().lower()
+    # Resolve the vault to search: explicit ``vault=`` > per-session active team
+    # (header / switch_team) > process default. Chroma is single-vault, so team
+    # stays ``None`` there (the namespace is ignored downstream anyway).
+    search_team = _resolve_team(vault) if _config.backend != "chroma" else None
 
     # Ensure the vector-disabled probe has been run via the safe
     # sqlite/pickle path before we touch chromadb. Calling _get_client()
@@ -1007,7 +1079,7 @@ def _search_all_vaults(clean_query, wing, room, limit, dist):
         teams = backend.list_vaults() if hasattr(backend, "list_vaults") else []
     except Exception as e:
         return {"error": f"could not list vaults: {e}"}
-    primary = _config.team or "default"
+    primary = _resolve_team()
     if primary not in teams:
         teams = [primary, *teams]
     results_by_vault = {}
@@ -1051,7 +1123,7 @@ def tool_list_vaults():
         teams = backend.list_vaults() if hasattr(backend, "list_vaults") else []
     except Exception as e:
         return {"error": str(e)}
-    primary = _config.team or "default"
+    primary = _resolve_team()
     return {
         "backend": _config.backend,
         "mode": "central",
@@ -1245,7 +1317,10 @@ def tool_add_drawer(
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
-    add_team = vault.strip().lower() if (vault and _config.backend != "chroma") else None
+    # Server-mode write routing: an explicit ``vault=`` targets that team; with
+    # no vault the per-session active team (header / switch_team) is resolved
+    # inside _get_collection. Chroma is single-vault, so team stays None.
+    add_team = vault if _config.backend != "chroma" else None
     col = _get_collection(create=True, team=add_team)
     if not col:
         return _no_palace()
