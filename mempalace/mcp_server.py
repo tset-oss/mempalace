@@ -739,8 +739,19 @@ _MAX_RESULTS = 100  # upper bound for search/list limit params
 
 
 def _get_cached_metadata(col, where=None):
-    """Return cached metadata if fresh, else fetch and cache."""
+    """Return cached metadata if fresh, else fetch and cache.
+
+    The process-global cache is chroma-only on purpose. It exists to avoid
+    re-running chroma's metadata read (and, on the #1222 path, to keep the
+    segfault-prone client untouched). In server mode it would be WRONG: the
+    cache is vault-agnostic, so on the shared central server one session's
+    vault metadata could be served to another session within the TTL. Postgres
+    ``_fetch_all_metadata`` is a direct, per-vault indexed query, so bypass the
+    cache and always fetch for the collection actually passed in.
+    """
     global _metadata_cache, _metadata_cache_time
+    if _config.backend != "chroma":
+        return _fetch_all_metadata(col, where=where)
     now = time.time()
     if (
         where is None
@@ -838,6 +849,11 @@ def _tool_status_via_sqlite() -> dict:
 
 
 def tool_status():
+    # Server-mode backends (postgres) report connection health + the active
+    # team vault, not the chroma-only on-disk / HNSW / vector_disabled signals.
+    if _config.backend != "chroma":
+        return _tool_status_server()
+
     # Run the safe sqlite/pickle probe before we touch chromadb. In the
     # #1222 failure mode, opening the persistent client to call .count()
     # can segfault — short-circuit to a pure-sqlite path when divergence
@@ -854,19 +870,29 @@ def tool_status():
     col = _get_collection(create=db_exists)
     if not col:
         return _no_palace()
-    count = col.count()
+    return _status_from_collection(col)
+
+
+def _status_from_collection(col, extra=None):
+    """Build the drawers + wing/room breakdown payload from a collection.
+
+    Shared by the chroma and server-mode status paths so the count/metadata
+    aggregation can never drift between them. ``extra`` is merged in first
+    (server mode passes backend/vault/health fields).
+    """
     wings = {}
     rooms = {}
     result = {
-        "total_drawers": count,
+        "total_drawers": col.count(),
         "wings": wings,
         "rooms": rooms,
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
     }
+    if extra:
+        result.update(extra)
     try:
-        all_meta = _get_cached_metadata(col)
-        for m in all_meta:
+        for m in _get_cached_metadata(col):
             m = m or {}
             w = m.get("wing", "unknown")
             r = m.get("room", "unknown")
@@ -877,6 +903,49 @@ def tool_status():
         result["error"] = str(e)
         result["partial"] = True
     return result
+
+
+def _tool_status_server():
+    """Status for server-mode backends (postgres): PG health + active vault.
+
+    Reports the backend connection health and the resolved team vault (and the
+    available vaults), then the usual drawer/wing/room breakdown for the active
+    vault. Deliberately skips the chroma-only signals — on-disk ``chroma.sqlite3``,
+    the ``vector_disabled`` HNSW probe, and HNSW capacity — none of which apply
+    to the central server.
+    """
+    from .palace import _resolve_backend
+
+    backend = _resolve_backend(_config)
+    result = {"backend": _config.backend, "vault": _resolve_team()}
+
+    try:
+        health = backend.health()
+        result["healthy"] = health.ok
+        if health.detail:
+            result["health_detail"] = health.detail
+    except Exception as e:
+        result["healthy"] = False
+        result["health_detail"] = str(e)
+
+    if not result.get("healthy"):
+        # Server unreachable — return health without probing collections.
+        result["protocol"] = PALACE_PROTOCOL
+        result["aaak_dialect"] = AAAK_SPEC
+        return result
+
+    try:
+        result["vaults"] = backend.list_vaults() if hasattr(backend, "list_vaults") else []
+    except Exception as e:
+        result["vaults_error"] = str(e)
+
+    col = _get_collection()
+    if col is None:
+        result["total_drawers"] = 0
+        result["protocol"] = PALACE_PROTOCOL
+        result["aaak_dialect"] = AAAK_SPEC
+        return result
+    return _status_from_collection(col, extra=result)
 
 
 # ── AAAK Dialect Spec ─────────────────────────────────────────────────────────
@@ -1015,7 +1084,11 @@ def tool_search(
     # sqlite/pickle path before we touch chromadb. Calling _get_client()
     # here would defeat the fallback — it constructs a PersistentClient
     # which can segfault on segment load in the #1222 failure mode.
-    _refresh_vector_disabled_flag()
+    # Server-mode backends (postgres) have no on-disk HNSW index, so the probe
+    # is chroma-only — skipped here (``_vector_disabled`` stays False, i.e.
+    # pgvector search stays enabled).
+    if _config.backend == "chroma":
+        _refresh_vector_disabled_flag()
     result = search_memories(
         sanitized["clean_query"],
         palace_path=_config.palace_path,
@@ -1027,7 +1100,7 @@ def tool_search(
         collection_name=_config.collection_name,
         team=search_team,
     )
-    if _is_transient_index_error(result):
+    if _config.backend == "chroma" and _is_transient_index_error(result):
         # Post-bulk-write HNSW flush window (#1315): drop caches, give
         # the segment a moment to settle, retry once. Caller never sees
         # the transient unless the second attempt also fails.
@@ -2073,7 +2146,12 @@ def tool_reconnect():
     Use after external scripts or CLI commands modify the palace database
     or replace ``knowledge_graph.sqlite3`` directly, which can leave the
     in-memory HNSW index stale or pin a closed-on-disk SQLite connection.
+
+    Server-mode backends (postgres) reconnect the connection pool and drain the
+    cached KnowledgeGraph handles instead of resetting chroma client caches.
     """
+    if _config.backend != "chroma":
+        return _tool_reconnect_server()
     global \
         _client_cache, \
         _collection_cache, \
@@ -2153,6 +2231,59 @@ def tool_reconnect():
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def _tool_reconnect_server():
+    """Reconnect a server-mode backend (postgres): drop the pool + KG cache.
+
+    The chroma path resets on-disk client/HNSW caches; centrally there is no
+    such state. Instead we close the connection pool (the next call lazily
+    re-opens it) and drain the cached KnowledgeGraph handles (they share the
+    pool, so their close() is a no-op — clearing the cache forces a rebuild
+    against the fresh pool), then report PG health + the active vault.
+    """
+    from .palace import _resolve_backend
+
+    backend = _resolve_backend(_config)
+    errors = []
+    try:
+        if hasattr(backend, "reconnect"):
+            backend.reconnect()
+        elif hasattr(backend, "close"):
+            backend.close()
+    except Exception as exc:
+        logger.debug("postgres pool reconnect failed", exc_info=True)
+        errors.append(f"pool reconnect failed: {exc}")
+
+    with _kg_cache_lock:
+        for kg in _kg_by_path.values():
+            try:
+                kg.close()
+            except Exception:
+                pass
+        _kg_by_path.clear()
+
+    result = {"success": not errors, "backend": _config.backend, "vault": _resolve_team()}
+    try:
+        health = backend.health()
+        result["healthy"] = health.ok
+        if health.detail:
+            result["health_detail"] = health.detail
+        if not health.ok:
+            result["success"] = False
+        col = _get_collection()
+        result["drawers"] = col.count() if col is not None else 0
+        result["message"] = (
+            "Reconnected to central server"
+            if result["success"]
+            else "Reconnect completed with errors"
+        )
+    except Exception as exc:
+        result["success"] = False
+        errors.append(str(exc))
+    if errors:
+        result["error"] = "; ".join(errors)
+    return result
 
 
 # ==================== MCP PROTOCOL ====================

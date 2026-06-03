@@ -820,6 +820,24 @@ class PostgresBackend(BaseBackend):
                 self._pool_obj = None
             self._closed = True
 
+    def reconnect(self) -> None:
+        """Drop the current pool so the next operation opens a fresh one.
+
+        Unlike :meth:`close`, the backend stays usable — this is the analog of
+        the chroma client-cache reset used by ``mempalace_reconnect`` after an
+        external change. The next ``_pool()`` call lazily re-opens against the
+        current DSN; ``_ensured`` is cleared so table DDL is re-checked (the
+        DDL is ``IF NOT EXISTS``, so re-checking is harmless).
+        """
+        with self._lock:
+            if self._pool_obj is not None:
+                try:
+                    self._pool_obj.close()
+                except Exception:
+                    logger.exception("error closing postgres pool during reconnect")
+                self._pool_obj = None
+            self._ensured = set()
+
     def health(self, palace: Optional[PalaceRef] = None) -> HealthStatus:
         if self._closed:
             return HealthStatus.unhealthy("backend closed")
