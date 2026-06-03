@@ -143,6 +143,40 @@ mempalace mcp
 mempalace mcp --palace ~/.custom-palace
 ```
 
+## `mempalace serve`
+
+Run the MCP server. Defaults to **stdio** (a local install); `--transport streamable-http` runs the **central HTTP server** at `/mcp` that engineers' Claude Code connects to.
+
+```bash
+mempalace serve                                   # stdio (local)
+mempalace serve --transport streamable-http \     # central server
+  --host 0.0.0.0 --port 8080 \
+  --default-team default --auth-token "$MEMPALACE_AUTH_TOKEN"
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--transport` | `stdio` | `stdio` (local IDE) or `streamable-http` (central HTTP server) |
+| `--host` | `127.0.0.1` | Bind address for streamable-http; use `0.0.0.0` to expose |
+| `--port` | `8080` | Port for streamable-http |
+| `--default-team` | `default` | Process-global default vault (sets `MEMPALACE_TEAM`); the bottom of the routing chain below the `X-Mempalace-Team` header |
+| `--auth-token` | _(none)_ | Shared static bearer token (or `MEMPALACE_AUTH_TOKEN`); when set, HTTP requests must send `Authorization: Bearer <token>` |
+
+Team routing is per session: a client's `X-Mempalace-Team` header seeds its default vault, `mempalace_switch_team` overrides it at runtime, and a tool's `vault` parameter overrides one call. See [deploy/README.md](https://github.com/MemPalace/mempalace/blob/main/deploy/README.md) for the full central deployment.
+
+## `mempalace team`
+
+Show or set this machine's primary team vault for central (postgres) mode.
+
+```bash
+mempalace team                       # show backend / primary team / db
+mempalace team set frontend \        # point this machine at a team vault
+  --database-url postgresql://mempalace:mempalace@DB_HOST:5432/mempalace
+mempalace team list                  # list team vaults on the central server
+```
+
+`set` writes `~/.mempalace/config.json` (`backend=postgres`, `team`, optional `database_url`). Team names are lowercase `[a-z0-9_]`. This is the per-machine default the local fork uses; the central HTTP server instead takes the team from each client's `X-Mempalace-Team` header.
+
 ## `mempalace hook`
 
 Run hook logic for Claude Code / Codex integration.

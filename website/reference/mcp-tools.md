@@ -1,6 +1,8 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 30 MCP tools.
+Detailed parameter schemas for the 31 core MCP tools. The central HTTP server
+(`mempalace serve`) additionally exposes `mempalace_switch_team` for per-session
+team-vault routing (documented below).
 
 ## Palace — Read Tools
 
@@ -409,3 +411,31 @@ Team-vault routing is also exposed through a `vault` parameter on `mempalace_sea
 **Parameters:** None
 
 **Returns:** `{ backend, mode, primary, vaults[, hint] }`
+
+On the central HTTP server the reported `primary` is the session's active vault
+(the `X-Mempalace-Team` header, or whatever `mempalace_switch_team` last set),
+not just local config.
+
+---
+
+### `mempalace_switch_team`
+
+*Central HTTP server only (`mempalace serve`).* Set the active team vault for
+the current session — all subsequent reads and writes route to it until you
+switch again. Mirrors the primary shown by `mempalace_list_vaults`. Call with no
+team (or `"default"`) to reset to the configured default (the `X-Mempalace-Team`
+request header / the server default).
+
+The session's default vault is normally seeded by the `X-Mempalace-Team` header
+set in the MCP client config (user scope = a machine's default, project scope =
+a repo's default); `switch_team` is the runtime override. To read across every
+vault use `vault: "all"` on `mempalace_search`; to target a single call use that
+call's `vault` parameter.
+
+**Parameters:**
+
+- `team` (string, optional) — the team vault to activate, e.g. `frontend`.
+  Lowercase `[a-z0-9_]`, 1–40 chars, no leading/trailing underscore. Omitted or
+  `"default"`/`"primary"` resets to the configured default.
+
+**Returns:** `{ ok, active_team[, note] }` (on a rejected name: `{ ok: false, error }`)

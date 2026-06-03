@@ -153,32 +153,44 @@ Usage and tool reference:
 
 31 MCP tools cover palace reads/writes, knowledge-graph operations,
 cross-wing navigation, drawer management, agent diaries, and team-vault
-listing. Installation and the full tool list:
+listing (the central HTTP server adds `switch_team`). Installation and the full tool list:
 [mempalaceofficial.com/reference/mcp-tools](https://mempalaceofficial.com/reference/mcp-tools.html).
 
 ## Central, team vaults (PostgreSQL)
 
 MemPalace is local-first by default (ChromaDB on your machine). For an internal
-engineering org it can also run **centrally** on a single PostgreSQL instance,
-with one **vault per team** (`frontend`, `backend`, …). Each machine sets its
-primary team locally so Claude Code files and recalls into that team's vault —
-no authentication, internal network only.
+engineering org it can also run **centrally**: a single PostgreSQL instance
+(pgvector + ParadeDB `pg_search` + Apache AGE) fronted by an **HTTP MCP server**
+that every engineer's Claude Code connects to, with one **vault per team**
+(`frontend`, `backend`, …). The fork runs on one host; everyone else is a thin
+HTTP MCP client.
 
 ```bash
-# One-time, on the central host (PG 18 + pgvector + pg_search + Apache AGE):
-cd deploy && docker compose up -d --build
+# One-time, on the central host — brings up Postgres + the MCP server:
+cd deploy && cp .env.example .env      # set MEMPALACE_AUTH_TOKEN
+docker compose up -d --build           # serves the MCP endpoint at :8080/mcp
 
-# Per engineer:
-pip install "mempalace[postgres]"
-mempalace team set frontend --database-url postgresql://mempalace:mempalace@DB_HOST:5432/mempalace
+# Per engineer — just wire Claude Code to the server (no install):
+claude mcp add --transport http --scope user mempalace https://mempalace.internal/mcp \
+  --header "Authorization: Bearer <shared-token>" \
+  --header "X-Mempalace-Team: frontend"
 ```
 
 The Postgres backend stores vectors in `pgvector` (HNSW cosine), keyword/BM25
 candidates in ParadeDB `pg_search`, and the temporal knowledge graph in
 per-team tables (with Apache AGE provisioned for graph traversal). Team vaults
 are isolated as Postgres schemas (`team_<name>`) and created lazily on first
-write. Search/file another team with the `vault` parameter; `mempalace_list_vaults`
-discovers what exists. Full setup and operations: [deploy/README.md](deploy/README.md).
+write.
+
+**Team routing** resolves per session: the `X-Mempalace-Team` header seeds the
+default vault (user scope = a machine's default, project scope = a repo's
+committed default); `mempalace_switch_team` overrides it for the session; a
+`vault` parameter overrides one call; `vault: "all"` reads across every team.
+The HTTP server is gated by a **shared static bearer token** (internal network
+only). `mempalace serve` also runs over stdio for a local install.
+
+Full setup and operations: [deploy/README.md](deploy/README.md). Client wiring
+for the org: `~/tset/agent-commons/docs/mcp/mempalace.md`.
 
 ## Agents
 
