@@ -197,14 +197,13 @@ def _check_kg_contradictions(text: str, palace_path: str) -> list:
         return []
 
     try:
-        from .knowledge_graph import KnowledgeGraph
+        from .kg_factory import get_knowledge_graph
 
-        # KG lives alongside the palace collection; mcp_server uses the
-        # same convention (see _kg init). Pass ``db_path`` — the previous
-        # code passed a nonexistent ``palace_path`` kwarg which raised
-        # TypeError, silently swallowed by the outer except and rendered
-        # the entire KG-check path dead.
-        kg = KnowledgeGraph(db_path=os.path.join(palace_path, "knowledge_graph.sqlite3"))
+        # Backend-aware: reads the SQLite KG alongside the palace for the local
+        # chroma backend, or the central team-vault KG (PostgresKnowledgeGraph)
+        # in server mode — so fact-checking sees the same graph the MCP tools
+        # write to rather than a stale empty local file.
+        kg = get_knowledge_graph(palace_path=palace_path)
     except Exception:
         # KG unavailable (brand-new palace, corrupted DB, etc.) — skip.
         return []
