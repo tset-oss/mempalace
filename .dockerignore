@@ -1,0 +1,17 @@
+# Build context trim for deploy/server/Dockerfile (compose builds from repo root).
+# The wheel only packages the `mempalace/` dir (see pyproject hatch config), so
+# everything below is safe to exclude — it keeps the context small and, for
+# deploy/, avoids shipping a local .env (and its bearer token) into the image.
+.git
+.venv
+**/__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.mypy_cache
+htmlcov
+*.egg-info
+.omc
+deploy
+tests
+benchmarks

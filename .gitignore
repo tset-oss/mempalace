@@ -13,6 +13,9 @@ mempal.yaml
 # Environment
 .env
 .env.*
+# ...but the deploy template IS version-controlled (it carries only placeholders
+# and the `cp .env.example .env` deploy step depends on it being in the repo).
+!deploy/.env.example
 
 # OS
 .DS_Store

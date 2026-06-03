@@ -1,9 +1,14 @@
-# Central MemPalace PostgreSQL — pgvector + pg_search (BM25) + Apache AGE.
+# Central MemPalace — PostgreSQL (pgvector + pg_search BM25 + Apache AGE) plus
+# the HTTP MCP server (FastMCP, streamable-http) that engineers' Claude Code
+# connects to.
 #
-#   cd deploy && docker compose up -d --build
+#   cd deploy && cp .env.example .env   # then set MEMPALACE_AUTH_TOKEN
+#   docker compose up -d --build
 #
-# Internal/engineering use only: credentials are static and there is no auth
-# layer beyond Postgres itself. Do not expose port 5432 to the public internet.
+# Internal/engineering use only. Postgres has no auth beyond its static
+# credentials — do not expose port 5432 publicly. The MCP server (port 8080) is
+# gated by a shared bearer token (MEMPALACE_AUTH_TOKEN); keep it behind the org
+# network / a TLS-terminating reverse proxy before exposing it.
 services:
   db:
     build:
@@ -34,6 +39,30 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # HTTP MCP server (FastMCP, streamable-http) — what each engineer's Claude
+  # Code connects to. Backed by the `db` service; gated by a shared bearer token.
+  mcp:
+    build:
+      context: ..
+      dockerfile: deploy/server/Dockerfile
+    image: mempalace-mcp:latest
+    container_name: mempalace-mcp
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      MEMPALACE_BACKEND: postgres
+      # Reach the db service over the compose network (not localhost).
+      MEMPALACE_DATABASE_URL: postgresql://mempalace:mempalace@db:5432/mempalace  # pragma: allowlist secret
+      # Centralise the write-ahead audit log alongside the data.
+      MEMPALACE_WAL_SINK: postgres
+      # Shared static bearer token — REQUIRED. `?err` fails the up if unset, so
+      # the server is never started unauthenticated by accident. Set it in .env.
+      MEMPALACE_AUTH_TOKEN: ${MEMPALACE_AUTH_TOKEN:?set MEMPALACE_AUTH_TOKEN in deploy/.env}
+    restart: unless-stopped
 
 volumes:
   mempalace_pgdata:
