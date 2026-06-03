@@ -177,6 +177,18 @@ mempalace team list                  # list team vaults on the central server
 
 `set` writes `~/.mempalace/config.json` (`backend=postgres`, `team`, optional `database_url`). Team names are lowercase `[a-z0-9_]`. This is the per-machine default the local fork uses; the central HTTP server instead takes the team from each client's `X-Mempalace-Team` header.
 
+## `mempalace reindex-entities`
+
+Backfill the per-vault entity index from drawers already filed (central postgres mode only). New writes index entities incrementally; this one-time operator command populates the index for drawers that predate the feature. Idempotent — safe to re-run.
+
+```bash
+mempalace reindex-entities                  # this machine's configured team
+mempalace reindex-entities --vault backend  # a specific team vault
+mempalace reindex-entities --all-vaults     # every vault on the server
+```
+
+Run it once per vault after upgrading a server that already holds memories, e.g. inside the deploy container: `docker compose exec mcp mempalace reindex-entities --all-vaults`. The index then powers `mempalace_entities` and the `entity=` filter on `mempalace_search` (see [MCP tools](mcp-tools.md)).
+
 ## `mempalace hook`
 
 Run hook logic for Claude Code / Codex integration.
