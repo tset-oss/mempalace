@@ -412,3 +412,38 @@ def test_bootstrap_first_call_does_not_deadlock():
     assert finished, "get_collection as first op deadlocked (bootstrap re-entered pool lock)"
     assert "err" not in box, f"unexpected error: {box.get('err')}"
     assert box["count"] == 0
+
+
+def test_wal_append_round_trip(backend):
+    """Live: wal_append auto-creates the audit table and stores a jsonb entry."""
+    op = "wal_test_" + uuid.uuid4().hex[:8]
+    backend.wal_append(
+        timestamp="2026-06-03T12:00:00+00:00",
+        operation=op,
+        team="frontend",
+        params={"content": "[REDACTED 5 chars]", "wing": "w"},
+        result={"ok": True},
+    )
+    try:
+        with psycopg.connect(_dsn()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT operation, team, params, result "
+                    "FROM mempalace_audit.write_log WHERE operation = %s",
+                    (op,),
+                )
+                row = cur.fetchone()
+        assert row is not None, "wal_append row not found"
+        assert row[0] == op
+        assert row[1] == "frontend"  # team column
+        # jsonb columns round-trip to dicts; redaction is intact.
+        assert row[2]["content"] == "[REDACTED 5 chars]"
+        assert row[2]["wing"] == "w"
+        assert row[3] == {"ok": True}
+    finally:
+        with psycopg.connect(_dsn()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM mempalace_audit.write_log WHERE operation = %s", (op,)
+                )
+            conn.commit()

@@ -161,6 +161,181 @@ def test_metadata_cache_bypassed_in_server_mode(pg_env):
     assert m._metadata_cache == [{"wing": "OTHER_VAULT"}]
 
 
+def test_wal_sink_config_validation(monkeypatch):
+    from mempalace.config import MempalaceConfig
+
+    cfg = MempalaceConfig()
+    monkeypatch.setenv("MEMPALACE_WAL_SINK", "postgres")
+    assert cfg.wal_sink == "postgres"
+    monkeypatch.setenv("MEMPALACE_WAL_SINK", "POSTGRES")  # case-insensitive
+    assert cfg.wal_sink == "postgres"
+    monkeypatch.setenv("MEMPALACE_WAL_SINK", "garbage")
+    assert cfg.wal_sink == "jsonl"  # unrecognised -> safe default
+
+
+def test_wal_log_routes_to_postgres_sink_with_redaction_and_team(pg_env):
+    monkeypatch = pg_env
+    monkeypatch.setenv("MEMPALACE_WAL_SINK", "postgres")
+
+    calls = []
+
+    class _SinkBackend:
+        def wal_append(self, **kw):
+            calls.append(kw)
+
+    monkeypatch.setattr("mempalace.palace._resolve_backend", lambda cfg: _SinkBackend())
+    jsonl_writes = []
+    monkeypatch.setattr(m, "_wal_log_jsonl", lambda entry: jsonl_writes.append(entry))
+
+    m._wal_log("add_drawer", {"content": "secret note", "wing": "w"})
+
+    assert len(calls) == 1
+    kw = calls[0]
+    assert kw["operation"] == "add_drawer"
+    assert kw["team"] == "frontend"  # the active vault (pg_env default)
+    # Redaction is applied before the sink sees it.
+    assert kw["params"]["content"].startswith("[REDACTED")
+    assert kw["params"]["wing"] == "w"
+    # On success it does NOT also write the local jsonl file.
+    assert jsonl_writes == []
+
+
+def test_wal_log_falls_back_to_jsonl_when_pg_sink_fails(pg_env):
+    monkeypatch = pg_env
+    monkeypatch.setenv("MEMPALACE_WAL_SINK", "postgres")
+
+    class _FailingBackend:
+        def wal_append(self, **kw):
+            raise RuntimeError("database unreachable")
+
+    monkeypatch.setattr("mempalace.palace._resolve_backend", lambda cfg: _FailingBackend())
+    jsonl_writes = []
+    monkeypatch.setattr(m, "_wal_log_jsonl", lambda entry: jsonl_writes.append(entry))
+
+    m._wal_log("delete_drawer", {"drawer_id": "d1"})
+
+    # The audit entry is never dropped — it lands in the local jsonl fallback.
+    assert len(jsonl_writes) == 1
+    assert jsonl_writes[0]["operation"] == "delete_drawer"
+    assert jsonl_writes[0]["team"] == "frontend"
+
+
+def test_wal_log_jsonl_default_for_chroma_records_no_team(monkeypatch, tmp_path):
+    monkeypatch.setenv("MEMPALACE_BACKEND", "chroma")
+    monkeypatch.delenv("MEMPALACE_WAL_SINK", raising=False)
+    wal_file = tmp_path / "write_log.jsonl"
+    monkeypatch.setattr(m, "_WAL_FILE", wal_file)
+
+    m._wal_log("add_drawer", {"content": "hi", "safe": "ok"})
+
+    import json
+
+    entry = json.loads(wal_file.read_text().strip())
+    assert entry["operation"] == "add_drawer"
+    assert entry["team"] is None  # chroma is single-vault
+    assert entry["params"]["content"].startswith("[REDACTED")
+    assert entry["params"]["safe"] == "ok"
+
+
+def test_wal_log_redacts_result_not_just_params(pg_env):
+    # result now crosses into central storage, so it gets the same redaction.
+    monkeypatch = pg_env
+    monkeypatch.setenv("MEMPALACE_WAL_SINK", "postgres")
+    calls = []
+
+    class _SinkBackend:
+        def wal_append(self, **kw):
+            calls.append(kw)
+
+    monkeypatch.setattr("mempalace.palace._resolve_backend", lambda cfg: _SinkBackend())
+    m._wal_log("op", {"safe": "x"}, result={"content": "should be redacted", "ok": True})
+
+    kw = calls[0]
+    assert kw["result"]["content"].startswith("[REDACTED")
+    assert kw["result"]["ok"] is True
+
+
+def test_add_drawer_audits_the_vault_it_actually_targeted(pg_env):
+    # The cross-vault case: session/default is 'frontend', but the write targets
+    # vault='backend'. The audit row MUST record 'backend' (where the data lands),
+    # not the session default.
+    monkeypatch = pg_env
+    captured = {}
+
+    def _spy_wal(operation, params, result=None, team=None):
+        captured["operation"] = operation
+        captured["team"] = team
+
+    monkeypatch.setattr(m, "_wal_log", _spy_wal)
+
+    class _ExistingResult:
+        ids = ["drawer_x"]  # idempotency hit -> add_drawer returns right after WAL
+
+    class _Col:
+        def get(self, ids=None, include=None):
+            return _ExistingResult()
+
+        def count(self):
+            return 1
+
+    monkeypatch.setattr(m, "_get_collection", lambda *a, **k: _Col())
+
+    m.tool_add_drawer("wing", "room", "some verbatim content", vault="backend")
+    assert captured["operation"] == "add_drawer"
+    assert captured["team"] == "backend"
+
+
+def test_postgres_wal_append_ensures_table_once_and_inserts_redacted():
+    # No DB needed: stub _conn() so we can inspect the SQL/params wal_append runs.
+    from mempalace.backends.postgres import PostgresBackend, _WAL_AUDIT_TABLE
+
+    backend = PostgresBackend(dsn="postgresql://unused/never-opened")
+    executed = []
+
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            executed.append((sql, params))
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def cursor(self):
+            return _Cur()
+
+    backend._conn = lambda: _Conn()
+
+    backend.wal_append(
+        timestamp="2026-06-03T00:00:00",
+        operation="add_drawer",
+        team="frontend",
+        params={"content": "[REDACTED 5 chars]", "wing": "w"},
+        result=None,
+    )
+    sqls = " ".join(s for s, _ in executed)
+    assert "CREATE SCHEMA IF NOT EXISTS" in sqls
+    assert _WAL_AUDIT_TABLE in sqls
+    insert = next(e for e in executed if e[0].lstrip().startswith("INSERT"))
+    params = insert[1]
+    assert params[1] == "add_drawer"
+    assert params[2] == "frontend"
+    assert "[REDACTED 5 chars]" in params[3]  # params jsonb payload
+
+    # Second append must NOT re-run the DDL (the _wal_ready guard).
+    executed.clear()
+    backend.wal_append(timestamp="t", operation="op", team=None, params={}, result=None)
+    assert not any("CREATE SCHEMA" in s for s, _ in executed)
+
+
 def test_postgres_backend_reconnect_drops_pool_but_stays_usable():
     # No DB / psycopg needed: reconnect() only manipulates the cached pool ref.
     from mempalace.backends.postgres import PostgresBackend

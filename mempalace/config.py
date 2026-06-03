@@ -366,6 +366,20 @@ class MempalaceConfig:
         return os.environ.get("MEMPALACE_DATABASE_URL") or self._file_config.get("database_url")
 
     @property
+    def wal_sink(self):
+        """Where the write-ahead audit log is written: ``jsonl`` or ``postgres``.
+
+        ``MEMPALACE_WAL_SINK`` env > config file > ``jsonl`` (the default). With
+        ``postgres`` the redacted audit entries go to a central table (with a
+        team column) on the server-mode backend; the local jsonl file stays the
+        default and the fallback when a database write fails. Any unrecognised
+        value is treated as ``jsonl``.
+        """
+        env_val = os.environ.get("MEMPALACE_WAL_SINK")
+        raw = str(env_val or self._file_config.get("wal_sink") or "jsonl").strip().lower()
+        return raw if raw in ("jsonl", "postgres") else "jsonl"
+
+    @property
     def people_map(self):
         """Mapping of name variants to canonical names."""
         if self._people_map_file.exists():

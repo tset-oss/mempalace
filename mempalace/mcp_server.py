@@ -495,21 +495,88 @@ _WAL_REDACT_KEYS = frozenset(
 )
 
 
-def _wal_log(operation: str, params: dict, result: dict = None):
-    """Append a write operation to the write-ahead log."""
-    # Redact sensitive content from params before logging
-    safe_params = {}
-    for k, v in params.items():
+def _redact_wal_dict(d):
+    """Key-based redaction for a WAL payload dict (params or result).
+
+    Applied to both ``params`` and ``result`` because the postgres sink ships
+    them to central, org-wide storage — the same redaction discipline the local
+    jsonl file gets. Non-dict values (e.g. ``result=None``) pass through.
+    """
+    if not isinstance(d, dict):
+        return d
+    safe = {}
+    for k, v in d.items():
         if k in _WAL_REDACT_KEYS:
-            safe_params[k] = f"[REDACTED {len(v)} chars]" if isinstance(v, str) else "[REDACTED]"
+            safe[k] = f"[REDACTED {len(v)} chars]" if isinstance(v, str) else "[REDACTED]"
         else:
-            safe_params[k] = v
+            safe[k] = v
+    return safe
+
+
+_wal_sink_unavailable_warned = False
+
+
+def _wal_log(operation: str, params: dict, result: dict = None, team=None):
+    """Append a write operation to the write-ahead audit log.
+
+    Redaction happens here, once, so it is preserved regardless of sink. With
+    ``MEMPALACE_WAL_SINK=postgres`` the redacted entry goes to the central audit
+    table (tagged with the team vault the write targeted); the local jsonl file
+    is the default and the fallback if the database write fails — the audit
+    trail is never silently dropped.
+
+    ``team`` is the vault the write actually targeted. Callers that route to a
+    non-default vault (``tool_add_drawer(vault=...)``) MUST pass the same value
+    they routed the write with, so the audit row matches where the data landed.
+    When omitted it resolves to the session/default vault — correct for the
+    write tools that take no explicit vault.
+    """
+    global _wal_sink_unavailable_warned
+    safe_params = _redact_wal_dict(params)
+    safe_result = _redact_wal_dict(result)
+    ts = datetime.now()
+    # The vault the write targeted (None on the local single-vault chroma backend).
+    if team is None and _config.backend != "chroma":
+        team = _resolve_team()
     entry = {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": ts.isoformat(),
         "operation": operation,
+        "team": team,
         "params": safe_params,
-        "result": result,
+        "result": safe_result,
     }
+
+    if _config.wal_sink == "postgres":
+        try:
+            from .palace import _resolve_backend
+
+            backend = _resolve_backend(_config)
+            if hasattr(backend, "wal_append"):
+                backend.wal_append(
+                    timestamp=ts,
+                    operation=operation,
+                    team=team,
+                    params=safe_params,
+                    result=safe_result,
+                )
+                return
+            # wal_sink=postgres but the active backend has no central sink (e.g.
+            # chroma): fall through to jsonl, but warn once so the operator knows
+            # the audit trail is local-only, not centralized as configured.
+            if not _wal_sink_unavailable_warned:
+                logger.warning(
+                    "MEMPALACE_WAL_SINK=postgres but backend %r has no central audit "
+                    "sink — writing the audit log to the local jsonl file instead.",
+                    _config.backend,
+                )
+                _wal_sink_unavailable_warned = True
+        except Exception as e:
+            logger.error("WAL postgres sink failed, falling back to jsonl: %s", e)
+    _wal_log_jsonl(entry)
+
+
+def _wal_log_jsonl(entry: dict) -> None:
+    """Append one audit entry to the local append-only jsonl file (0600)."""
     try:
         fd = os.open(str(_WAL_FILE), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
@@ -1390,10 +1457,11 @@ def tool_add_drawer(
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
-    # Server-mode write routing: an explicit ``vault=`` targets that team; with
-    # no vault the per-session active team (header / switch_team) is resolved
-    # inside _get_collection. Chroma is single-vault, so team stays None.
-    add_team = vault if _config.backend != "chroma" else None
+    # Server-mode write routing: an explicit ``vault=`` targets that team, else
+    # the per-session active team (header / switch_team). Resolve ONCE so the
+    # collection write and the WAL audit row agree on the target vault. Chroma
+    # is single-vault, so team stays None.
+    add_team = _resolve_team(vault) if _config.backend != "chroma" else None
     col = _get_collection(create=True, team=add_team)
     if not col:
         return _no_palace()
@@ -1412,6 +1480,7 @@ def tool_add_drawer(
             "content_length": len(content),
             "content_preview": content[:200],
         },
+        team=add_team,
     )
 
     chunk_size = _config.chunk_size

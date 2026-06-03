@@ -122,6 +122,14 @@ def team_schema(namespace: Optional[str]) -> str:
     return f"team_{sanitize_team(namespace)}"
 
 
+# Central write-ahead audit log (G004). One table for the whole org; the per-row
+# ``team`` column records which vault each write targeted. Kept in its own schema
+# (not a ``team_<slug>`` vault schema) so the audit trail is queryable across all
+# teams from one place.
+_WAL_AUDIT_SCHEMA = "mempalace_audit"
+_WAL_AUDIT_TABLE = "write_log"
+
+
 def _qi(ident: str) -> str:
     """Validate + double-quote an SQL identifier."""
     if not _IDENT_RE.match(ident):
@@ -669,6 +677,8 @@ class PostgresBackend(BaseBackend):
         self._vector_dim = vector_dim or int(os.environ.get("MEMPALACE_PG_VECTOR_DIM", _DEFAULT_VECTOR_DIM))
         # Test/optional injection of an embedding function.
         self._embedder = embedder
+        # One-time DDL guard for the central WAL audit table (G004).
+        self._wal_ready = False
 
     # -- pool / connection ------------------------------------------------
     def _pool(self):
@@ -837,6 +847,7 @@ class PostgresBackend(BaseBackend):
                     logger.exception("error closing postgres pool during reconnect")
                 self._pool_obj = None
             self._ensured = set()
+            self._wal_ready = False
 
     def health(self, palace: Optional[PalaceRef] = None) -> HealthStatus:
         if self._closed:
@@ -849,6 +860,50 @@ class PostgresBackend(BaseBackend):
             return HealthStatus.healthy()
         except Exception as e:
             return HealthStatus.unhealthy(str(e))
+
+    # -- write-ahead audit log (central sink) -----------------------------
+    def _ensure_wal_table(self) -> None:
+        if self._wal_ready:
+            return
+        schema = _qi(_WAL_AUDIT_SCHEMA)
+        table = f"{schema}.{_qi(_WAL_AUDIT_TABLE)}"
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+                cur.execute(
+                    f"CREATE TABLE IF NOT EXISTS {table} ("
+                    "  id bigserial PRIMARY KEY,"
+                    "  ts timestamptz NOT NULL DEFAULT now(),"
+                    "  operation text NOT NULL,"
+                    "  team text,"
+                    "  params jsonb,"
+                    "  result jsonb"
+                    ")"
+                )
+        self._wal_ready = True
+
+    def wal_append(self, *, timestamp, operation, team, params, result) -> None:
+        """Persist one (already-redacted) audit entry to the central table.
+
+        The caller redacts sensitive values before calling this; here we only
+        store them. ``team`` is the vault the write targeted (``None`` outside
+        team-vault mode). ``params`` / ``result`` land in ``jsonb`` columns.
+        """
+        self._ensure_wal_table()
+        table = f"{_qi(_WAL_AUDIT_SCHEMA)}.{_qi(_WAL_AUDIT_TABLE)}"
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"INSERT INTO {table} (ts, operation, team, params, result) "
+                    "VALUES (%s, %s, %s, %s::jsonb, %s::jsonb)",
+                    (
+                        timestamp,
+                        operation,
+                        team,
+                        json.dumps(params, default=str),
+                        json.dumps(result, default=str),
+                    ),
+                )
 
     @classmethod
     def detect(cls, path: str) -> bool:
