@@ -1,0 +1,200 @@
+"""Per-vault entity index (central, team-vaulted Postgres).
+
+A lightweight inverted index mapping ``entity -> drawer`` inside a team's vault
+schema (``team_<team>.entity_occurrences``). It is the server-side replacement
+for the bulk miner's ``entities`` metadata + the single-user, non-vault-scoped
+``hallways.json`` (see ``docs/design/vault-scoped-entities-hallways.md``).
+
+It exists to power **entity-scoped recall of verbatim content** over MCP — the
+one thing ``kg_query`` does not do (it returns relationships, not the stored
+text). It is maintained best-effort and incrementally on the MCP write path
+(``tool_add_drawer`` / ``tool_delete_drawer`` / ``tool_update_drawer``), keyed on
+the **physical** row id actually written (the chunk id on the chunked path) so
+delete/update stay consistent and an ``entity=`` search is a direct id filter.
+
+This deliberately stays on a plain SQL table — no embeddings, no AGE — and
+follows the bespoke-DDL-guard pattern of :class:`PostgresKnowledgeGraph` and
+``PostgresBackend._ensure_wal_table`` rather than the embedding-shaped
+``_ensure_collection``.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from typing import Iterable, Optional
+
+# Reuse identifier quoting + schema naming from the storage backend.
+from .backends.postgres import _qi, team_schema
+
+# The per-vault known-entity set seeds extraction. It is queried on the write
+# path, so cache it briefly in-process and invalidate on any write rather than
+# re-scanning DISTINCT on every add.
+_KNOWN_TTL_SECONDS = 30.0
+
+
+class PostgresEntityIndex:
+    """Entity -> drawer occurrence index stored in a team vault's schema."""
+
+    def __init__(self, backend, team: Optional[str] = None):
+        self._backend = backend
+        self._team = team
+        self._schema = team_schema(team)
+        self._lock = threading.Lock()
+        self._ensured = False
+        self._known_cache: Optional[frozenset] = None
+        self._known_cache_at = 0.0
+
+    # -- schema -----------------------------------------------------------
+    def _table(self) -> str:
+        return f"{_qi(self._schema)}.{_qi('entity_occurrences')}"
+
+    def _ensure(self) -> None:
+        if self._ensured:
+            return
+        with self._lock:
+            if self._ensured:
+                return
+            with self._backend._conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(f"CREATE SCHEMA IF NOT EXISTS {_qi(self._schema)}")
+                    cur.execute(
+                        f"CREATE TABLE IF NOT EXISTS {self._table()} ("
+                        "  entity text NOT NULL,"
+                        "  drawer_id text NOT NULL,"
+                        "  wing text,"
+                        "  room text,"
+                        "  PRIMARY KEY (entity, drawer_id)"
+                        ")"
+                    )
+                    cur.execute(
+                        f"CREATE INDEX IF NOT EXISTS {_qi('entity_occurrences_entity')} "
+                        f"ON {self._table()} (entity)"
+                    )
+                    cur.execute(
+                        f"CREATE INDEX IF NOT EXISTS {_qi('entity_occurrences_wing')} "
+                        f"ON {self._table()} (wing)"
+                    )
+            self._ensured = True
+
+    def close(self) -> None:
+        # Connections belong to the shared backend pool; nothing to close here.
+        return None
+
+    def _invalidate_known(self) -> None:
+        self._known_cache = None
+
+    # -- writes -----------------------------------------------------------
+    def add(
+        self,
+        drawer_ids: Iterable[str],
+        entities: Iterable[str],
+        wing: Optional[str],
+        room: Optional[str],
+    ) -> int:
+        """Insert (entity, drawer_id, wing, room) rows. Idempotent per pair.
+
+        The same entity set is written for every physical drawer id (each chunk
+        of a chunked drawer), so an ``entity=`` lookup hits whatever physical row
+        the search returns. Returns the number of (entity, drawer) pairs offered
+        (pre-dedup); ``ON CONFLICT DO NOTHING`` makes re-adds harmless.
+        """
+        ids = [d for d in drawer_ids if d]
+        ents = [e for e in entities if e]
+        if not ids or not ents:
+            return 0
+        rows = [(e, d, wing, room) for d in ids for e in ents]
+        self._ensure()
+        with self._backend._conn() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    f"INSERT INTO {self._table()} (entity, drawer_id, wing, room) "
+                    "VALUES (%s, %s, %s, %s) ON CONFLICT (entity, drawer_id) DO NOTHING",
+                    rows,
+                )
+        self._invalidate_known()
+        return len(rows)
+
+    def delete_by_drawer(self, drawer_ids: Iterable[str]) -> None:
+        """Remove all entity rows for the given physical drawer ids."""
+        ids = [d for d in drawer_ids if d]
+        if not ids:
+            return
+        self._ensure()
+        with self._backend._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"DELETE FROM {self._table()} WHERE drawer_id = ANY(%s)", (ids,)
+                )
+        self._invalidate_known()
+
+    # -- reads ------------------------------------------------------------
+    def known_entities(self) -> frozenset:
+        """Per-vault known-entity set: accumulated occurrences UNION kg_add names.
+
+        Seeds the extractor so tagging is not pure regex guessing and improves
+        within a vault over time. Briefly TTL-cached; invalidated on any write.
+        kg seeding reads the relational ``kg_entities`` table (kg_add is plain
+        SQL, not AGE) and is skipped when that table does not exist yet.
+        """
+        now = time.monotonic()
+        if self._known_cache is not None and (now - self._known_cache_at) < _KNOWN_TTL_SECONDS:
+            return self._known_cache
+        self._ensure()
+        names: set[str] = set()
+        with self._backend._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT DISTINCT entity FROM {self._table()}")
+                names.update(r[0] for r in cur.fetchall() if r[0])
+                # Seed from this vault's kg_add entities when the KG table exists.
+                cur.execute("SELECT to_regclass(%s)", (f"{self._schema}.kg_entities",))
+                if cur.fetchone()[0] is not None:
+                    cur.execute(
+                        f"SELECT DISTINCT name FROM {_qi(self._schema)}.{_qi('kg_entities')}"
+                    )
+                    names.update(r[0] for r in cur.fetchall() if r[0])
+        self._known_cache = frozenset(names)
+        self._known_cache_at = now
+        return self._known_cache
+
+    def drawers_for_entity(self, entity: str) -> list[dict]:
+        """Physical drawer ids (+ wing/room) that mention ``entity``.
+
+        Case-insensitive match so a query for ``Dana`` finds rows stamped
+        ``dana`` / ``DANA`` (extraction preserves the matched casing).
+        """
+        if not entity:
+            return []
+        self._ensure()
+        with self._backend._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT drawer_id, wing, room FROM {self._table()} "
+                    "WHERE lower(entity) = lower(%s)",
+                    (entity,),
+                )
+                return [
+                    {"drawer_id": r[0], "wing": r[1], "room": r[2]} for r in cur.fetchall()
+                ]
+
+    def top_entities(
+        self, wing: Optional[str] = None, min_count: int = 1, limit: int = 100
+    ) -> list[dict]:
+        """Most-mentioned entities in the vault (optionally scoped to a wing)."""
+        self._ensure()
+        clauses = []
+        params: list = []
+        if wing:
+            clauses.append("wing = %s")
+            params.append(wing)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.extend([max(1, int(min_count)), max(1, int(limit))])
+        with self._backend._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT entity, count(DISTINCT drawer_id) AS n FROM {self._table()}"
+                    f"{where} GROUP BY entity HAVING count(DISTINCT drawer_id) >= %s "
+                    "ORDER BY n DESC, entity ASC LIMIT %s",
+                    params,
+                )
+                return [{"entity": r[0], "count": r[1]} for r in cur.fetchall()]

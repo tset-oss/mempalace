@@ -842,17 +842,24 @@ def detect_hall(content: str) -> str:
     return "general"
 
 
-def _extract_entities_for_metadata(content: str) -> str:
+def _extract_entities_for_metadata(content: str, known=None) -> str:
     """Extract entity names from content for metadata tagging.
 
-    Combines the user's known-entity registry (cached across calls) with
-    capitalized words appearing ≥2 times in the first ``_ENTITY_EXTRACT_WINDOW``
-    chars. Filters out the closet stoplist (``When``, ``After``, ``The``, …)
-    so sentence-starters don't masquerade as proper nouns.
+    Combines a known-entity set with capitalized words appearing ≥2 times in
+    the first ``_ENTITY_EXTRACT_WINDOW`` chars. Filters out the closet stoplist
+    (``When``, ``After``, ``The``, …) so sentence-starters don't masquerade as
+    proper nouns.
 
-    Returns semicolon-separated string suitable for ChromaDB metadata
-    filtering. The list is truncated to ``_ENTITY_METADATA_LIMIT`` entries
-    *before* joining so a name is never cut in half.
+    ``known`` is the known-entity set to match against. When ``None`` (the
+    default — the chroma/miner path), it is loaded from the user's local
+    registry (``~/.mempalace/known_entities.json``). The central Postgres write
+    path injects a **per-vault** set instead (accumulated occurrences + kg_add
+    names), so that file — which on a server is the server process's home, not
+    the engineer's — is never read for team vaults.
+
+    Returns semicolon-separated string suitable for metadata filtering. The list
+    is truncated to ``_ENTITY_METADATA_LIMIT`` entries *before* joining so a name
+    is never cut in half.
     """
     import re
 
@@ -860,7 +867,7 @@ def _extract_entities_for_metadata(content: str) -> str:
 
     matched: set = set()
 
-    known = _load_known_entities()
+    known = frozenset(known) if known is not None else _load_known_entities()
     for name in known:
         # Case-insensitive match — mirrors entity_detector.py's init-time
         # behavior so a known entity like "Aya" tags drawers that mention

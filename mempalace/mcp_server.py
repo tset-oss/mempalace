@@ -388,6 +388,64 @@ def _call_kg(op):
             raise
 
 
+# ── Per-vault entity index (server mode only) ───────────────────────────────
+# Mirrors the KG cache: one PostgresEntityIndex per team, sharing the storage
+# backend's connection pool. Drained alongside _kg_by_path on reconnect.
+_entity_index_by_team: dict = {}
+_entity_index_lock = threading.Lock()
+
+
+def _get_entity_index(team=None):
+    """Return the cached ``PostgresEntityIndex`` for the resolved team."""
+    from .entity_index_postgres import PostgresEntityIndex
+    from .palace import _resolve_backend
+
+    t = team if team is not None else _resolve_team()
+    key = f"pgentidx::{t}"
+    idx = _entity_index_by_team.get(key)
+    if idx is not None:
+        return idx
+    with _entity_index_lock:
+        idx = _entity_index_by_team.get(key)
+        if idx is None:
+            idx = PostgresEntityIndex(_resolve_backend(_config), team=t)
+            _entity_index_by_team[key] = idx
+    return idx
+
+
+def _index_drawer_entities(team, drawer_ids, content, wing, room):
+    """Best-effort: extract entities from ``content`` and index them per vault.
+
+    No-op on chroma (the miner stamps entities there). NEVER raises — an
+    entity-index failure must not fail or undo a verbatim drawer write
+    (verbatim-always). Entities are extracted once over the full content and the
+    same set is written for every physical drawer id (each chunk of a chunked
+    drawer), so an ``entity=`` lookup hits whatever physical row search returns.
+    """
+    if _config.backend == "chroma":
+        return
+    try:
+        from .miner import _extract_entities_for_metadata
+
+        idx = _get_entity_index(team)
+        entities_str = _extract_entities_for_metadata(content, known=idx.known_entities())
+        entities = [e for e in entities_str.split(";") if e]
+        if entities:
+            idx.add(drawer_ids, entities, wing, room)
+    except Exception:
+        logger.debug("entity index update failed (best-effort)", exc_info=True)
+
+
+def _unindex_drawer_entities(team, drawer_ids):
+    """Best-effort: drop a drawer's entity rows. No-op on chroma; never raises."""
+    if _config.backend == "chroma":
+        return
+    try:
+        _get_entity_index(team).delete_by_drawer(drawer_ids)
+    except Exception:
+        logger.debug("entity index delete failed (best-effort)", exc_info=True)
+
+
 _client_cache = None
 _collection_cache = None
 _palace_db_inode = 0  # inode of chroma.sqlite3 at cache time
@@ -1542,6 +1600,8 @@ def tool_add_drawer(
                     "The palace index may be stale; run reconnect or repair."
                 )
             _metadata_cache = None
+            # Best-effort per-vault entity index (server mode); never fails the write.
+            _index_drawer_entities(add_team, [drawer_id], content, wing, room)
             logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
             return {
                 "success": True,
@@ -1576,6 +1636,9 @@ def tool_add_drawer(
                 "The palace index may be stale; run reconnect or repair."
             )
         _metadata_cache = None
+        # Best-effort per-vault entity index (server mode). Keyed on the physical
+        # chunk ids actually written so delete/update stay consistent.
+        _index_drawer_entities(add_team, chunk_ids, content, wing, room)
         logger.info(f"Filed drawer: {drawer_id} → {wing}/{room} ({len(chunk_ids)} chunks)")
         return {
             "success": True,
@@ -1616,6 +1679,11 @@ def tool_delete_drawer(drawer_id: str):
     try:
         col.delete(ids=[drawer_id])
         _metadata_cache = None
+        # Best-effort: drop the drawer's entity rows (server mode). Same team
+        # _get_collection() resolved (implicit session/default).
+        _unindex_drawer_entities(
+            _resolve_team() if _config.backend != "chroma" else None, [drawer_id]
+        )
         logger.info(f"Deleted drawer: {drawer_id}")
         return {"success": True, "drawer_id": drawer_id}
     except Exception as e:
@@ -1807,6 +1875,16 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         col.update(**update_kwargs)
 
         _metadata_cache = None
+
+        # Best-effort: re-index entities (server mode). An update can change the
+        # content, wing, or room, any of which alters the entity rows, so drop
+        # and re-extract from the new state rather than leaving stale rows.
+        if _config.backend != "chroma":
+            upd_team = _resolve_team()
+            _unindex_drawer_entities(upd_team, [drawer_id])
+            _index_drawer_entities(
+                upd_team, [drawer_id], new_doc, new_meta.get("wing"), new_meta.get("room")
+            )
 
         logger.info(f"Updated drawer: {drawer_id}")
         return {
@@ -2285,6 +2363,9 @@ def tool_reconnect():
             except Exception:
                 pass
         _kg_by_path.clear()
+    # Drain the per-vault entity-index cache too so a reconnected pool is used.
+    with _entity_index_lock:
+        _entity_index_by_team.clear()
     try:
         col = _get_collection()
         if col is None:
@@ -2346,6 +2427,9 @@ def _tool_reconnect_server():
             except Exception:
                 pass
         _kg_by_path.clear()
+    # Drain the per-vault entity-index cache too so a reconnected pool is used.
+    with _entity_index_lock:
+        _entity_index_by_team.clear()
 
     result = {"success": not errors, "backend": _config.backend, "vault": _resolve_team()}
     try:
