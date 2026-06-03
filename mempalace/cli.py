@@ -30,6 +30,7 @@ Examples:
 """
 
 import os
+import re
 import sys
 import shlex
 import argparse
@@ -1169,6 +1170,66 @@ def _reconfigure_stdio_utf8_on_windows():
     reconfigure_stdio_utf8_on_windows(stdout_errors="replace", stderr_errors="replace")
 
 
+def cmd_team(args):
+    """Show or set the local team-vault configuration (central postgres mode).
+
+    ``mempalace team``               — show current backend / primary team / DB
+    ``mempalace team set <name>``    — point this machine at the central team vault
+    ``mempalace team list``          — list team vaults on the central server
+    """
+    action = getattr(args, "team_action", None) or "show"
+    cfg = MempalaceConfig()
+
+    if action == "set":
+        name = (args.name or "").strip().lower()
+        if not name or not re.fullmatch(r"[a-z0-9_]+", name):
+            print("Team name must be lowercase letters, digits or underscores (e.g. frontend).")
+            return
+        updates = {"backend": "postgres", "team": name}
+        if getattr(args, "database_url", None):
+            updates["database_url"] = args.database_url
+        path = cfg.update_config(updates)
+        print(f"Primary team vault set to '{name}' (backend=postgres).")
+        print(f"  config: {path}")
+        if not (cfg.database_url or os.environ.get("MEMPALACE_DATABASE_URL")):
+            print(
+                "  note: no database URL configured yet — set one with "
+                "--database-url, MEMPALACE_DATABASE_URL, or the MEMPALACE_PG_* env vars."
+            )
+        return
+
+    if action == "list":
+        if cfg.backend == "chroma":
+            print("Local (chroma) backend — single 'local' vault. Run 'mempalace team set <name>' for central mode.")
+            return
+        try:
+            from .palace import _resolve_backend
+
+            backend = _resolve_backend(cfg)
+            vaults = backend.list_vaults() if hasattr(backend, "list_vaults") else []
+        except Exception as e:
+            print(f"Could not reach the central server: {e}")
+            return
+        primary = cfg.team or "default"
+        print(f"Team vaults on the central server (primary: {primary}):")
+        for v in vaults:
+            print(f"  - {v}" + ("  (primary)" if v == primary else ""))
+        if not vaults:
+            print("  (none yet — vaults are created on first write)")
+        return
+
+    # show
+    print(f"backend: {cfg.backend}")
+    if cfg.backend == "chroma":
+        print("mode:    local (single 'local' vault)")
+        print(f"palace:  {cfg.palace_path}")
+    else:
+        print(f"team:    {cfg.team or '(default)'}")
+        has_db = bool(cfg.database_url or os.environ.get("MEMPALACE_DATABASE_URL"))
+        print(f"db url:  {'configured' if has_db else '(from MEMPALACE_PG_* env or defaults)'}")
+    print("\nSet with:  mempalace team set <name> [--database-url URL]")
+
+
 def main():
     """CLI entry point for the ``mempalace`` console script.
 
@@ -1577,6 +1638,19 @@ def main():
 
     sub.add_parser("status", help="Show what's been filed")
 
+    p_team = sub.add_parser(
+        "team", help="Show or set this machine's primary team vault (central postgres mode)"
+    )
+    team_sub = p_team.add_subparsers(dest="team_action")
+    p_team_set = team_sub.add_parser("set", help="Point this machine at a central team vault")
+    p_team_set.add_argument("name", help="Team name, e.g. frontend or backend")
+    p_team_set.add_argument(
+        "--database-url",
+        dest="database_url",
+        help="Postgres connection URL for the central server (optional)",
+    )
+    team_sub.add_parser("list", help="List team vaults on the central server")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1598,6 +1672,10 @@ def main():
             return
         args.name = name
         cmd_instructions(args)
+        return
+
+    if args.command == "team":
+        cmd_team(args)
         return
 
     dispatch = {
