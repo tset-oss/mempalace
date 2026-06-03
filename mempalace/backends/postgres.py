@@ -107,9 +107,15 @@ def dsn_from_env() -> str:
 
 
 def sanitize_team(namespace: Optional[str]) -> str:
-    """Normalise a team/namespace into a schema-safe slug, default ``default``."""
+    """Normalise a team/namespace into a schema-safe slug, default ``default``.
+
+    Capped at 40 chars to match the override-path validator (mcp_server's
+    ``_TEAM_SLUG_RE`` / ``_canonical_default_team``), so the physical schema slug
+    derived here can never exceed — and therefore never diverge from — the slug
+    the server reports back to the caller.
+    """
     raw = (namespace or os.environ.get("MEMPALACE_TEAM") or "default").strip().lower()
-    raw = re.sub(r"[^a-z0-9_]+", "_", raw).strip("_")
+    raw = re.sub(r"[^a-z0-9_]+", "_", raw).strip("_")[:40]
     if not raw:
         raw = "default"
     if not _TEAM_RE.match(raw):  # pragma: no cover - defensive

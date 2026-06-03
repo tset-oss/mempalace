@@ -69,11 +69,11 @@ _SWITCH_TEAM_DESC = (
     "call use that call's vault= argument."
 )
 
-# Team-name validation reuses mcp_server._TEAM_SLUG_RE — the single source of
-# truth (the sanitize_team fixed-point set). A malformed header / switch_team
-# value is dropped (falls back to the default), never silently rewritten, so
-# routing never surprises the caller and never disagrees with the schema slug.
-_RESET_ALIASES = {"", "primary", "default"}
+# Team-name validation is delegated to mcp_server._valid_team — the single
+# source of truth (the sanitize_team fixed-point set). A malformed header /
+# switch_team value is dropped (falls back to the default), never silently
+# rewritten, so routing never surprises the caller and never disagrees with the
+# schema slug.
 
 
 @dataclass
@@ -89,21 +89,6 @@ class _TeamSession:
 # exposes no session).
 _sessions: "weakref.WeakKeyDictionary[object, _TeamSession]" = weakref.WeakKeyDictionary()
 _STDIO_SESSION = _TeamSession()
-
-
-def _clean_team(value) -> str | None:
-    """Normalise an external team value to a safe slug, or ``None`` if unusable.
-
-    ``None`` means "no override" — reset/blank/``primary``/``default`` and any
-    value outside the safe identifier class all collapse to ``None`` so the
-    caller falls back to the session/server default.
-    """
-    if not value:
-        return None
-    t = str(value).strip().lower()
-    if t in _RESET_ALIASES or not _legacy._TEAM_SLUG_RE.match(t):
-        return None
-    return t
 
 
 def _get_or_create_session(ctx) -> _TeamSession:
@@ -133,7 +118,7 @@ def _header_team(ctx) -> str | None:
         raw = request.headers.get("x-mempalace-team")
     except AttributeError:
         return None
-    return _clean_team(raw)
+    return _legacy._valid_team(raw)
 
 
 def _seed_for_request(get_context) -> str | None:
@@ -174,7 +159,10 @@ def _make_switch_team(get_context):
     def mempalace_switch_team(team: str = "") -> dict:
         session = _get_or_create_session(get_context())
         raw = (team or "").strip().lower()
-        if raw in _RESET_ALIASES:
+        # These reset to the configured default; "all" gets a distinct hint
+        # since it is the search-only selector, not a writable vault. Both are
+        # also rejected by _valid_team — handled here first for clearer messages.
+        if raw in ("", "primary", "default"):
             session.active_team = None
             return {
                 "ok": True,
@@ -189,7 +177,8 @@ def _make_switch_team(get_context):
                     "pass vault='all' on mempalace_search instead."
                 ),
             }
-        if not _legacy._TEAM_SLUG_RE.match(raw):
+        slug = _legacy._valid_team(raw)
+        if slug is None:
             return {
                 "ok": False,
                 "error": (
@@ -197,8 +186,8 @@ def _make_switch_team(get_context):
                     "no leading/trailing underscore"
                 ),
             }
-        session.active_team = raw
-        return {"ok": True, "active_team": raw}
+        session.active_team = slug
+        return {"ok": True, "active_team": slug}
 
     return mempalace_switch_team
 

@@ -42,6 +42,18 @@ def _tools_dict_keys() -> list:
     return re.findall(r'"(mempalace_\w+)":\s*\{', src)
 
 
+def _fastmcp_extra_tool_names() -> list:
+    """Tool names the FastMCP server registers beyond the TOOLS dict.
+
+    The central HTTP server (mcp_fastmcp.build_server) wraps every TOOLS entry
+    and adds server-only tools (e.g. switch_team) via ``add_tool(name="...")``.
+    Those exist in code too, just not in the stdio TOOLS dict — parse their
+    literal names so the docs check counts them as registered.
+    """
+    src = _read(MEMPALACE_PKG / "mcp_fastmcp.py")
+    return re.findall(r'name="(mempalace_\w+)"', src)
+
+
 def _doc_tool_names() -> list:
     """Return the list of tool names documented in the MCP tools reference.
 
@@ -94,7 +106,9 @@ class TestReadmeToolsExistInCode:
         Pre-#875 this parsed the tool table that lived in README.md; that
         table has moved to the website docs and README now links out.
         """
-        code_tools = set(_tools_dict_keys())
+        # "Exists in code" = the stdio TOOLS dict OR a FastMCP server-only tool
+        # (e.g. switch_team), both of which the docs may document.
+        code_tools = set(_tools_dict_keys()) | set(_fastmcp_extra_tool_names())
         doc_tools = _doc_tool_names()
         assert len(doc_tools) > 0, (
             f"Could not parse any tools from {MCP_TOOLS_DOC_PATH.relative_to(REPO_ROOT)} "

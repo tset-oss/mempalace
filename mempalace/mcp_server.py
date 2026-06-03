@@ -200,18 +200,27 @@ _active_team_var: contextvars.ContextVar = contextvars.ContextVar(
 _TEAM_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_]{0,38}[a-z0-9])?$")
 
 
+# Tokens that mean "no specific team / use the default", not a literal vault.
+# ``all`` is here too: it is the cross-team *search* selector, never a writable
+# vault — so as an explicit/header/session team it means "fall back", which
+# keeps it from ever routing a write into a literal ``team_all`` schema.
+_TEAM_RESET_ALIASES = frozenset({"", "primary", "default", "all"})
+
+
 def _valid_team(value):
     """Return *value* as a canonical team slug, or ``None`` if it is not one.
 
-    ``primary`` / ``default`` / blank mean "no override" (``None``). A value
-    outside the ``[a-z0-9_]`` slug class (e.g. a typo, a hyphen, or a stray
-    header) is rejected (``None``) rather than silently rewritten, so it falls
-    back to the configured default instead of routing to a surprise vault.
+    The reset aliases (blank / ``primary`` / ``default`` / ``all``) mean "no
+    override" (``None``). A value outside the ``[a-z0-9_]`` slug class (e.g. a
+    typo, a hyphen, an over-long name, or a stray header) is rejected (``None``)
+    rather than silently rewritten, so it falls back to the configured default
+    instead of routing to a surprise vault. This is the single team-name
+    validator — the FastMCP header / switch_team paths reuse it.
     """
     if not value:
         return None
     t = str(value).strip().lower()
-    if t in ("primary", "default") or not _TEAM_SLUG_RE.match(t):
+    if t in _TEAM_RESET_ALIASES or not _TEAM_SLUG_RE.match(t):
         return None
     return t
 
@@ -223,6 +232,12 @@ def _canonical_default_team():
     (trusted), so unlike the strict-validated override paths it is normalised
     (collapse to ``[a-z0-9_]``, cap length) to match the schema slug rather than
     rejected.
+
+    Intentionally re-derives the normalisation rather than importing
+    ``backends.postgres.sanitize_team`` so this module stays backend-agnostic
+    (sanitize_team also reads ``MEMPALACE_TEAM`` with its own fallback). Both
+    apply the same ``[^a-z0-9_]→_``, strip-underscore, ``[:40]`` rule, so the
+    slug they produce for a given input is identical.
     """
     raw = re.sub(r"[^a-z0-9_]+", "_", (_config.team or "default").strip().lower()).strip("_")
     return (raw or "default")[:40]

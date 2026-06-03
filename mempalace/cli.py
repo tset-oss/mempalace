@@ -29,6 +29,7 @@ Examples:
     mempalace search "pricing discussion" --wing my_app --room costs
 """
 
+import hmac
 import os
 import re
 import sys
@@ -1182,8 +1183,11 @@ def cmd_team(args):
 
     if action == "set":
         name = (args.name or "").strip().lower()
-        if not name or not re.fullmatch(r"[a-z0-9_]+", name):
-            print("Team name must be lowercase letters, digits or underscores (e.g. frontend).")
+        if not name or not re.fullmatch(r"[a-z0-9_]{1,40}", name):
+            print(
+                "Team name must be 1-40 lowercase letters, digits or underscores "
+                "(e.g. frontend)."
+            )
             return
         updates = {"backend": "postgres", "team": name}
         if getattr(args, "database_url", None):
@@ -1245,8 +1249,6 @@ class _BearerAuthASGI:
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") == "http":
-            import hmac
-
             headers = dict(scope.get("headers") or [])
             provided = headers.get(b"authorization", b"").decode("latin-1")
             if not hmac.compare_digest(provided, self._expected):

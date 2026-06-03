@@ -149,6 +149,14 @@ def test_invalid_header_is_ignored():
     assert mcp_fastmcp._seed_for_request(lambda: ctx) is None
 
 
+def test_header_all_is_ignored():
+    # "all" is the cross-team search selector, never a writable vault — as a
+    # header it must fall back to the default, not route to a literal team_all.
+    ctx = _FakeCtx(_FakeSession(), headers={"X-Mempalace-Team": "all"})
+    assert mcp_fastmcp._header_team(ctx) is None
+    assert mcp_fastmcp._seed_for_request(lambda: ctx) is None
+
+
 def test_no_request_means_no_header_seed():
     # stdio transport: request is None -> header path yields nothing.
     ctx = _FakeCtx(_FakeSession(), has_request=False)
@@ -224,9 +232,11 @@ def test_valid_team_canonicalises_or_rejects():
     # Canonical: lowercased, [a-z0-9_], 1-40 chars.
     assert mcp_server._valid_team("Frontend") == "frontend"
     assert mcp_server._valid_team("team_a") == "team_a"
-    # Aliases mean "no override".
+    # Aliases mean "no override" — including "all" (the search-only selector,
+    # never a writable vault, so it must not route to a literal team_all).
     assert mcp_server._valid_team("primary") is None
     assert mcp_server._valid_team("default") is None
+    assert mcp_server._valid_team("all") is None
     assert mcp_server._valid_team("") is None
     # Non-canonical is rejected (NOT silently rewritten) so it can't route to a
     # surprise vault or collide with another at the SQL-sanitisation boundary.

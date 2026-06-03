@@ -336,6 +336,16 @@ def test_postgres_wal_append_ensures_table_once_and_inserts_redacted():
     assert not any("CREATE SCHEMA" in s for s, _ in executed)
 
 
+def test_sanitize_team_caps_length_to_match_reported_slug():
+    # The physical schema slug must not exceed the 40-char slug the override
+    # validator / _canonical_default_team report, so a >40 name can never make
+    # the data land in a differently-named schema than the server advertises.
+    from mempalace.backends.postgres import sanitize_team
+
+    assert sanitize_team("a" * 50) == "a" * 40
+    assert len(sanitize_team("frontend_" * 10)) <= 40
+
+
 def test_postgres_backend_reconnect_drops_pool_but_stays_usable():
     # No DB / psycopg needed: reconnect() only manipulates the cached pool ref.
     from mempalace.backends.postgres import PostgresBackend
