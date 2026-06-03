@@ -178,12 +178,23 @@ def resolve_backend_for_palace(
 
 
 def _register_builtins() -> None:
-    """Register chroma as the in-tree default."""
+    """Register the in-tree backends (chroma default + postgres)."""
     from .chroma import ChromaBackend
 
     # Use setdefault semantics so a caller that pre-registered for tests wins.
     if "chroma" not in _registry:
         _registry["chroma"] = ChromaBackend
+
+    # Postgres is in-tree but its heavy driver (psycopg) is imported lazily, so
+    # importing the class here is safe even when the `postgres` extra is not
+    # installed — construction/connection is what requires psycopg.
+    try:
+        from .postgres import PostgresBackend
+
+        if "postgres" not in _registry:
+            _registry["postgres"] = PostgresBackend
+    except Exception:  # pragma: no cover - defensive; class import is stdlib-only
+        logger.exception("failed to register in-tree postgres backend")
 
 
 _register_builtins()

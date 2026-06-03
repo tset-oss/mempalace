@@ -30,6 +30,7 @@ from .base import (
     UnsupportedFilterError,
 )
 from .chroma import ChromaBackend, ChromaCollection
+from .postgres import PostgresBackend, PostgresCollection
 from .registry import (
     available_backends,
     get_backend,
@@ -54,6 +55,8 @@ __all__ = [
     "HealthStatus",
     "PalaceNotFoundError",
     "PalaceRef",
+    "PostgresBackend",
+    "PostgresCollection",
     "QueryResult",
     "UnsupportedFilterError",
     "available_backends",

@@ -100,6 +100,14 @@ spellcheck = ["autocorrect>=2.0"]
 gpu = ["onnxruntime-gpu>=1.16"]
 dml = ["onnxruntime-directml>=1.16"]
 coreml = ["onnxruntime>=1.16"]
+# Central, team-vaulted deployment on PostgreSQL (pgvector + pg_search + AGE).
+# Required by the `postgres` storage backend (mempalace/backends/postgres.py).
+# The backend imports psycopg lazily, so the package installs and the chroma
+# default works without this extra; install it to select MEMPALACE_BACKEND=postgres.
+postgres = [
+    "psycopg[binary]>=3.1",
+    "psycopg-pool>=3.2",
+]
 # Multilingual extra kept as a no-op alias for back-compat with
 # `pip install mempalace[multilingual]` — these deps now ship in core.
 multilingual = []
