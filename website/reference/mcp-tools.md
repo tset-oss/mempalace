@@ -393,3 +393,19 @@ Force a reconnect to the palace database. Use this after external scripts or CLI
 **Parameters:** None
 
 **Returns:** `{ success, message, drawers, vector_disabled[, vector_disabled_reason] }` (on no-palace: `{ success: false, message, drawers, vector_disabled }`; on exception: `{ success: false, error }`)
+
+---
+
+### `mempalace_list_vaults`
+
+List the team vaults available on a centrally-hosted MemPalace (the `postgres` backend) and report which one is this machine's primary vault (from local config / `MEMPALACE_TEAM`). On a local (`chroma`) install there is a single implicit `local` vault. Call once per session before routing memories to a specific team.
+
+Team-vault routing is also exposed through a `vault` parameter on `mempalace_search` and `mempalace_add_drawer`:
+
+- omit `vault` → this machine's primary team vault (the default)
+- `vault: "<team>"` → a specific team's vault (e.g. `frontend`, `backend`)
+- `vault: "all"` (search only) → search every team vault, returned per-vault
+
+**Parameters:** None
+
+**Returns:** `{ backend, mode, primary, vaults[, hint] }`

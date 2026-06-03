@@ -151,10 +151,34 @@ Usage and tool reference:
 
 ## MCP server
 
-29 MCP tools cover palace reads/writes, knowledge-graph operations,
-cross-wing navigation, drawer management, and agent diaries. Installation
-and the full tool list:
+31 MCP tools cover palace reads/writes, knowledge-graph operations,
+cross-wing navigation, drawer management, agent diaries, and team-vault
+listing. Installation and the full tool list:
 [mempalaceofficial.com/reference/mcp-tools](https://mempalaceofficial.com/reference/mcp-tools.html).
+
+## Central, team vaults (PostgreSQL)
+
+MemPalace is local-first by default (ChromaDB on your machine). For an internal
+engineering org it can also run **centrally** on a single PostgreSQL instance,
+with one **vault per team** (`frontend`, `backend`, …). Each machine sets its
+primary team locally so Claude Code files and recalls into that team's vault —
+no authentication, internal network only.
+
+```bash
+# One-time, on the central host (PG 18 + pgvector + pg_search + Apache AGE):
+cd deploy && docker compose up -d --build
+
+# Per engineer:
+pip install "mempalace[postgres]"
+mempalace team set frontend --database-url postgresql://mempalace:mempalace@DB_HOST:5432/mempalace
+```
+
+The Postgres backend stores vectors in `pgvector` (HNSW cosine), keyword/BM25
+candidates in ParadeDB `pg_search`, and the temporal knowledge graph in
+per-team tables (with Apache AGE provisioned for graph traversal). Team vaults
+are isolated as Postgres schemas (`team_<name>`) and created lazily on first
+write. Search/file another team with the `vault` parameter; `mempalace_list_vaults`
+discovers what exists. Full setup and operations: [deploy/README.md](deploy/README.md).
 
 ## Agents
 
