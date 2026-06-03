@@ -72,3 +72,14 @@ def test_tool_entities_unavailable_on_chroma(monkeypatch):
     res = m.tool_entities()
     assert res["available"] is False
     assert res["backend"] == "chroma"
+
+
+def test_cli_reindex_entities_is_postgres_only(monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from mempalace.cli import cmd_reindex_entities
+
+    monkeypatch.setenv("MEMPALACE_BACKEND", "chroma")
+    cmd_reindex_entities(SimpleNamespace(vault=None, all_vaults=False))
+    out = capsys.readouterr().out
+    assert "postgres backend only" in out

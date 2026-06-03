@@ -198,3 +198,50 @@ class PostgresEntityIndex:
                     params,
                 )
                 return [{"entity": r[0], "count": r[1]} for r in cur.fetchall()]
+
+    # -- backfill ---------------------------------------------------------
+    def backfill(self, drawers_col, extract, batch_size: int = 2000) -> dict:
+        """One-time populate the index from an existing drawers collection.
+
+        Drawers filed before this index existed (append-only history is never
+        rewritten) carry no entity rows, so on an established vault the index
+        stays empty until a backfill runs. This iterates the drawers collection
+        in pages and indexes each physical row by the entities in its text.
+
+        ``extract(content) -> list[str]`` is injected (so this module needs no
+        miner dependency); the caller wraps the regex extractor with a known set
+        captured once. Idempotent via ``add``'s ON CONFLICT, so re-running is
+        safe. Keyed on the physical drawer/chunk id actually stored, matching
+        the write path. Returns ``{"drawers": n, "entity_rows": m}``.
+        """
+        self._ensure()
+        seen = 0
+        rows = 0
+        offset = 0
+        try:
+            total = drawers_col.count()
+        except Exception:
+            total = 0
+        while offset < total:
+            batch = drawers_col.get(
+                limit=batch_size, offset=offset, include=["documents", "metadatas"]
+            )
+            ids = list(getattr(batch, "ids", None) or [])
+            if not ids:
+                break
+            docs = list(getattr(batch, "documents", None) or [])
+            metas = list(getattr(batch, "metadatas", None) or [])
+            for i, did in enumerate(ids):
+                meta = metas[i] if i < len(metas) else {}
+                meta = meta if isinstance(meta, dict) else {}
+                if meta.get("is_sentinel"):
+                    continue
+                content = docs[i] if i < len(docs) else ""
+                seen += 1
+                if not content:
+                    continue
+                ents = extract(content)
+                if ents:
+                    rows += self.add([did], ents, meta.get("wing"), meta.get("room"))
+            offset += len(ids)
+        return {"drawers": seen, "entity_rows": rows}

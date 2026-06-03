@@ -1345,6 +1345,59 @@ def cmd_serve(args):
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
+def cmd_reindex_entities(args):
+    """Backfill the per-vault entity index from existing drawers (postgres only).
+
+    A one-time op after enabling the entity index on a vault that already holds
+    drawers (new writes index incrementally). Idempotent — safe to re-run.
+    """
+    cfg = MempalaceConfig()
+    if cfg.backend == "chroma":
+        print(
+            "reindex-entities is for the central postgres backend only "
+            "(set MEMPALACE_BACKEND=postgres)."
+        )
+        return
+
+    from .backends import PalaceRef
+    from .entity_index_postgres import PostgresEntityIndex
+    from .miner import _extract_entities_for_metadata
+    from .palace import _resolve_backend
+
+    backend = _resolve_backend(cfg)
+    if getattr(args, "all_vaults", False):
+        teams = backend.list_vaults() if hasattr(backend, "list_vaults") else []
+    else:
+        teams = [args.vault or cfg.team or "default"]
+    if not teams:
+        print("No vaults to reindex.")
+        return
+
+    for team in teams:
+        idx = PostgresEntityIndex(backend, team=team)
+        known = idx.known_entities()
+
+        def extract(content, _known=known):
+            joined = _extract_entities_for_metadata(content, known=_known)
+            return [e for e in joined.split(";") if e]
+
+        try:
+            col = backend.get_collection(
+                palace=PalaceRef(id=team, namespace=team),
+                collection_name=cfg.collection_name,
+                create=False,
+            )
+        except Exception as e:
+            print(f"  {team}: skipped ({e})")
+            continue
+        stats = idx.backfill(col, extract)
+        print(
+            f"  {team}: {stats['drawers']} drawers scanned, "
+            f"{stats['entity_rows']} entity rows written"
+        )
+    print("reindex-entities complete.")
+
+
 def main():
     """CLI entry point for the ``mempalace`` console script.
 
@@ -1794,6 +1847,20 @@ def main():
         help="Shared static bearer token for streamable-http (or set MEMPALACE_AUTH_TOKEN).",
     )
 
+    p_reindex = sub.add_parser(
+        "reindex-entities",
+        help="Backfill the per-vault entity index from existing drawers (central postgres mode)",
+    )
+    p_reindex.add_argument(
+        "--vault", help="Team vault to reindex (default: this machine's configured team)"
+    )
+    p_reindex.add_argument(
+        "--all-vaults",
+        dest="all_vaults",
+        action="store_true",
+        help="Reindex every team vault on the central server",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1836,6 +1903,7 @@ def main():
         "migrate": cmd_migrate,
         "status": cmd_status,
         "serve": cmd_serve,
+        "reindex-entities": cmd_reindex_entities,
     }
     dispatch[args.command](args)
 

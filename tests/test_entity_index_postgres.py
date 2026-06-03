@@ -204,3 +204,50 @@ def test_tool_entities_lists_and_looks_up(backend, team, monkeypatch):
     names = {e["entity"] for e in listing["entities"]}
     assert "Dana" in names
     assert "Ingest" in names
+
+
+def test_backfill_populates_and_is_idempotent(backend, team):
+    """backfill() indexes an existing drawers collection (paginated)."""
+    from mempalace.miner import _extract_entities_for_metadata
+
+    idx = PostgresEntityIndex(backend, team=team)
+
+    class _FakeResult:
+        def __init__(self, ids, documents, metadatas):
+            self.ids = ids
+            self.documents = documents
+            self.metadatas = metadatas
+
+    class _FakeCol:
+        def __init__(self, rows):
+            self._rows = rows  # list of (id, document, metadata)
+
+        def count(self):
+            return len(self._rows)
+
+        def get(self, limit=None, offset=0, include=None):
+            page = self._rows[offset : offset + (limit or len(self._rows))]
+            return _FakeResult(
+                [r[0] for r in page], [r[1] for r in page], [r[2] for r in page]
+            )
+
+    rows = [
+        ("d1", "Dana owns the ingest work.", {"wing": "people", "room": "r"}),
+        ("d2", "Dana and Zelda met.", {"wing": "people", "room": "r"}),
+        ("d3", "", {"wing": "people", "room": "r"}),  # empty content -> no entities
+        ("d4", "sentinel", {"is_sentinel": True}),  # sentinel -> skipped entirely
+    ]
+    known = frozenset({"Dana", "Zelda", "ingest"})
+
+    def extract(content):
+        return [e for e in _extract_entities_for_metadata(content, known=known).split(";") if e]
+
+    stats = idx.backfill(_FakeCol(rows), extract)
+    assert stats["drawers"] == 3  # d1, d2, d3 scanned; d4 (sentinel) skipped
+
+    assert {r["drawer_id"] for r in idx.drawers_for_entity("Dana")} == {"d1", "d2"}
+    assert {r["drawer_id"] for r in idx.drawers_for_entity("Zelda")} == {"d2"}
+
+    # Idempotent: a second backfill does not duplicate rows.
+    idx.backfill(_FakeCol(rows), extract)
+    assert {r["drawer_id"] for r in idx.drawers_for_entity("Dana")} == {"d1", "d2"}
