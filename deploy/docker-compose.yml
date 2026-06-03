@@ -1,0 +1,39 @@
+# Central MemPalace PostgreSQL — pgvector + pg_search (BM25) + Apache AGE.
+#
+#   cd deploy && docker compose up -d --build
+#
+# Internal/engineering use only: credentials are static and there is no auth
+# layer beyond Postgres itself. Do not expose port 5432 to the public internet.
+services:
+  db:
+    build:
+      context: ./postgres
+      dockerfile: Dockerfile
+    image: mempalace-postgres:18
+    container_name: mempalace-db
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: mempalace
+      POSTGRES_USER: mempalace
+      POSTGRES_PASSWORD: mempalace  # pragma: allowlist secret
+    shm_size: "1g"
+    volumes:
+      # postgres:18+ stores data in a major-version subdirectory.
+      # Mount at /var/lib/postgresql so PG18 can create the versioned subdir.
+      - mempalace_pgdata:/var/lib/postgresql
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
+    command:
+      - "postgres"
+      - "-c"
+      - "config_file=/etc/postgresql/postgresql.conf"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mempalace -d mempalace"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mempalace_pgdata:

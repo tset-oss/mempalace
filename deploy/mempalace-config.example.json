@@ -1,0 +1,5 @@
+{
+  "backend": "postgres",
+  "team": "frontend",
+  "database_url": "postgresql://mempalace:mempalace@DB_HOST:5432/mempalace"
+}
