@@ -23,7 +23,7 @@ documented in **`~/tset/agent-commons/docs/mcp/mempalace.md`**.
 | `postgres/Dockerfile` | PG18 + pgvector 0.8.2 + pg_search 0.22.5 + AGE 1.7.0-rc0 |
 | `postgres/postgresql.conf` | Tuning; `shared_preload_libraries='pg_search,age'` |
 | `postgres/initdb/10-extensions.sql` | First-boot `CREATE EXTENSION` (idempotent) |
-| `server/Dockerfile` | MCP server image (`pip install .[postgres,serve]`) |
+| `server/Dockerfile` | MCP server image; `pip install .[postgres,serve]` + pre-baked embeddinggemma ONNX model |
 | `docker-compose.yml` | The `db` + `mcp` services + volume |
 | `.env.example` | Server token + per-machine client env |
 | `../.dockerignore` | Trims the MCP server build context |

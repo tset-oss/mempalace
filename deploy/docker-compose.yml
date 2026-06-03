@@ -55,6 +55,12 @@ services:
       - "8080:8080"
     environment:
       MEMPALACE_BACKEND: postgres
+      # Multilingual embeddings (embeddinggemma-300m, 100+ languages, 384-dim).
+      # Pre-baked into the image (see deploy/server/Dockerfile) so no model is
+      # downloaded at request time. Set this BEFORE the first ingest — changing
+      # the embedding model on a populated palace needs `repair rebuild-index`
+      # (different vector space).
+      MEMPALACE_EMBEDDING_MODEL: embeddinggemma
       # Reach the db service over the compose network (not localhost).
       MEMPALACE_DATABASE_URL: postgresql://mempalace:mempalace@db:5432/mempalace  # pragma: allowlist secret
       # Centralise the write-ahead audit log alongside the data.

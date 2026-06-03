@@ -18,6 +18,15 @@ COPY . /app
 # manylinux wheels, so no compiler toolchain is needed on slim.
 RUN pip install ".[postgres,serve]"
 
+# Pre-bake the embeddinggemma-300m ONNX model (~300 MB) into the image so the
+# server never downloads it from HuggingFace at request time (no runtime egress
+# to HF, no cold-start latency on the first add_drawer/search). The download is
+# cached under the default HF cache (/root/.cache/huggingface), reused at run
+# time since the container runs as root. This matches MEMPALACE_EMBEDDING_MODEL
+# in docker-compose.yml; if you switch the compose model, the new model
+# lazy-downloads on first use instead.
+RUN python -c "from mempalace.embedding import get_embedding_function as g; g(model='embeddinggemma')(['warm-up'])"
+
 EXPOSE 8080
 
 # Bind all interfaces *inside the container*; the published port + the shared
