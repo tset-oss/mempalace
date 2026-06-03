@@ -231,6 +231,25 @@ def _get_kg(canonical_path=None) -> KnowledgeGraph:
     this call drift the insert and evict keys apart, stranding a closed
     handle under one key while the lookup probes another.
     """
+    # Server-mode backends store the KG centrally in the team's vault schema
+    # (PostgresKnowledgeGraph), sharing the storage backend's connection pool.
+    # Cached per team rather than per filesystem path.
+    if _config.backend != "chroma":
+        from .knowledge_graph_postgres import PostgresKnowledgeGraph
+        from .palace import _resolve_backend
+
+        team = _config.team or "default"
+        key = f"pgkg::{team}"
+        kg = _kg_by_path.get(key)
+        if kg is not None:
+            return kg
+        with _kg_cache_lock:
+            kg = _kg_by_path.get(key)
+            if kg is None:
+                kg = PostgresKnowledgeGraph(_resolve_backend(_config), team=team)
+                _kg_by_path[key] = kg
+        return kg
+
     path = (
         canonical_path if canonical_path is not None else _canonicalize_kg_path(_resolve_kg_path())
     )
@@ -489,18 +508,31 @@ def _get_client():
     return _client_cache
 
 
-def _get_collection(create=False):
-    """Return the ChromaDB collection, caching the client between calls.
+def _get_collection(create=False, team=None):
+    """Return the active collection, caching the client between calls.
 
-    On failure, log the exception and retry once after clearing the client
-    and collection caches. Tools were silently returning ``None`` when a
-    cached client/collection went stale — typically after the chromadb
-    rust bindings invalidated a handle following an out-of-band write —
-    leaving the LLM with no diagnostic and no recovery path. The retry
-    forces ``_get_client()`` to rebuild from scratch (which re-runs
-    ``quarantine_stale_hnsw`` per #1322), so the second attempt heals the
-    common stale-handle / stale-HNSW case automatically.
+    For server-mode backends (``MEMPALACE_BACKEND=postgres``) this delegates to
+    the backend-aware :func:`mempalace.palace.get_collection`, routing to the
+    machine's primary team vault (``config.team``) or an explicit ``team``
+    override. The chroma fast-path below — with its client/collection caching
+    and stale-HNSW healing — is preserved unchanged for the local default.
+
+    On failure (chroma path), log the exception and retry once after clearing
+    the client and collection caches. The retry forces ``_get_client()`` to
+    rebuild from scratch (which re-runs ``quarantine_stale_hnsw`` per #1322),
+    so the second attempt heals the common stale-handle / stale-HNSW case.
     """
+    if _config.backend != "chroma":
+        from .backends import CollectionNotInitializedError, PalaceNotFoundError
+        from .palace import get_collection as _palace_get_collection
+
+        try:
+            return _palace_get_collection(
+                _config.palace_path, _config.collection_name, create=create, team=team
+            )
+        except (PalaceNotFoundError, CollectionNotInitializedError):
+            return None
+
     global _client_cache, _collection_cache, _metadata_cache, _metadata_cache_time
     for attempt in range(2):
         try:
@@ -882,6 +914,7 @@ def tool_search(
     max_distance: float = 1.5,
     min_similarity: float = None,
     context: str = None,
+    vault: str = None,
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
@@ -895,6 +928,17 @@ def tool_search(
     dist = (1.0 - min_similarity) if min_similarity is not None else max_distance
     # Mitigate system prompt contamination (Issue #333)
     sanitized = sanitize_query(query)
+
+    # Team-vault routing (server-mode backends only; chroma ignores ``vault``).
+    # vault=None / "primary" -> the machine's configured primary team vault.
+    # vault="all"            -> search every team vault, returned per-vault.
+    # vault="<team>"         -> that team's vault.
+    if _config.backend != "chroma" and vault and vault.lower() == "all":
+        return _search_all_vaults(sanitized["clean_query"], wing, room, limit, dist)
+    search_team = None
+    if _config.backend != "chroma" and vault and vault.lower() not in ("primary", "default"):
+        search_team = vault.strip().lower()
+
     # Ensure the vector-disabled probe has been run via the safe
     # sqlite/pickle path before we touch chromadb. Calling _get_client()
     # here would defeat the fallback — it constructs a PersistentClient
@@ -909,6 +953,7 @@ def tool_search(
         max_distance=dist,
         vector_disabled=_vector_disabled,
         collection_name=_config.collection_name,
+        team=search_team,
     )
     if _is_transient_index_error(result):
         # Post-bulk-write HNSW flush window (#1315): drop caches, give
@@ -925,9 +970,12 @@ def tool_search(
             n_results=limit,
             max_distance=dist,
             vector_disabled=_vector_disabled,
+            team=search_team,
         )
         if not _is_transient_index_error(result):
             result["index_recovered"] = True
+    if search_team is not None:
+        result["vault"] = search_team
     if _vector_disabled:
         result["vector_disabled"] = True
         result["vector_disabled_reason"] = _vector_disabled_reason
@@ -943,6 +991,74 @@ def tool_search(
     if context:
         result["context_received"] = True
     return result
+
+
+def _search_all_vaults(clean_query, wing, room, limit, dist):
+    """Fan a search across every team vault (server-mode ``vault="all"``).
+
+    Returns results grouped per vault rather than a single merged list, so the
+    model can see which team each hit came from without the server having to
+    re-rank across heterogeneous vaults.
+    """
+    from .palace import _resolve_backend
+
+    backend = _resolve_backend(_config)
+    try:
+        teams = backend.list_vaults() if hasattr(backend, "list_vaults") else []
+    except Exception as e:
+        return {"error": f"could not list vaults: {e}"}
+    primary = _config.team or "default"
+    if primary not in teams:
+        teams = [primary, *teams]
+    results_by_vault = {}
+    for t in teams:
+        results_by_vault[t] = search_memories(
+            clean_query,
+            palace_path=_config.palace_path,
+            wing=wing,
+            room=room,
+            n_results=limit,
+            max_distance=dist,
+            collection_name=_config.collection_name,
+            team=t,
+        )
+    return {
+        "query": clean_query,
+        "vault": "all",
+        "vaults_searched": teams,
+        "results_by_vault": results_by_vault,
+    }
+
+
+def tool_list_vaults():
+    """List the team vaults available on the central server.
+
+    Call once per session to discover which vaults exist and which is this
+    machine's primary (from local config / ``MEMPALACE_TEAM``). On the local
+    chroma backend there is a single implicit ``local`` vault.
+    """
+    if _config.backend == "chroma":
+        return {
+            "backend": "chroma",
+            "mode": "local",
+            "primary": "local",
+            "vaults": ["local"],
+        }
+    from .palace import _resolve_backend
+
+    backend = _resolve_backend(_config)
+    try:
+        teams = backend.list_vaults() if hasattr(backend, "list_vaults") else []
+    except Exception as e:
+        return {"error": str(e)}
+    primary = _config.team or "default"
+    return {
+        "backend": _config.backend,
+        "mode": "central",
+        "primary": primary,
+        "vaults": teams,
+        "hint": "Pass vault='<team>' to read/write another team's vault, or vault='all' to search across all.",
+    }
 
 
 def tool_check_duplicate(content: str, threshold: float = 0.9):
@@ -1103,7 +1219,8 @@ def tool_follow_tunnels(wing: str, room: str):
 
 
 def tool_add_drawer(
-    wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp"
+    wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp",
+    vault: str = None,
 ):
     """File verbatim content into a wing/room. Checks for duplicates first.
 
@@ -1128,7 +1245,8 @@ def tool_add_drawer(
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
-    col = _get_collection(create=True)
+    add_team = vault.strip().lower() if (vault and _config.backend != "chroma") else None
+    col = _get_collection(create=True, team=add_team)
     if not col:
         return _no_palace()
 
@@ -2207,6 +2325,10 @@ TOOLS = {
                     "type": "string",
                     "description": "Background context for the search (optional). NOT used for embedding — only for future re-ranking.",
                 },
+                "vault": {
+                    "type": "string",
+                    "description": "Team vault to search (central/postgres deployments only). Omit for this machine's primary team; '<team>' for a specific team; 'all' to search every team vault. Ignored on local installs.",
+                },
             },
             "required": ["query"],
         },
@@ -2243,10 +2365,19 @@ TOOLS = {
                 },
                 "source_file": {"type": "string", "description": "Where this came from (optional)"},
                 "added_by": {"type": "string", "description": "Who is filing this (default: mcp)"},
+                "vault": {
+                    "type": "string",
+                    "description": "Team vault to file into (central/postgres deployments only). Omit for this machine's primary team; '<team>' to file into another team's vault. Ignored on local installs.",
+                },
             },
             "required": ["wing", "room", "content"],
         },
         "handler": tool_add_drawer,
+    },
+    "mempalace_list_vaults": {
+        "description": "List the team vaults available on the central server and which is this machine's primary. Call once per session before routing memories to a specific team. On local installs returns a single 'local' vault.",
+        "input_schema": {"type": "object", "properties": {}},
+        "handler": tool_list_vaults,
     },
     "mempalace_delete_drawer": {
         "description": "Delete a drawer by ID. Irreversible.",

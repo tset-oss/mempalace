@@ -13,7 +13,13 @@ import sys
 import threading
 from typing import Optional
 
-from .backends import BackendClosedError, CollectionNotInitializedError, PalaceNotFoundError
+from .backends import (
+    BackendClosedError,
+    CollectionNotInitializedError,
+    PalaceNotFoundError,
+    PalaceRef,
+    get_backend,
+)
 from .backends.chroma import ChromaBackend
 from .entity_detector import _apply_known_systems_prepass, _get_coca_filter
 
@@ -58,26 +64,62 @@ _DEFAULT_BACKEND = ChromaBackend()
 NORMALIZE_VERSION = 2
 
 
+def _resolve_backend(config):
+    """Return the configured backend instance, wiring its DSN if needed.
+
+    Honors ``config.database_url`` (config.json) for the postgres backend when
+    the ``MEMPALACE_DATABASE_URL`` env var was not used; the pool is created
+    lazily so setting the DSN here (before first use) is safe.
+    """
+    # Chroma keeps using the module-level instance so the chroma-specific cache
+    # manipulation in mcp_server / repair (``_DEFAULT_BACKEND._clients``) and the
+    # get_collection path share one client cache. Other backends come from the
+    # registry.
+    if config.backend == "chroma":
+        return _DEFAULT_BACKEND
+    backend = get_backend(config.backend)
+    dsn = getattr(config, "database_url", None)
+    if dsn and getattr(backend, "_dsn", "sentinel") is None:
+        setattr(backend, "_dsn", dsn)
+    return backend
+
+
 def get_collection(
     palace_path: str,
     collection_name: Optional[str] = None,
     create: bool = True,
+    team: Optional[str] = None,
 ):
-    """Get the palace collection through the backend layer."""
+    """Get the palace collection through the configured storage backend.
+
+    Backend selection and team-vault routing come from :class:`MempalaceConfig`:
+
+    * ``config.backend`` chooses chroma (local, default) or postgres (central).
+    * For server-mode backends, the palace is addressed by team **namespace**
+      (``team`` arg override > ``config.team`` > the backend's ``default``
+      vault). The local chroma backend ignores the namespace and keys by path.
+    """
+    from .config import MempalaceConfig, get_configured_collection_name
+
+    config = MempalaceConfig()
     if collection_name is None:
-        from .config import get_configured_collection_name
-
         collection_name = get_configured_collection_name()
-    return _DEFAULT_BACKEND.get_collection(
-        palace_path,
-        collection_name=collection_name,
-        create=create,
+    backend = _resolve_backend(config)
+    namespace = (team or config.team) if config.backend != "chroma" else None
+    ref = PalaceRef(id=palace_path, local_path=palace_path, namespace=namespace)
+    return backend.get_collection(palace=ref, collection_name=collection_name, create=create)
+
+
+def get_closets_collection(palace_path: str, create: bool = True, team: Optional[str] = None):
+    """Get the closets collection — the searchable index layer.
+
+    ``team`` routes to a specific team vault for server-mode backends (must be
+    threaded through alongside the drawers collection so a cross-team search
+    does not mix one team's closets with another team's drawers).
+    """
+    return get_collection(
+        palace_path, collection_name="mempalace_closets", create=create, team=team
     )
-
-
-def get_closets_collection(palace_path: str, create: bool = True):
-    """Get the closets collection — the searchable index layer."""
-    return get_collection(palace_path, collection_name="mempalace_closets", create=create)
 
 
 def _open_collection_or_explain(

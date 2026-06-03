@@ -100,6 +100,7 @@ class TestSearchMemories:
             "/fake/path",
             collection_name="custom_drawers",
             create=False,
+            team=None,
         )
 
     def test_search_memories_filters_in_result(self, palace_path, seeded_collection):
@@ -120,7 +121,7 @@ class TestSearchMemories:
             "ids": [["d1", "d2"]],
         }
 
-        def mock_get_collection(path, collection_name=None, create=False):
+        def mock_get_collection(path, collection_name=None, create=False, team=None):
             # First call: drawers. Second call: closets — raise so hybrid
             # degrades to pure drawer search (the catch block covers it).
             if not hasattr(mock_get_collection, "_called"):

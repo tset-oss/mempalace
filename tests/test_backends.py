@@ -1586,19 +1586,23 @@ def test_palace_get_collection_uses_configured_collection_name(monkeypatch):
 
     captured = {}
 
-    def fake_get_collection(palace_path, collection_name=None, create=False):
-        captured["palace_path"] = palace_path
+    # RFC 001 form: palace.get_collection delegates with palace=PalaceRef and
+    # kwargs-only. For the default chroma backend, _resolve_backend returns the
+    # module-level _DEFAULT_BACKEND, so monkeypatching it intercepts the call.
+    def fake_get_collection(*, palace, collection_name, create):
+        captured["palace_ref"] = palace
         captured["collection_name"] = collection_name
         captured["create"] = create
         return object()
 
+    monkeypatch.delenv("MEMPALACE_BACKEND", raising=False)
     monkeypatch.setattr(palace._DEFAULT_BACKEND, "get_collection", fake_get_collection)
     monkeypatch.setattr("mempalace.config.get_configured_collection_name", lambda: "custom_drawers")
 
     palace.get_collection("/palace", create=False)
 
-    assert captured == {
-        "palace_path": "/palace",
-        "collection_name": "custom_drawers",
-        "create": False,
-    }
+    assert captured["collection_name"] == "custom_drawers"
+    assert captured["create"] is False
+    # chroma keys by filesystem path; team namespace is not used for chroma.
+    assert captured["palace_ref"].local_path == "/palace"
+    assert captured["palace_ref"].namespace is None

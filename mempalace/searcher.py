@@ -755,6 +755,7 @@ def search_memories(
     vector_disabled: bool = False,
     candidate_strategy: str = "vector",
     collection_name: str = None,
+    team: str = None,
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 
@@ -809,7 +810,9 @@ def search_memories(
         )
 
     try:
-        drawers_col = get_collection(palace_path, collection_name=collection_name, create=False)
+        drawers_col = get_collection(
+            palace_path, collection_name=collection_name, create=False, team=team
+        )
     except Exception as e:
         logger.error("No palace found at %s: %s", palace_path, e)
         return {
@@ -841,7 +844,7 @@ def search_memories(
     # Gather closet hits (best-per-source) to build a boost lookup.
     closet_boost_by_source: dict = {}  # source_file -> (rank, closet_dist, preview)
     try:
-        closets_col = get_closets_collection(palace_path, create=False)
+        closets_col = get_closets_collection(palace_path, create=False, team=team)
         ckwargs = {
             "query_texts": [query],
             "n_results": n_results * 2,

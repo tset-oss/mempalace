@@ -191,6 +191,9 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
 
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
+# Default storage backend. ``chroma`` keeps MemPalace local-first and offline by
+# default; ``postgres`` selects the central, team-vaulted deployment.
+DEFAULT_BACKEND = "chroma"
 
 
 @lru_cache(maxsize=1)
@@ -324,6 +327,43 @@ class MempalaceConfig:
     def collection_name(self):
         """ChromaDB collection name."""
         return self._file_config.get("collection_name", DEFAULT_COLLECTION_NAME)
+
+    @property
+    def backend(self):
+        """Storage backend name. ``MEMPALACE_BACKEND`` env > config file > chroma.
+
+        ``chroma`` (default) keeps the palace local; ``postgres`` selects the
+        central, team-vaulted deployment.
+        """
+        env_val = os.environ.get("MEMPALACE_BACKEND")
+        raw = env_val or self._file_config.get("backend") or DEFAULT_BACKEND
+        return str(raw).strip().lower()
+
+    @property
+    def team(self):
+        """Primary team vault for this machine (``MEMPALACE_TEAM`` env > config).
+
+        This is what makes Claude Code default to a team's vault on the central
+        server, e.g. ``frontend`` / ``backend``. Returns ``None`` when unset
+        (the backend then falls back to its ``default`` vault). Only meaningful
+        for server-mode backends (postgres); ignored by the local chroma backend.
+        """
+        env_val = os.environ.get("MEMPALACE_TEAM")
+        raw = env_val if env_val is not None else self._file_config.get("team")
+        if raw is None:
+            return None
+        raw = str(raw).strip().lower()
+        return raw or None
+
+    @property
+    def database_url(self):
+        """Postgres connection URL for server-mode backends.
+
+        ``MEMPALACE_DATABASE_URL`` env > config file. Returns ``None`` when
+        unset; the postgres backend then assembles a DSN from the discrete
+        ``MEMPALACE_PG_*`` environment variables.
+        """
+        return os.environ.get("MEMPALACE_DATABASE_URL") or self._file_config.get("database_url")
 
     @property
     def people_map(self):
@@ -637,6 +677,34 @@ class MempalaceConfig:
                 self._config_file.chmod(0o600)
             except (OSError, NotImplementedError):
                 pass
+        return self._config_file
+
+    def update_config(self, updates: dict):
+        """Merge ``updates`` into config.json, preserving existing keys.
+
+        Used by ``mempalace team`` to persist the local backend / primary team
+        vault / database URL. Creates the config dir + file if absent.
+        """
+        self._config_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self._config_dir.chmod(0o700)
+        except (OSError, NotImplementedError):
+            pass
+        current = {}
+        if self._config_file.exists():
+            try:
+                with open(self._config_file, "r") as f:
+                    current = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                current = {}
+        current.update(updates)
+        with open(self._config_file, "w") as f:
+            json.dump(current, f, indent=2)
+        try:
+            self._config_file.chmod(0o600)
+        except (OSError, NotImplementedError):
+            pass
+        self._file_config = current
         return self._config_file
 
     def save_people_map(self, people_map):
