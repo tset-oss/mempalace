@@ -86,10 +86,16 @@ def patched_lazy_load(monkeypatch):
     Returns a dict of recording counters so tests can assert how many times
     each was called (e.g. confirm lazy-load caches after first call).
     """
-    calls = {"hf_hub_download": 0, "InferenceSession": 0, "Tokenizer.from_file": 0}
+    calls = {
+        "hf_hub_download": 0,
+        "InferenceSession": 0,
+        "Tokenizer.from_file": 0,
+        "downloaded": [],
+    }
 
     def fake_download(repo, filename=None, subfolder=None, **kwargs):
         calls["hf_hub_download"] += 1
+        calls["downloaded"].append(filename)
         return f"/tmp/fake/{subfolder or ''}/{filename}"
 
     fake_session_cls = _make_fake_session()
@@ -126,9 +132,29 @@ def test_lazy_load_runs_once(patched_lazy_load):
     ef(["one"])
     ef(["two"])
     ef(["three"])
-    assert patched_lazy_load["hf_hub_download"] == 2  # model + tokenizer, once total
+    # external-data sidecar + model graph + tokenizer, exactly once total
+    assert patched_lazy_load["hf_hub_download"] == 3
     assert patched_lazy_load["InferenceSession"] == 1
     assert patched_lazy_load["Tokenizer.from_file"] == 1
+
+
+def test_lazy_load_fetches_external_data_sidecar(patched_lazy_load):
+    """Regression: the ONNX graph keeps its weights in an external-data sidecar
+    (``model_quantized.onnx_data``). Fetching only the ``.onnx`` left onnxruntime
+    unable to resolve the sidecar at session init ("cannot get file size:
+    …onnx_data"). The sidecar must be downloaded into the same snapshot dir.
+
+    This is unit-mockable only because we record the requested filenames — the
+    pre-fix bug was invisible here precisely because InferenceSession is mocked,
+    so it surfaced only against the real model.
+    """
+    ef = embedding.EmbeddinggemmaONNX()
+    ef(["x"])
+    downloaded = patched_lazy_load["downloaded"]
+    assert embedding._EMBEDDINGGEMMA_ONNX in downloaded
+    assert embedding._EMBEDDINGGEMMA_ONNX + "_data" in downloaded, (
+        "external-data sidecar must be fetched alongside the .onnx graph"
+    )
 
 
 def test_output_shape_is_truncated_to_384(patched_lazy_load):

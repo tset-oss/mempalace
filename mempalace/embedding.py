@@ -188,6 +188,17 @@ class EmbeddinggemmaONNX:
             _EMBEDDINGGEMMA_REPO,
             _EMBEDDINGGEMMA_ONNX,
         )
+        # The ONNX graph keeps its weights in an external-data sidecar
+        # (``model_quantized.onnx_data``). onnxruntime resolves that sidecar by
+        # relative path from the .onnx file's own directory, so it must land in
+        # the same snapshot dir — fetch it first. Downloading only the .onnx
+        # yields a "cannot get file size: …onnx_data" RUNTIME_EXCEPTION at
+        # InferenceSession init.
+        hf_hub_download(
+            _EMBEDDINGGEMMA_REPO,
+            subfolder="onnx",
+            filename=_EMBEDDINGGEMMA_ONNX + "_data",
+        )
         model_path = hf_hub_download(
             _EMBEDDINGGEMMA_REPO, subfolder="onnx", filename=_EMBEDDINGGEMMA_ONNX
         )
