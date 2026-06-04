@@ -20,6 +20,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -73,6 +74,19 @@ def _run_hook(
     env = {
         "HOME": str(home),
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        # Pin the interpreter to the one running the tests. The hook's
+        # default resolution (``command -v python3``) can land on a
+        # version-manager shim (asdf/pyenv) that cannot function under
+        # this deliberately stripped environment: HOME is redirected to
+        # ``tmp_path``, so the shim no longer finds its ``$HOME/.asdf``
+        # (or ``~/.pyenv``) data dir and exits 126 with empty stderr. The
+        # hook then never runs its Python parse step, and every
+        # parse-dependent assertion below fails for a reason unrelated to
+        # the bash logic under test. ``MEMPAL_PYTHON`` is the hook's own
+        # documented override for exactly this "ambient python3 doesn't
+        # work" case (see the resolution comment in the hook scripts), so
+        # this pins a known-good interpreter without bypassing real code.
+        "MEMPAL_PYTHON": sys.executable,
     }
     if extra_env:
         env.update(extra_env)
