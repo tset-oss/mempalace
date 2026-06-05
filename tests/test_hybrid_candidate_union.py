@@ -452,6 +452,54 @@ class TestUnionMergerBackendDispatch:
         )
         assert hits == before, "max_distance>0 must skip keyword candidates on every route"
 
+    def test_empty_source_keyword_candidates_are_merged_not_dropped(self):
+        """Empty source_file (the agent-curated add_drawer write) candidates must
+        widen the union pool. Previously their dedup key was the "?" basename,
+        which the merge loop skips — so keyword-strong/vector-distant EMPTY-SOURCE
+        drawers never reached the rerank pool. They must now merge, stay distinct
+        from one another, and still dedup against the SAME drawer's vector hit.
+        """
+        from mempalace.searcher import _merge_bm25_union_candidates
+
+        def _es(text):
+            # An empty-source candidate exactly as postgres/chroma
+            # keyword_candidates emit it: source_file="" -> basename "?".
+            return {
+                "text": text,
+                "wing": "people",
+                "room": "alice",
+                "source_file": "?",
+                "distance": None,
+                "_source_file_full": "",
+                "_chunk_index": 0,
+            }
+
+        class _FakeCollection:
+            def supports_keyword_candidates(self):
+                return True
+
+            def keyword_candidates(self, *, query, n_results, where=None, restrict_ids=None):
+                return [
+                    _es("rare zylophonics ticket one"),
+                    _es("rare zylophonics ticket two"),
+                    _es("existing empty-source vector hit"),  # dup of the hit below
+                ]
+
+        # A pre-existing empty-source vector hit with fields identical to the 3rd
+        # candidate — the merger must dedup it (no double-add).
+        hits = [_es("existing empty-source vector hit")]
+        _merge_bm25_union_candidates(
+            hits, "zylophonics", "/ignored", "people", "alice", 5, collection=_FakeCollection()
+        )
+        texts = [h["text"] for h in hits]
+        # Both DISTINCT empty-source candidates were merged (not skipped as "?")...
+        assert "rare zylophonics ticket one" in texts
+        assert "rare zylophonics ticket two" in texts
+        # ...distinct empty-source drawers were not collapsed into one...
+        assert len([t for t in texts if t.startswith("rare zylophonics ticket")]) == 2
+        # ...and the duplicate of the existing hit was NOT double-added.
+        assert texts.count("existing empty-source vector hit") == 1
+
 
 class TestHybridRankTolerantOfMissingDistance:
     """``_hybrid_rank`` accepts ``distance=None`` — required for BM25-only

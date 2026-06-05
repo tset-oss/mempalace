@@ -710,9 +710,18 @@ def _merge_bm25_union_candidates(
         ci = entry.get("_chunk_index")
         if full and ci is not None:
             return (full, ci)
-        # Fall back to basename only when richer metadata is missing —
-        # avoids silently dropping candidates on legacy data while still
-        # giving chunk-precise dedup whenever the metadata is present.
+        # Empty/missing source_file — the agent-curated add_drawer write path
+        # stores source_file="". The old basename fallback returned "?" here, and
+        # the merge loop below skips key=="?", so keyword-strong/vector-distant
+        # EMPTY-SOURCE drawers (the dominant central-deployment case) never
+        # widened the union pool. Key them on (wing, room, chunk_index, text):
+        # distinct empty-source drawers stay distinct, while the SAME drawer's
+        # vector hit and keyword candidate carry identical fields and still dedup
+        # to a single entry (no double-add). Uses only fields already present on
+        # both candidate shapes — no contract/backend change.
+        if not full:
+            return ("empty_source", entry.get("wing"), entry.get("room"), ci, entry.get("text", ""))
+        # Non-empty source but no chunk_index: basename dedup (legacy data).
         return entry.get("source_file")
 
     seen = {_dedup_key(h) for h in hits}
