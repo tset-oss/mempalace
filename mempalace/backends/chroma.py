@@ -1047,8 +1047,22 @@ class ChromaCollection(BaseCollection):
             return []
         from ..searcher import _bm25_only_via_sqlite
 
-        wing = where.get("wing") if isinstance(where, dict) else None
-        room = where.get("room") if isinstance(where, dict) else None
+        # ``build_where_filter`` (searcher.py) emits ``{"wing": w}`` /
+        # ``{"room": r}`` for a single filter but ``{"$and": [{"wing": w},
+        # {"room": r}]}`` when BOTH are set. A naive ``where.get("wing")`` returns
+        # None on the ``$and`` shape, dropping the scope — under the union default
+        # that leaks out-of-wing/room keyword candidates into scoped searches.
+        # Flatten the ``$and`` clauses so both filters reach the FTS5 path.
+        wing = room = None
+        if isinstance(where, dict):
+            if "$and" in where and isinstance(where["$and"], list):
+                merged: dict = {}
+                for clause in where["$and"]:
+                    if isinstance(clause, dict):
+                        merged.update(clause)
+                wing, room = merged.get("wing"), merged.get("room")
+            else:
+                wing, room = where.get("wing"), where.get("room")
         try:
             collection_name = self._collection.name
         except Exception:
@@ -1082,6 +1096,10 @@ class ChromaCollection(BaseCollection):
                 }
             )
         return out
+
+    def supports_keyword_candidates(self) -> bool:
+        """Chroma collections route keyword candidates through the FTS5 path."""
+        return True
 
     # ------------------------------------------------------------------
     # Writes

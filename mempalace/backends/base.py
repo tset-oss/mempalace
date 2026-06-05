@@ -351,9 +351,25 @@ class BaseCollection(ABC):
         without keyword retrieval simply contribute no extra candidates (the
         union merger then degrades to vector-only), mirroring the no-op default
         of the other optional methods in this region. Backends that DO support
-        it MUST override AND advertise ``supports_keyword_candidates``.
+        it MUST override AND advertise ``supports_keyword_candidates`` (both the
+        backend ``capabilities`` flag and the :meth:`supports_keyword_candidates`
+        collection-handle predicate below, which the union merger dispatches on).
         """
         return []
+
+    def supports_keyword_candidates(self) -> bool:
+        """Whether this collection honours :meth:`keyword_candidates`.
+
+        ``searcher._merge_bm25_union_candidates`` dispatches on this predicate
+        (read off the live collection handle) to decide whether to source
+        scoreless keyword candidates from :meth:`keyword_candidates`. The ABC
+        default is ``False`` — a collection that does not override
+        ``keyword_candidates`` contributes no extra candidates and the union
+        merger degrades to vector-only. Backends whose collections DO implement
+        keyword retrieval override this to return ``True`` (and advertise the
+        ``supports_keyword_candidates`` capability on the backend).
+        """
+        return False
 
 
 # ---------------------------------------------------------------------------

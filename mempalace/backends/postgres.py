@@ -672,6 +672,10 @@ class PostgresCollection(BaseCollection):
             )
         return candidates
 
+    def supports_keyword_candidates(self) -> bool:
+        """Postgres collections implement the trigram-GIN keyword path (G002)."""
+        return True
+
     def get(
         self,
         *,

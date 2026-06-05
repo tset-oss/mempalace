@@ -642,43 +642,66 @@ def _merge_bm25_union_candidates(
     room: str,
     n_results: int,
     max_distance: float = 0.0,
+    collection=None,
+    restrict_ids: list | None = None,
 ) -> None:
-    """Append top-K BM25-only candidates from sqlite into ``hits`` in place.
+    """Append top-K scoreless keyword candidates into ``hits`` in place.
 
     Used by ``search_memories(..., candidate_strategy="union")`` to widen
     the rerank pool's *source* (not just its size) — vector-only candidate
     selection skips docs whose embeddings are far from the query even when
-    BM25 signal is strong.
+    keyword signal is strong.
+
+    Candidate source is dispatched on the live ``collection`` handle: when
+    it advertises :meth:`BaseCollection.supports_keyword_candidates` the
+    keyword candidates come from ``collection.keyword_candidates(...)`` (the
+    backend's own scoreless route — postgres' trigram GIN, chroma's FTS5
+    wrapper). This is the SINGLE keyword route per backend; there is no
+    separate ``_bm25_only_via_sqlite(palace_path, ...)`` fallback inside the
+    merger. ``collection=None`` (or a handle that does not advertise the
+    capability) yields zero extra candidates — byte-identical to the
+    pre-G003 no-op for any caller that doesn't thread the handle.
 
     Dedup is chunk-precise: the key is ``(_source_file_full, _chunk_index)``
     so two files sharing a basename in different directories don't collide,
-    and a vector hit on chunk N of a file doesn't block BM25 from
-    contributing chunk M of the same file. Falls back to ``source_file``
+    and a vector hit on chunk N of a file doesn't block keyword candidates
+    from contributing chunk M of the same file. Falls back to ``source_file``
     only when full-path/chunk metadata is absent.
 
-    BM25-only additions carry ``distance=None`` so ``_hybrid_rank`` scores
+    Keyword-only additions carry ``distance=None`` so ``_hybrid_rank`` scores
     them on BM25 contribution alone.
 
     When ``max_distance > 0.0`` (a strict vector-distance threshold is
-    set), BM25-only candidates are skipped entirely — they have no vector
-    distance to satisfy the threshold, and silently injecting them would
-    break the existing ``max_distance`` guarantee that hybrid results lie
-    within the requested vector-distance bound.
+    set), keyword-only candidates are skipped entirely on BOTH backends —
+    they have no vector distance to satisfy the threshold, and silently
+    injecting them would break the existing ``max_distance`` guarantee that
+    hybrid results lie within the requested vector-distance bound.
     """
     if max_distance > 0.0:
         return
 
+    if collection is None or getattr(collection, "supports_keyword_candidates", None) is None:
+        return
     try:
-        bm25_extra = _bm25_only_via_sqlite(
-            query,
-            palace_path,
-            wing=wing,
-            room=room,
-            n_results=n_results * 3,
-            _include_internal=True,
-        ).get("results", [])
+        if collection.supports_keyword_candidates() is not True:
+            return
     except Exception:
-        logger.debug("candidate_strategy=union: BM25 fetch failed", exc_info=True)
+        logger.debug("candidate_strategy=union: capability probe failed", exc_info=True)
+        return
+
+    where = build_where_filter(wing, room)
+    try:
+        bm25_extra = collection.keyword_candidates(
+            query=query,
+            n_results=n_results * 3,
+            where=where or None,
+            restrict_ids=restrict_ids,
+        )
+    except Exception:
+        # Recall is the design requirement, so a persistently-broken keyword
+        # path (missing trigram GIN, schema drift, backend error) must be
+        # visible rather than silently degrading union to vector-only.
+        logger.warning("candidate_strategy=union: keyword fetch failed", exc_info=True)
         return
 
     def _dedup_key(entry: dict):
@@ -725,6 +748,33 @@ def _validate_candidate_strategy(strategy: str) -> None:
         )
 
 
+# Sentinel for ``search_memories(candidate_strategy=...)``: distinguishes
+# "caller passed nothing" (consult the env, then default) from an explicit
+# value. The default candidate strategy is ``"union"`` (G003) — keyword
+# candidates are merged into the rerank pool on both backends.
+_DEFAULT_CANDIDATE_STRATEGY = "union"
+_CANDIDATE_STRATEGY_UNSET = object()
+
+
+def _resolve_candidate_strategy(explicit) -> str:
+    """Resolve the effective candidate strategy.
+
+    Precedence: an explicit ``candidate_strategy`` argument always wins; when
+    the caller passes nothing, the ``MEMPALACE_CANDIDATE_STRATEGY`` env var is
+    consulted (the per-deployment latency escape hatch — e.g. force ``"vector"``
+    to skip the extra keyword query); when neither is set the default is
+    ``"union"``. The resolved value is validated against the allowed set so an
+    invalid env value fails the same way an invalid argument does.
+    """
+    if explicit is not _CANDIDATE_STRATEGY_UNSET:
+        return explicit
+    env_value = os.environ.get("MEMPALACE_CANDIDATE_STRATEGY")
+    if env_value:
+        _validate_candidate_strategy(env_value)
+        return env_value
+    return _DEFAULT_CANDIDATE_STRATEGY
+
+
 def _apply_candidate_strategy(
     strategy: str,
     hits: list,
@@ -734,15 +784,29 @@ def _apply_candidate_strategy(
     room: str,
     n_results: int,
     max_distance: float = 0.0,
+    collection=None,
+    restrict_ids: list | None = None,
 ) -> None:
     """Dispatch to the registered merger for ``strategy``.
 
     Strategy validity is assumed (``_validate_candidate_strategy`` runs
-    earlier); ``"vector"`` is a no-op.
+    earlier); ``"vector"`` is a no-op. The live ``collection`` handle is
+    threaded through so the union merger can dispatch keyword retrieval on
+    the backend's capability (see ``_merge_bm25_union_candidates``).
     """
     merger = _CANDIDATE_MERGERS[strategy]
     if merger is not None:
-        merger(hits, query, palace_path, wing, room, n_results, max_distance=max_distance)
+        merger(
+            hits,
+            query,
+            palace_path,
+            wing,
+            room,
+            n_results,
+            max_distance=max_distance,
+            collection=collection,
+            restrict_ids=restrict_ids,
+        )
 
 
 def search_memories(
@@ -753,10 +817,10 @@ def search_memories(
     n_results: int = 5,
     max_distance: float = 0.0,
     vector_disabled: bool = False,
-    candidate_strategy: str = "vector",
+    candidate_strategy=_CANDIDATE_STRATEGY_UNSET,
     collection_name: str = None,
     team: str = None,
-    restrict_ids: list = None,
+    restrict_ids: list | None = None,
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 
@@ -777,31 +841,40 @@ def search_memories(
             detects a divergence that would segfault chromadb on segment
             load.
         candidate_strategy: How candidates for the hybrid re-rank are gathered.
+            When the argument is omitted, the value is resolved from the
+            ``MEMPALACE_CANDIDATE_STRATEGY`` env var if set, otherwise it
+            defaults to ``"union"`` (G003). An explicit argument always wins
+            over the env var.
 
-            * ``"vector"`` (default) — preserves historical behavior: top
-              ``n_results * 3`` rows from the vector index are the rerank pool.
-              Cheap; works well when query and target docs agree in the
-              embedding space.
-            * ``"union"`` — also pull top ``n_results * 3`` BM25 candidates
-              from the sqlite FTS5 index and merge them into the rerank pool
-              (deduped by source_file). Catches docs with strong BM25 signal
-              that are vector-distant from the query (e.g. terminology guides
-              looked up by narrative-shaped queries; policy clauses surfaced
-              by scenario descriptions). Adds one sqlite open + FTS5 MATCH
-              per query; perf cost is small but unmeasured at corpus scale.
-              Opt in until the cost is characterized.
+            * ``"union"`` (default) — pull top ``n_results * 3`` scoreless
+              keyword candidates from the live collection's own keyword route
+              (``collection.keyword_candidates`` — postgres' trigram GIN,
+              chroma's FTS5 path) and merge them into the rerank pool (deduped
+              chunk-precisely). Catches docs with strong keyword signal that
+              are vector-distant from the query (e.g. terminology guides looked
+              up by narrative-shaped queries; policy clauses surfaced by
+              scenario descriptions). Adds one indexed keyword query per search
+              on both backends.
 
-              When ``max_distance > 0.0`` is also set, BM25-only candidates
+              When ``max_distance > 0.0`` is also set, keyword-only candidates
               are skipped — they have no vector distance and would silently
               violate the requested distance threshold.
+            * ``"vector"`` — preserves the historical narrow behavior: only the
+              top ``n_results * 3`` rows from the vector index form the rerank
+              pool; no keyword candidates are injected. The per-process latency
+              escape hatch (set ``MEMPALACE_CANDIDATE_STRATEGY=vector``, or pass
+              the argument explicitly) when the extra keyword query is too
+              costly for a deployment.
         restrict_ids: Optional list of drawer ids to restrict the candidate set
             to before ranking (entity-scoped recall). Applied to the drawer
             floor query only; ``None`` (default) leaves search unscoped. Honored
             by the Postgres backend; the chroma path does not set it.
     """
-    # Validate the strategy eagerly so invalid values fail the same way
-    # regardless of whether the call routes through the vector path or
-    # the BM25-only fallback below.
+    # Resolve the effective strategy: explicit arg > MEMPALACE_CANDIDATE_STRATEGY
+    # env > "union" default. Validate eagerly so invalid values (arg or env)
+    # fail the same way regardless of whether the call routes through the
+    # vector path or the BM25-only fallback below.
+    candidate_strategy = _resolve_candidate_strategy(candidate_strategy)
     _validate_candidate_strategy(candidate_strategy)
 
     if vector_disabled:
@@ -1011,6 +1084,8 @@ def search_memories(
         room,
         n_results,
         max_distance=max_distance,
+        collection=drawers_col,
+        restrict_ids=restrict_ids,
     )
 
     # BM25 hybrid re-rank within the final candidate set, then trim back

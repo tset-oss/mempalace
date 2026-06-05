@@ -264,6 +264,35 @@ def test_keyword_candidates_respects_where_filter(backend, team):
 
 
 @live_only
+def test_keyword_candidates_respects_and_wing_room(backend, team):
+    """Both-filter (``$and``) scoping is honored on postgres.
+
+    Regression lock-in paired with the chroma ``$and`` fix (G003): the union
+    merger passes ``build_where_filter(wing, room)``, which is a
+    ``{"$and": [{"wing": w}, {"room": r}]}`` shape when both are set. Postgres'
+    ``_WhereTranslator`` must scope on BOTH (unlike the chroma wrapper, which
+    needed an explicit flatten).
+    """
+    col = _col(backend, team, create=True)
+    _seed(col)
+    # In-scope $and → the rare token is retrieved.
+    in_scope = col.keyword_candidates(
+        query="zylophonics",
+        n_results=10,
+        where={"$and": [{"wing": "projects"}, {"room": "2026-06-05"}]},
+    )
+    assert any("zylophonics" in c["text"] for c in in_scope)
+    # Wrong room inside $and → scoped out despite the token match (proves the
+    # room arm of the $and is applied, not dropped).
+    out_of_scope = col.keyword_candidates(
+        query="zylophonics",
+        n_results=10,
+        where={"$and": [{"wing": "projects"}, {"room": "nonexistent_room"}]},
+    )
+    assert out_of_scope == []
+
+
+@live_only
 def test_keyword_candidates_respects_restrict_ids(backend, team):
     col = _col(backend, team, create=True)
     rare_id = _seed(col)
@@ -380,3 +409,73 @@ def test_candidates_survive_union_merge_dedup(backend, team):
         hits.append(bh)
         seen.add(k)
     assert len(hits) == len(cands), "a postgres candidate was dropped by the dedup None-guard"
+
+
+# --------------------------------------------------------------------------
+# (e) G003: the union merger dispatches on the live postgres collection handle
+# --------------------------------------------------------------------------
+
+
+@live_only
+def test_union_merger_dispatches_to_postgres_keyword_candidates(backend, team):
+    """``_merge_bm25_union_candidates`` routes through the live postgres handle.
+
+    G003 threads the live collection into the merger and dispatches on
+    ``supports_keyword_candidates``. Driven against a real ``PostgresCollection``
+    the merger must (1) inject the lexically-exact rare-token drawer that a
+    vector-only hit list missed, and (2) tag every injected candidate scoreless
+    (``distance=None``, ``effective_distance=None``, ``closet_boost=0.0``).
+    """
+    from mempalace.searcher import _merge_bm25_union_candidates
+
+    col = _col(backend, team, create=True)
+    _seed(col)
+    assert col.supports_keyword_candidates() is True
+
+    # A starting hit list that does NOT contain the rare-token drawer.
+    hits = [
+        {
+            "text": "General meeting notes about scheduling.",
+            "source_file": "misc_0.md",
+            "distance": 0.3,
+            "_source_file_full": "/home/agent/notes/misc_0.md",
+            "_chunk_index": 0,
+        }
+    ]
+    _merge_bm25_union_candidates(
+        hits, "zylophonics report", "/ignored", None, None, 5, collection=col
+    )
+    texts = [h["text"] for h in hits]
+    assert any("zylophonics" in t for t in texts), (
+        "union merger must inject the lexically-exact postgres keyword candidate"
+    )
+    injected = [h for h in hits if "zylophonics" in h["text"]]
+    for h in injected:
+        assert h["distance"] is None
+        assert h["effective_distance"] is None
+        assert h["closet_boost"] == 0.0
+
+
+@live_only
+def test_union_merger_max_distance_skips_postgres_candidates(backend, team):
+    """``max_distance>0`` must skip scoreless candidates on the postgres route too."""
+    from mempalace.searcher import _merge_bm25_union_candidates
+
+    col = _col(backend, team, create=True)
+    _seed(col)
+
+    hits = [
+        {
+            "text": "General meeting notes about scheduling.",
+            "source_file": "misc_0.md",
+            "distance": 0.3,
+            "_source_file_full": "/home/agent/notes/misc_0.md",
+            "_chunk_index": 0,
+        }
+    ]
+    before = list(hits)
+    _merge_bm25_union_candidates(
+        hits, "zylophonics report", "/ignored", None, None, 5,
+        max_distance=0.5, collection=col,
+    )
+    assert hits == before, "max_distance>0 must inject no scoreless postgres candidates"
