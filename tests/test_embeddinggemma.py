@@ -172,6 +172,27 @@ def test_output_is_l2_normalized(patched_lazy_load):
     assert np.allclose(norms, 1.0, atol=1e-5), f"vectors not unit-norm: {norms}"
 
 
+def test_embed_query_matches_call(patched_lazy_load):
+    """Regression: ChromaDB 1.5.x's query path calls ``embedding_function.
+    embed_query(input=...)`` (not ``__call__``) when a custom EF is set. The
+    chroma-provided ``ONNXMiniLM_L6_V2`` base supplied this method, so the
+    ``minilm`` model worked, but ``EmbeddinggemmaONNX`` does not inherit from
+    chroma's ``EmbeddingFunction`` base — without an explicit ``embed_query``,
+    every chroma search under the deploy-default embeddinggemma model raised
+    ``AttributeError: 'EmbeddinggemmaONNX' object has no attribute
+    'embed_query'`` (the postgres backend was unaffected — it calls ``__call__``
+    directly). ``embed_query`` must exist and delegate to ``__call__`` so query
+    and document vectors stay identical (cross-backend search parity).
+    """
+    ef = embedding.EmbeddinggemmaONNX()
+    assert hasattr(ef, "embed_query"), (
+        "EmbeddinggemmaONNX must expose embed_query (chroma query path)"
+    )
+    via_call = ef(["black hole event horizon"])
+    via_query = ef.embed_query(["black hole event horizon"])
+    assert via_query == via_call, "embed_query must produce the same vectors as __call__"
+
+
 def test_prefix_is_applied(patched_lazy_load, monkeypatch):
     captured = []
     original_encode_batch = _FakeTokenizer.encode_batch

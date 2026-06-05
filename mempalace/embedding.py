@@ -132,6 +132,16 @@ def _build_ef_class():
 # the model (~300 MB) downloads on first call and is cached by huggingface_hub.
 _EMBEDDINGGEMMA_REPO = "onnx-community/embeddinggemma-300m-ONNX"
 _EMBEDDINGGEMMA_ONNX = "model_quantized.onnx"
+# A single SYMMETRIC prompt is applied to both documents (write) and queries
+# (read). This is deliberate: it keeps query and document encodings identical so
+# the chroma and postgres backends rank on the same vector space (postgres calls
+# __call__ for both, so it is symmetric too — `embed_query` delegates to
+# `__call__` for parity). EmbeddingGemma also ships ASYMMETRIC retrieval prompts
+# ("task: search result | query: " for queries, "title: none | text: " for
+# documents); adopting them could improve retrieval quality but would require the
+# postgres backend to distinguish query-vs-document encoding and would break the
+# current cross-backend symmetry. Tracked as a deferred optimization (see the
+# search-parity ADR follow-ups); do NOT change without re-running the parity harness.
 _EMBEDDINGGEMMA_PREFIX = "task: sentence similarity | query: "
 _EMBEDDINGGEMMA_DIM = 384  # Matryoshka truncation — first 384 dims of the 768
 _EMBEDDINGGEMMA_MAX_LEN = 2048
@@ -233,6 +243,23 @@ class EmbeddinggemmaONNX:
         # MTEB methodology assumes; ChromaDB's distance is configured for it).
         norms = np.linalg.norm(sent_emb, axis=1, keepdims=True) + 1e-12
         return (sent_emb / norms).tolist()
+
+    def embed_query(self, input):  # noqa: A002 — ChromaDB EF protocol uses `input`
+        """Embed a query — required by the ChromaDB 1.5.x EF protocol.
+
+        ChromaDB's query path calls ``embedding_function.embed_query(input=...)``
+        when a custom EF is set, while the write path uses ``__call__``. The
+        chroma-provided ``ONNXMiniLM_L6_V2`` base supplies this method (so the
+        ``minilm`` model worked), but this class does not inherit from
+        chroma's ``EmbeddingFunction`` base, so without this delegation every
+        chroma search under ``embeddinggemma`` raised
+        ``AttributeError: 'EmbeddinggemmaONNX' object has no attribute
+        'embed_query'``. Delegating to ``__call__`` keeps query and document
+        vectors identical — the same behaviour the Postgres backend already
+        gets (it always calls ``__call__``), which is exactly what cross-backend
+        search parity requires.
+        """
+        return self(input)
 
 
 def get_embedding_function(device: Optional[str] = None, model: Optional[str] = None):
