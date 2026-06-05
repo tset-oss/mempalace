@@ -10,6 +10,13 @@
 
 CREATE EXTENSION IF NOT EXISTS vector;
 
+-- pg_trgm backs the per-drawer trigram GIN on ``document`` and is a REQUIRED
+-- path (keyword-candidate retrieval substrate), not optional like pg_search/age
+-- below. It is a core, always-available contrib extension needing no preload, so
+-- it is created unguarded (NOT in a DO/EXCEPTION swallow block) and must be
+-- ordered before any ``gin_trgm_ops`` DDL.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
 DO $$
 BEGIN
     CREATE EXTENSION IF NOT EXISTS pg_search;

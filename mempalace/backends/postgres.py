@@ -725,6 +725,12 @@ class PostgresBackend(BaseBackend):
             with self._conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                    # pg_trgm backs the trigram GIN on ``document`` and is a
+                    # REQUIRED path (the keyword-candidate retrieval substrate),
+                    # unlike the optional pg_search/age below. It is core to
+                    # Postgres and always available, so a failure here must
+                    # surface (propagate) rather than be swallowed and warned.
+                    cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
                     for ext in ("pg_search", "age"):
                         try:
                             cur.execute(f"CREATE EXTENSION IF NOT EXISTS {ext}")
@@ -751,6 +757,7 @@ class PostgresBackend(BaseBackend):
         key = (schema, table)
         if key in self._ensured:
             return
+        preexisting_table = False
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -759,6 +766,7 @@ class PostgresBackend(BaseBackend):
                 schema_exists = cur.fetchone() is not None
                 cur.execute("SELECT to_regclass(%s)", (f"{schema}.{table}",))
                 table_exists = cur.fetchone()[0] is not None
+                preexisting_table = table_exists
 
                 if not create:
                     if not schema_exists:
@@ -789,6 +797,15 @@ class PostgresBackend(BaseBackend):
                         f"CREATE INDEX IF NOT EXISTS {_qi(table + '_hnsw')} "
                         f"ON {_qi(schema)}.{_qi(table)} USING hnsw (embedding vector_cosine_ops)"
                     )
+                    # Trigram GIN on ``document`` for index-backed keyword
+                    # ($contains) retrieval. Created in the SAME transaction as
+                    # the table itself, so a fresh collection is atomic: a
+                    # mid-statement failure rolls back the whole table-create
+                    # (no half-created table missing its trigram index).
+                    cur.execute(
+                        f"CREATE INDEX IF NOT EXISTS {_qi(table + '_doc_trgm')} "
+                        f"ON {_qi(schema)}.{_qi(table)} USING gin (document gin_trgm_ops)"
+                    )
                     # Best-effort BM25 index for optional keyword push-down.
                     try:
                         cur.execute(
@@ -799,7 +816,104 @@ class PostgresBackend(BaseBackend):
                     except Exception as e:  # pragma: no cover - pg_search optional
                         conn.rollback()
                         logger.warning("BM25 index not created (pg_search unavailable): %s", e)
+        # Existing-vault migration: a table created before the trigram GIN was
+        # introduced has no ``{table}_doc_trgm`` index. Add it WITHOUT holding an
+        # ACCESS EXCLUSIVE lock on the (possibly large, live) table — i.e. with
+        # CREATE INDEX CONCURRENTLY, which cannot run inside the transaction
+        # block above and is therefore run on a dedicated autocommit connection
+        # OUTSIDE the ``_conn()`` context. Idempotent and a no-op once the index
+        # exists; fresh tables already got the GIN atomically in the txn above.
+        if preexisting_table:
+            self._migrate_doc_trgm_index(schema, table)
         self._ensured.add(key)
+
+    def _migrate_doc_trgm_index(self, schema: str, table: str) -> None:
+        """Add the ``{table}_doc_trgm`` trigram GIN to a pre-existing table.
+
+        Uses ``CREATE INDEX CONCURRENTLY IF NOT EXISTS`` so building the index on
+        a populated, live table does not take an ACCESS EXCLUSIVE lock that would
+        block concurrent ``add_drawer``/search traffic. CONCURRENTLY cannot run
+        inside a transaction block, so this acquires a pooled connection and
+        forces ``autocommit`` (the ``_conn()`` path is a transaction and must NOT
+        be used here).
+
+        CONCURRENTLY can leave an INVALID index behind on failure; this detects
+        an invalid leftover, drops it, and retries once before surfacing a clear
+        error. Calling this when the index already exists (and is valid) is a
+        cheap no-op (``IF NOT EXISTS``).
+        """
+        index_name = table + "_doc_trgm"
+        # Validate identifiers up front (defence-in-depth; ``_qi`` would reject
+        # an unsafe identifier anyway, but fail fast before any DDL).
+        _qi(schema)
+        _qi(table)
+        _qi(index_name)
+        create_sql = (
+            f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {_qi(index_name)} "
+            f"ON {_qi(schema)}.{_qi(table)} USING gin (document gin_trgm_ops)"
+        )
+        drop_sql = f"DROP INDEX CONCURRENTLY IF EXISTS {_qi(schema)}.{_qi(index_name)}"
+
+        def _index_is_invalid(conn) -> bool:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT i.indisvalid FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "JOIN pg_index i ON i.indexrelid = c.oid "
+                    "WHERE n.nspname = %s AND c.relname = %s",
+                    (schema, index_name),
+                )
+                row = cur.fetchone()
+            return row is not None and row[0] is False
+
+        with self._pool().connection() as conn:
+            # CONCURRENTLY requires autocommit (no surrounding transaction block).
+            # Restore autocommit=False unconditionally on exit so the physical
+            # connection returned to the pool has normal transactional semantics
+            # for the next consumer. psycopg_pool's reset normalises transaction
+            # STATUS but does NOT reset the autocommit attribute, so without the
+            # finally the next caller inherits autocommit=True and loses atomicity.
+            conn.autocommit = True
+            try:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(create_sql)
+                except Exception as e:
+                    # A failed CONCURRENTLY build can leave an INVALID index; drop it
+                    # and retry once. If the retry also fails, surface a clear error.
+                    logger.warning(
+                        "concurrent trigram GIN build failed for %s.%s (%s); "
+                        "dropping any invalid leftover and retrying once",
+                        schema,
+                        index_name,
+                        e,
+                    )
+                    with conn.cursor() as cur:
+                        cur.execute(drop_sql)
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute(create_sql)
+                    except Exception as retry_err:
+                        raise RuntimeError(
+                            f"failed to create trigram GIN {schema}.{index_name} "
+                            f"concurrently after retry: {retry_err}"
+                        ) from retry_err
+                # Guard: even a "successful" CONCURRENTLY can leave an invalid index
+                # if interrupted; if so, drop it and rebuild once so we never leave a
+                # silently-unused invalid index behind.
+                if _index_is_invalid(conn):
+                    with conn.cursor() as cur:
+                        cur.execute(drop_sql)
+                        cur.execute(create_sql)
+                    if _index_is_invalid(conn):
+                        raise RuntimeError(
+                            f"trigram GIN {schema}.{index_name} remains INVALID after rebuild"
+                        )
+            finally:
+                # Restore transactional semantics before the connection goes back
+                # to the pool. The connection is IDLE in autocommit here (all DDL
+                # committed individually via autocommit), so this is safe.
+                conn.autocommit = False
 
     # -- contract ---------------------------------------------------------
     def get_collection(self, *args, **kwargs) -> PostgresCollection:
