@@ -1016,6 +1016,74 @@ class ChromaCollection(BaseCollection):
             yield
 
     # ------------------------------------------------------------------
+    # Keyword candidates (G002)
+    # ------------------------------------------------------------------
+
+    def keyword_candidates(
+        self,
+        *,
+        query: str,
+        n_results: int,
+        where=None,
+        restrict_ids=None,
+    ) -> list[dict]:
+        """Thin wrapper over the existing FTS5/BM25 keyword route.
+
+        Delegates to ``searcher._bm25_only_via_sqlite`` — chroma's single
+        keyword-retrieval path (chromadb's own FTS5 trigram index) — and adapts
+        its rows to the SCORELESS :meth:`BaseCollection.keyword_candidates`
+        contract. ``wing``/``room`` are extracted from ``where`` (the only
+        filters the FTS5 path supports); ``restrict_ids`` is not honoured by the
+        sqlite path and is therefore ignored (chroma keyword candidates are
+        not entity-id pre-filtered — vector retrieval covers that). The in-DB
+        BM25 score the helper attaches is dropped here so the single Python
+        Okapi-BM25 in ``searcher._hybrid_rank`` remains the only ranker.
+
+        Returns ``[]`` when no palace_path is configured (direct-constructed
+        collection) so the union merger degrades to vector-only rather than
+        raising.
+        """
+        if self._palace_path is None:
+            return []
+        from ..searcher import _bm25_only_via_sqlite
+
+        wing = where.get("wing") if isinstance(where, dict) else None
+        room = where.get("room") if isinstance(where, dict) else None
+        try:
+            collection_name = self._collection.name
+        except Exception:
+            collection_name = None
+        result = _bm25_only_via_sqlite(
+            query,
+            self._palace_path,
+            wing=wing,
+            room=room,
+            n_results=n_results,
+            _include_internal=True,
+            collection_name=collection_name,
+        )
+        rows = result.get("results", []) if isinstance(result, dict) else []
+        out: list[dict] = []
+        for r in rows:
+            full_source = r.get("_source_file_full", "") or ""
+            out.append(
+                {
+                    "text": r.get("text", ""),
+                    "wing": r.get("wing", "unknown"),
+                    "room": r.get("room", "unknown"),
+                    "source_file": r.get("source_file", "?"),
+                    "created_at": r.get("created_at", "unknown"),
+                    # SCORELESS — drop any in-DB BM25 score the helper attached.
+                    "similarity": None,
+                    "distance": None,
+                    "matched_via": "keyword_chroma",
+                    "_source_file_full": full_source,
+                    "_chunk_index": r.get("_chunk_index"),
+                }
+            )
+        return out
+
+    # ------------------------------------------------------------------
     # Writes
     # ------------------------------------------------------------------
 
@@ -1268,6 +1336,7 @@ class ChromaBackend(BaseBackend):
             "supports_embeddings_out",
             "supports_metadata_filters",
             "supports_contains_fast",
+            "supports_keyword_candidates",
             "local_mode",
         }
     )

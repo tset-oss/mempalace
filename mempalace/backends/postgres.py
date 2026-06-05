@@ -257,6 +257,25 @@ def _as_text(value) -> str:
     return str(value)
 
 
+# Token splitter for keyword-candidate selection. Mirrors ``searcher._tokenize``
+# (lowercase, ``\w{2,}`` unicode word runs) so the postgres keyword path and the
+# chroma FTS path tokenise identically; re-implemented locally to avoid importing
+# ``searcher`` (which imports the backends — a circular import). Callers apply the
+# ≥3-char trigram floor on top, matching ``_bm25_only_via_sqlite``.
+_KEYWORD_TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
+
+
+def _tokenize_query(text: Optional[str]) -> list[str]:
+    if not text:
+        return []
+    return _KEYWORD_TOKEN_RE.findall(text.lower())
+
+
+def _basename(path: str) -> str:
+    """Return the trailing path component (handles both '/' and '\\')."""
+    return re.split(r"[\\/]", path)[-1]
+
+
 def _where_document_clause(where_document: Optional[dict], params: list[Any], doc_col: str = "document") -> Optional[str]:
     """Translate a where_document ``{"$contains": "x"}`` into an ILIKE clause."""
     if not where_document:
@@ -551,6 +570,108 @@ class PostgresCollection(BaseCollection):
         out_dists.append(dists)
         out_embs.append(embs)
 
+    def keyword_candidates(
+        self,
+        *,
+        query: str,
+        n_results: int,
+        where=None,
+        restrict_ids=None,
+    ) -> list[dict]:
+        """Trigram-similarity SCORELESS keyword candidates (G002).
+
+        Tokenises ``query`` (≥3-char tokens — the same trigram floor the chroma
+        FTS path uses; see ``searcher._bm25_only_via_sqlite``) and selects
+        drawers whose ``document`` matches ANY token via ``ILIKE '%token%'``.
+        Each ``ILIKE '%...%'`` on a ≥3-char needle is eligible for the G001
+        trigram GIN (``{table}_doc_trgm``, ``gin_trgm_ops``) as a Bitmap Index
+        Scan. The planner switches to the GIN once the table is large enough for
+        it to beat a sequential scan on cost; small/fresh vaults may still Seq
+        Scan the multi-token OR (results are identical either way). Rows are
+        ordered by ``word_similarity(query, document)`` purely to decide which
+        matches survive the ``LIMIT`` — a truncation heuristic, NOT a relevance
+        score. The single Python Okapi-BM25 in ``searcher._hybrid_rank`` does the
+        real ranking (the merger over-fetches ``n_results*3``).
+
+        The result is SCORELESS by contract (``distance=None``, no
+        ``paradedb.score``): the single Python Okapi-BM25 in
+        ``searcher._hybrid_rank`` is the only ranker. See
+        :meth:`BaseCollection.keyword_candidates` for the full return-shape
+        contract.
+
+        When the query yields no ≥3-char token (e.g. "is a"), this returns an
+        empty list — there is no usable trigram needle, matching the chroma
+        path's documented <3-char floor. ``$contains``/``where_document``
+        retrieval (``_where_document_clause``) is unaffected: it still returns
+        correct results for short needles via a (non-index-accelerated) ILIKE
+        fallback.
+        """
+        _validate_where(where)
+        tokens = [t for t in _tokenize_query(query) if len(t) >= 3]
+        if not tokens:
+            return []
+
+        params: list[Any] = []
+        where_parts = ["embedding IS NOT NULL"]
+        if where:
+            tr = _WhereTranslator()
+            frag = tr.translate(where)
+            if frag:
+                where_parts.append(frag)
+                params.extend(tr.params)
+        if restrict_ids is not None:
+            where_parts.append("id = ANY(%s)")
+            params.append(list(restrict_ids))
+
+        # OR of per-token ILIKE predicates. Each ``document ILIKE '%token%'`` on
+        # a ≥3-char token is GIN-accelerated by the trigram index (G001).
+        ilike_clauses = []
+        for tok in tokens:
+            ilike_clauses.append("document ILIKE %s")
+            params.append(f"%{tok}%")
+        where_parts.append("(" + " OR ".join(ilike_clauses) + ")")
+
+        # word_similarity(query, document) orders by best lexical overlap. The
+        # query text is a bind param, NOT a score returned to the pipeline.
+        params.append(query)  # word_similarity first arg
+        params.append(int(n_results))
+        sql = (
+            f"SELECT id, document, metadata FROM {self._fqtn} "
+            f"WHERE {' AND '.join(f'({c})' for c in where_parts)} "
+            "ORDER BY word_similarity(%s, document) DESC "
+            "LIMIT %s"
+        )
+
+        with self._backend._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+
+        candidates: list[dict] = []
+        for row in rows:
+            doc = row[1] or ""
+            meta = _loads_meta(row[2])
+            full_source = meta.get("source_file", "") or ""
+            candidates.append(
+                {
+                    "text": doc,
+                    "wing": meta.get("wing", "unknown"),
+                    "room": meta.get("room", "unknown"),
+                    "source_file": _basename(full_source) if full_source else "?",
+                    "created_at": meta.get("filed_at", "unknown"),
+                    # SCORELESS: no vector distance, no in-DB/BM25 score. The
+                    # single Python Okapi-BM25 in _hybrid_rank ranks these.
+                    "similarity": None,
+                    "distance": None,
+                    "matched_via": "keyword_postgres",
+                    # Chunk-precise dedup key for _merge_bm25_union_candidates
+                    # (searcher.py:684-697); a None key is silently dropped.
+                    "_source_file_full": full_source,
+                    "_chunk_index": meta.get("chunk_index"),
+                }
+            )
+        return candidates
+
     def get(
         self,
         *,
@@ -670,6 +791,7 @@ class PostgresBackend(BaseBackend):
             "supports_embeddings_out",
             "supports_metadata_filters",
             "supports_contains_fast",
+            "supports_keyword_candidates",
             "server_mode",
             "multi_tenant",
         }

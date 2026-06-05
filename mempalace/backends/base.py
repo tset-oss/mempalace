@@ -299,6 +299,62 @@ class BaseCollection(ABC):
             embeddings=embeddings,
         )
 
+    def keyword_candidates(
+        self,
+        *,
+        query: str,
+        n_results: int,
+        where: Optional[dict] = None,
+        restrict_ids: Optional[list[str]] = None,
+    ) -> list[dict]:
+        """Return SCORELESS keyword-match candidate drawers for ``query``.
+
+        This is the optional keyword-retrieval seam consumed by
+        ``searcher.search_memories(..., candidate_strategy="union")``: it widens
+        the rerank pool's *source* with lexically-strong documents that
+        vector-only selection skips. Backends advertise support via the
+        ``supports_keyword_candidates`` capability flag; the single Python
+        Okapi-BM25 in ``searcher._hybrid_rank`` is the *only* ranker, so this
+        method MUST NOT return any in-DB / BM25 score.
+
+        Return-shape contract (pinned here, NOT in tests). Each returned dict
+        MUST carry:
+
+        * ``text`` — the verbatim document content.
+        * ``wing`` / ``room`` / ``source_file`` — drawer location (``source_file``
+          is the basename; falls back to ``"?"`` when absent).
+        * ``_source_file_full`` — the full (un-basenamed) ``source_file`` from
+          metadata. Together with ``_chunk_index`` this is the chunk-precise
+          dedup key used by ``searcher._merge_bm25_union_candidates._dedup_key``
+          (``searcher.py``); a candidate whose key resolves to ``None`` is
+          SILENTLY DROPPED by that merger (``searcher.py:697``), so every
+          candidate MUST carry enough of ``_source_file_full`` / ``_chunk_index``
+          / ``source_file`` to produce a non-``None`` dedup key.
+        * ``_chunk_index`` — the metadata ``chunk_index`` (may be ``None`` when a
+          drawer is unchunked; ``source_file`` then carries the dedup key).
+        * ``distance=None`` — SCORELESS. There is no vector distance and no
+          in-DB keyword score; ``_hybrid_rank`` treats ``distance=None`` as
+          vector-unknown and scores the candidate on its BM25 contribution
+          alone. A candidate MUST NOT carry ``paradedb.score`` or any other
+          in-DB score number.
+
+        Implementations MAY carry extra display-only fields (e.g. ``created_at``,
+        ``similarity=None``) to match the existing chroma candidate shape in
+        ``searcher._bm25_only_via_sqlite``; downstream formatting tolerates the
+        extras. Only the keys enumerated above are load-bearing.
+
+        ``where`` is the Chroma where-dict algebra (wing/room filtering);
+        ``restrict_ids`` optionally pre-filters to specific drawer ids
+        (entity-scoped search).
+
+        The ABC default is the "unsupported" sentinel: an empty list. Backends
+        without keyword retrieval simply contribute no extra candidates (the
+        union merger then degrades to vector-only), mirroring the no-op default
+        of the other optional methods in this region. Backends that DO support
+        it MUST override AND advertise ``supports_keyword_candidates``.
+        """
+        return []
+
 
 # ---------------------------------------------------------------------------
 # Backend contract
