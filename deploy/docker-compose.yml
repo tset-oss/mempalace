@@ -1,6 +1,7 @@
-# Central MemPalace — PostgreSQL (pgvector + pg_search BM25 + Apache AGE) plus
-# the HTTP MCP server (FastMCP, streamable-http) that engineers' Claude Code
-# connects to.
+# Central MemPalace — PostgreSQL (pgvector vectors + pg_trgm keyword recall +
+# Apache AGE graph; pg_search is provisioned but the query path does not use it
+# for retrieval) plus the HTTP MCP server (FastMCP, streamable-http) that
+# engineers' Claude Code connects to.
 #
 #   cd deploy && cp .env.example .env   # then set MEMPALACE_AUTH_TOKEN
 #   docker compose up -d --build

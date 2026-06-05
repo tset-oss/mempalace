@@ -1299,6 +1299,15 @@ def tool_search(
     vault: str = None,
     entity: str = None,
 ):
+    """Hybrid (vector + keyword) ranked search over the palace.
+
+    ``entity=`` is a RANKED-AND-TRUNCATED view, not a complete dump: it narrows
+    the candidate set to the drawers that mention ``entity`` and then returns the
+    vector/union-ranked subset capped at ``limit``. Drawers about the entity that
+    rank below the cutoff are not returned. For the lossless "everything about
+    entity X" path, use ``mempalace_entities(entity=...)`` to list every drawer
+    id, then ``mempalace_get_drawer`` on each id for the verbatim content.
+    """
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
         wing = _sanitize_optional_name(wing, "wing")
@@ -1478,13 +1487,17 @@ def tool_entities(
 ):
     """Navigate the per-vault entity index (central server only).
 
-    With ``entity``: the drawers that mention it (ids + wing/room) — the entry
-    point for entity-scoped recall; pair with ``mempalace_search(entity=...)``
-    for the verbatim content. Without ``entity``: the vault's most-mentioned
-    entities, scoped to ``wing`` if given. ``min_count`` (overview only, default
-    2) filters one-off extraction noise; pass 1 to see everything. On the local
-    chroma backend the entity index does not exist (use ``mempalace mine`` +
-    search there).
+    With ``entity``: EVERY drawer that mentions it (ids + wing/room), unranked and
+    untruncated — this is the lossless first step of the "everything about entity
+    X" path. Follow each id with ``mempalace_get_drawer`` to read the verbatim
+    content. Prefer this two-step over ``mempalace_search(entity=...)`` when you
+    need all of the entity's drawers: ``mempalace_search(entity=...)`` is
+    RANKED-AND-TRUNCATED (it returns only the vector/union-ranked subset capped at
+    its ``limit``), whereas this list is complete. Without ``entity``: the vault's
+    most-mentioned entities, scoped to ``wing`` if given. ``min_count`` (overview
+    only, default 2) filters one-off extraction noise; pass 1 to see everything.
+    On the local chroma backend the entity index does not exist (use
+    ``mempalace mine`` + search there).
     """
     if _config.backend == "chroma":
         return {

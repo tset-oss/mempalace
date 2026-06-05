@@ -16,8 +16,13 @@ Design:
   are returned in pgvector's native cosine range ``[0, 2]`` — identical to
   Chroma's ``hnsw:space=cosine``, so ``searcher.py`` needs no changes.
 * **JSONB metadata** with the Chroma where-clause algebra translated to SQL.
-* **pg_search (ParadeDB BM25)** index is created best-effort for optional
-  keyword push-down; the backend still works without it.
+* **Keyword recall** rides a ``pg_trgm`` trigram GIN on ``document``: both the
+  ``$contains`` filter (for ≥3-char needles) and ``keyword_candidates()`` use it
+  to fetch SCORELESS rows (``distance=None``) that the single shared Python
+  Okapi-BM25 reranker (``searcher._hybrid_rank``) then ranks — the same ranker
+  the Chroma path uses. No in-DB score (no ``paradedb.score``) ever enters the
+  pipeline; the ``pg_search`` extension is provisioned (``_ensure_bootstrap``)
+  but the query path does not use it for retrieval.
 * **Embeddings are computed client-side** (the same embedding function Chroma
   uses) whenever the caller does not pass precomputed vectors, so existing
   miner/searcher call sites keep working unchanged.
@@ -794,6 +799,12 @@ class PostgresBackend(BaseBackend):
             "supports_embeddings_passthrough",
             "supports_embeddings_out",
             "supports_metadata_filters",
+            # ``$contains`` rides the per-drawer ``document`` trigram GIN
+            # (``gin_trgm_ops``) provisioned in ``_ensure_collection`` — a Bitmap
+            # Index Scan, not a sequential scan — for needles of ≥3 characters
+            # (the trigram floor, matching the Chroma FTS path). Below 3 chars the
+            # query is still correct via a fallback scan; the flag describes the
+            # indexed ≥3-char case.
             "supports_contains_fast",
             "supports_keyword_candidates",
             "server_mode",
@@ -932,16 +943,6 @@ class PostgresBackend(BaseBackend):
                         f"CREATE INDEX IF NOT EXISTS {_qi(table + '_doc_trgm')} "
                         f"ON {_qi(schema)}.{_qi(table)} USING gin (document gin_trgm_ops)"
                     )
-                    # Best-effort BM25 index for optional keyword push-down.
-                    try:
-                        cur.execute(
-                            f"CREATE INDEX IF NOT EXISTS {_qi(table + '_bm25')} "
-                            f"ON {_qi(schema)}.{_qi(table)} USING bm25 (id, document) "
-                            "WITH (key_field='id')"
-                        )
-                    except Exception as e:  # pragma: no cover - pg_search optional
-                        conn.rollback()
-                        logger.warning("BM25 index not created (pg_search unavailable): %s", e)
         # Existing-vault migration: a table created before the trigram GIN was
         # introduced has no ``{table}_doc_trgm`` index. Add it WITHOUT holding an
         # ACCESS EXCLUSIVE lock on the (possibly large, live) table — i.e. with

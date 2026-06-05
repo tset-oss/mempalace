@@ -1,11 +1,14 @@
 # Central MemPalace on PostgreSQL
 
 This directory hosts the **central, team-vaulted** deployment of MemPalace: a
-single PostgreSQL 18 instance with `pgvector` (vectors), ParadeDB `pg_search`
-(BM25), and Apache AGE (graph), plus an **HTTP MCP server** (FastMCP,
-streamable-http) that every engineer's Claude Code connects to. Every
-engineering team gets its own **vault** (an isolated Postgres schema, e.g.
-`team_frontend`).
+single PostgreSQL 18 instance with `pgvector` (vectors), `pg_trgm` (the trigram
+GIN that backs keyword recall), and Apache AGE (graph), plus an **HTTP MCP
+server** (FastMCP, streamable-http) that every engineer's Claude Code connects
+to. Every engineering team gets its own **vault** (an isolated Postgres schema,
+e.g. `team_frontend`). ParadeDB `pg_search` is also provisioned (see the
+Dockerfile) but the query path does not use it for retrieval — keyword
+candidates are scoreless rows from the trigram GIN, ranked by the shared Python
+Okapi-BM25 reranker.
 
 It is built for an internal engineering network. Postgres itself has **no auth
 beyond its static credentials** — never expose port 5432 publicly. The MCP

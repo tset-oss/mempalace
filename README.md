@@ -160,7 +160,8 @@ listing (the central HTTP server adds `switch_team`). Installation and the full 
 
 MemPalace is local-first by default (ChromaDB on your machine). For an internal
 engineering org it can also run **centrally**: a single PostgreSQL instance
-(pgvector + ParadeDB `pg_search` + Apache AGE) fronted by an **HTTP MCP server**
+(pgvector for vectors, `pg_trgm` for keyword recall, Apache AGE for the graph)
+fronted by an **HTTP MCP server**
 that every engineer's Claude Code connects to, with one **vault per team**
 (`frontend`, `backend`, …). The fork runs on one host; everyone else is a thin
 HTTP MCP client.
@@ -176,11 +177,15 @@ claude mcp add --transport http --scope user mempalace https://mempalace.interna
   --header "X-Mempalace-Team: frontend"
 ```
 
-The Postgres backend stores vectors in `pgvector` (HNSW cosine), keyword/BM25
-candidates in ParadeDB `pg_search`, and the temporal knowledge graph in
-per-team tables (with Apache AGE provisioned for graph traversal). Team vaults
-are isolated as Postgres schemas (`team_<name>`) and created lazily on first
-write.
+The Postgres backend stores vectors in `pgvector` (HNSW cosine) and the temporal
+knowledge graph in per-team tables (with Apache AGE provisioned for graph
+traversal). Keyword recall works the same way it does on ChromaDB: a `pg_trgm`
+trigram GIN on each drawer's text feeds **scoreless** candidates into the single
+shared Python Okapi-BM25 reranker (`searcher._hybrid_rank`) — no in-database
+score ever enters the pipeline, so both backends rank identically. This is why
+`union` (vector hits merged with keyword candidates) is the default candidate
+strategy on Postgres and Chroma alike. Team vaults are isolated as Postgres
+schemas (`team_<name>`) and created lazily on first write.
 
 **Team routing** resolves per session: the `X-Mempalace-Team` header seeds the
 default vault (user scope = a machine's default, project scope = a repo's

@@ -146,6 +146,36 @@ def test_fresh_collection_has_doc_trgm_gin(backend, team):
 
 
 # --------------------------------------------------------------------------
+# (a-flag) supports_contains_fast is accurate: the backend advertises it, and
+# the backing trigram GIN it claims actually exists on a fresh collection.
+# Honesty post-condition (story G006): the flag is true IFF $contains is
+# GIN-backed, so this ties the capability to the index it depends on.
+# --------------------------------------------------------------------------
+
+
+def test_supports_contains_fast_capability_advertised():
+    # No DB needed: the capability is a class attribute.
+    assert "supports_contains_fast" in PostgresBackend.capabilities
+
+
+@live_only
+def test_supports_contains_fast_is_backed_by_doc_trgm_gin(backend, team):
+    # The flag is only honest if the trigram GIN that makes $contains fast
+    # actually exists on a freshly-created collection.
+    assert "supports_contains_fast" in PostgresBackend.capabilities
+    _col(backend, team, create=True)
+    schema = team_schema(team)
+    row = _trgm_index_row(schema, COLLECTION + "_doc_trgm")
+    assert row is not None, (
+        "supports_contains_fast is advertised but the trigram GIN that backs it "
+        "is missing — the capability flag would be a false claim"
+    )
+    indisvalid, indexdef = row
+    assert indisvalid is True
+    assert "gin_trgm_ops" in indexdef.lower()
+
+
+# --------------------------------------------------------------------------
 # (c) existing-vault migration (the CONCURRENTLY path)
 # --------------------------------------------------------------------------
 

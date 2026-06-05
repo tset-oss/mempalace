@@ -2,7 +2,9 @@
 #
 # Layers three extensions onto postgres:18 (Debian 13/Trixie amd64):
 #   - pgvector   v0.8.2    — HNSW vector search (replaces local ChromaDB vectors)
-#   - pg_search  v0.22.5   — ParadeDB BM25 search (optional keyword push-down)
+#   - pg_search  v0.22.5   — ParadeDB BM25 (provisioned; the query path uses
+#                              pg_trgm, a core extension, for keyword recall, not
+#                              pg_search — kept available for future use)
 #   - Apache AGE v1.7.0-rc0 — Cypher graph queries (palace traversal / tunnels;
 #                              KG can move onto AGE later behind the KG interface)
 #
