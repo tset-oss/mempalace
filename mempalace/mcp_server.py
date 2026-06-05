@@ -446,6 +446,108 @@ def _unindex_drawer_entities(team, drawer_ids):
         logger.debug("entity index delete failed (best-effort)", exc_info=True)
 
 
+# Server-side closet rebuild (eventual-consistency). The CLI miner builds
+# closets; a miner-less central deployment writing through add_drawer would have
+# an empty closet index, silently disabling the closet ranking boost in search.
+# A lazily-started in-process debounce coalescer rebuilds a group's closets after
+# each add_drawer, reusing the shared deterministic palace builders. The
+# rebuild is best-effort and NEVER fails or undoes the verbatim drawer write,
+# mirroring _index_drawer_entities above.
+_closet_debouncer = None
+_closet_debouncer_lock = threading.Lock()
+_closet_reconcile_started = False
+
+
+def _get_closet_debouncer():
+    """Return the process-wide closet debounce coalescer, starting it lazily.
+
+    The debounce window honours ``MEMPALACE_CLOSET_DEBOUNCE_SECONDS`` (tests set
+    it to 0 for deterministic, sleep-free flushing) and defaults to the module
+    default otherwise.
+    """
+    global _closet_debouncer
+    if _closet_debouncer is not None:
+        return _closet_debouncer
+    with _closet_debouncer_lock:
+        if _closet_debouncer is None:
+            from .closet_rebuild import DEFAULT_DEBOUNCE_SECONDS, ClosetDebouncer
+
+            raw = os.environ.get("MEMPALACE_CLOSET_DEBOUNCE_SECONDS")
+            try:
+                debounce = float(raw) if raw is not None else DEFAULT_DEBOUNCE_SECONDS
+            except (TypeError, ValueError):
+                debounce = DEFAULT_DEBOUNCE_SECONDS
+            _closet_debouncer = ClosetDebouncer(debounce_seconds=debounce)
+            _closet_debouncer.start(palace_path=_config.palace_path)
+    return _closet_debouncer
+
+
+def _enqueue_closet_rebuild(team, source_file, wing, room):
+    """Best-effort: schedule a server-side closet rebuild for the drawer's group.
+
+    No-op on chroma (the miner stamps closets there, and the central write-path
+    gap this closes is postgres-only). Captures ``team`` HERE — inside the
+    request context — and passes it explicitly so the background worker never
+    relies on the per-session team contextvar (which a background thread does not
+    inherit). NEVER raises: a closet failure must not fail the drawer write.
+    """
+    if _config.backend == "chroma":
+        return
+    try:
+        from .closet_rebuild import closet_grouping_key
+
+        grouping_key = closet_grouping_key(source_file or "", wing, room)
+        _get_closet_debouncer().enqueue(
+            team, grouping_key, wing, room, palace_path=_config.palace_path
+        )
+    except Exception:
+        logger.debug("closet rebuild enqueue failed (best-effort)", exc_info=True)
+
+
+def _start_closet_reconcile():
+    """Re-enqueue groups with missing closets, bounded and OFF the boot path.
+
+    Pending debounce timers are per-process, so a restart can drop a rebuild
+    that never fired. This runs a bounded reconcile in a daemon thread so it
+    never blocks server boot or the first add_drawer. No-op on chroma. Idempotent.
+    """
+    global _closet_reconcile_started
+    if _config.backend == "chroma":
+        return
+    with _closet_debouncer_lock:
+        if _closet_reconcile_started:
+            return
+        _closet_reconcile_started = True
+
+    def _reconcile() -> None:
+        try:
+            from .closet_rebuild import reconcile_closets
+            from .palace import _resolve_backend
+
+            backend = _resolve_backend(_config)
+            # Reconcile every known vault; log per-vault counts. list_vaults is
+            # the server-mode vault enumerator.
+            try:
+                vaults = list(backend.list_vaults())
+            except Exception:
+                vaults = []
+            if not vaults:
+                vaults = [_canonical_default_team()]
+            debouncer = _get_closet_debouncer()
+            for team in vaults:
+                try:
+                    reconcile_closets(_config.palace_path, team, debouncer)
+                except Exception:
+                    logger.debug(
+                        "closet reconcile failed for team=%s (best-effort)", team, exc_info=True
+                    )
+        except Exception:
+            logger.debug("closet reconcile startup failed (best-effort)", exc_info=True)
+
+    t = threading.Thread(target=_reconcile, name="mempalace-closet-reconcile", daemon=True)
+    t.start()
+
+
 _client_cache = None
 _collection_cache = None
 _palace_db_inode = 0  # inode of chroma.sqlite3 at cache time
@@ -1678,6 +1780,8 @@ def tool_add_drawer(
             _metadata_cache = None
             # Best-effort per-vault entity index (server mode); never fails the write.
             _index_drawer_entities(add_team, [drawer_id], content, wing, room)
+            # Best-effort server-side closet rebuild (server mode); never fails the write.
+            _enqueue_closet_rebuild(add_team, source_file, wing, room)
             logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
             return {
                 "success": True,
@@ -1715,6 +1819,8 @@ def tool_add_drawer(
         # Best-effort per-vault entity index (server mode). Keyed on the physical
         # chunk ids actually written so delete/update stay consistent.
         _index_drawer_entities(add_team, chunk_ids, content, wing, room)
+        # Best-effort server-side closet rebuild (server mode); never fails the write.
+        _enqueue_closet_rebuild(add_team, source_file, wing, room)
         logger.info(f"Filed drawer: {drawer_id} → {wing}/{room} ({len(chunk_ids)} chunks)")
         return {
             "success": True,
@@ -3455,6 +3561,10 @@ def main():
     # Idle auto-exit: release ChromaDB file handles from stale servers
     # that outlived their Claude Code session (#1552).
     _start_idle_exit_watchdog()
+    # Bounded, best-effort closet reconcile in a daemon thread (server mode
+    # only). OFF the boot-critical path: it never blocks the request loop or the
+    # first add_drawer, and re-enqueues any group whose closets went missing.
+    _start_closet_reconcile()
     while True:
         try:
             line = sys.stdin.readline()

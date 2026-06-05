@@ -17,6 +17,7 @@ import sqlite3
 from pathlib import Path
 
 from .backends import CollectionNotInitializedError, PalaceNotFoundError
+from .closet_rebuild import closet_grouping_key
 from .palace import get_closets_collection, get_collection
 
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
@@ -971,11 +972,17 @@ def search_memories(
 
         meta = meta or {}
         source = meta.get("source_file", "") or ""
+        # Effective closet-boost key: a real source_file keys on itself; an
+        # empty source_file (an agent-curated add_drawer write) keys on the same
+        # deterministic (wing, room) fallback the server-side rebuild used, so
+        # the closet built for empty-source drawers actually boosts them. Without
+        # this, empty-source drawers never match a closet and the boost is inert.
+        boost_source = closet_grouping_key(source, meta.get("wing", ""), meta.get("room", ""))
         boost = 0.0
         matched_via = "drawer"
         closet_preview = None
-        if source in closet_boost_by_source:
-            c_rank, c_dist, c_preview = closet_boost_by_source[source]
+        if boost_source in closet_boost_by_source:
+            c_rank, c_dist, c_preview = closet_boost_by_source[boost_source]
             if c_dist <= CLOSET_DISTANCE_CAP and c_rank < len(CLOSET_RANK_BOOSTS):
                 boost = CLOSET_RANK_BOOSTS[c_rank]
                 matched_via = "drawer+closet"
