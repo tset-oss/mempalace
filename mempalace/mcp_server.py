@@ -827,20 +827,49 @@ def _refresh_vector_disabled_flag() -> None:
 # enables review/rollback of writes from external or untrusted sources.
 
 _WAL_DIR = Path(os.path.expanduser("~/.mempalace/wal"))
-_WAL_DIR.mkdir(parents=True, exist_ok=True)
-try:
-    _WAL_DIR.chmod(0o700)
-except (OSError, NotImplementedError):
-    pass
 _WAL_FILE = _WAL_DIR / "write_log.jsonl"
-# Atomically create WAL file with restricted permissions (no TOCTOU race).
-# os.open with O_CREAT|O_WRONLY and mode 0o600 creates the file if absent
-# or opens it if present, both in a single syscall.
-try:
-    _fd = os.open(str(_WAL_FILE), os.O_CREAT | os.O_WRONLY, 0o600)
-    os.close(_fd)
-except (OSError, NotImplementedError):
-    pass
+# NOTE: the directory and file are NOT created here at import time. Importing
+# this module on a postgres deploy (where the audit log goes to the central
+# team-tagged table, not a local jsonl file) must leave no host-global
+# ~/.mempalace/wal artifact behind. The directory/file are created LAZILY on
+# the first jsonl write — see ``_ensure_wal_file`` / ``_wal_log_jsonl``. On the
+# chroma/jsonl path the file still appears on first write, exactly as before,
+# just created on demand rather than eagerly at import.
+
+_wal_file_ensured = False
+
+
+def _ensure_wal_file() -> None:
+    """Create the jsonl WAL directory + file lazily, with restricted perms.
+
+    Only ever called from the jsonl write path, so the postgres sink never
+    touches the host filesystem. Idempotent: the one-time directory perms +
+    pre-creation run once per process. The parent directory is derived from
+    ``_WAL_FILE`` so a monkeypatched WAL path (tests) gets its parent created
+    too.
+    """
+    global _wal_file_ensured
+    wal_dir = _WAL_FILE.parent
+    try:
+        # Always make sure the parent exists (cheap, idempotent) — this also
+        # covers a WAL path swapped out underneath us (tests monkeypatch
+        # ``_WAL_FILE``). The directory perms + pre-creation harden once.
+        wal_dir.mkdir(parents=True, exist_ok=True)
+        if _wal_file_ensured:
+            return
+        try:
+            wal_dir.chmod(0o700)
+        except (OSError, NotImplementedError):
+            pass
+        # Atomically create the WAL file with restricted permissions (no TOCTOU
+        # race). os.open with O_CREAT|O_WRONLY and mode 0o600 creates the file
+        # if absent or opens it if present, both in a single syscall.
+        _fd = os.open(str(_WAL_FILE), os.O_CREAT | os.O_WRONLY, 0o600)
+        os.close(_fd)
+    except (OSError, NotImplementedError):
+        pass
+    _wal_file_ensured = True
+
 
 # Keys whose values should be redacted in WAL entries to avoid logging sensitive content
 _WAL_REDACT_KEYS = frozenset(
@@ -929,7 +958,13 @@ def _wal_log(operation: str, params: dict, result: dict = None, team=None):
 
 
 def _wal_log_jsonl(entry: dict) -> None:
-    """Append one audit entry to the local append-only jsonl file (0600)."""
+    """Append one audit entry to the local append-only jsonl file (0600).
+
+    The WAL directory/file are created here, lazily, on the first jsonl write,
+    so importing the module (or running on the postgres sink) leaves no
+    host-global ~/.mempalace/wal artifact behind.
+    """
+    _ensure_wal_file()
     try:
         fd = os.open(str(_WAL_FILE), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
