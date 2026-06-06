@@ -715,3 +715,49 @@ class EntityRegistry:
             f"Wiki cache: {len(self._data.get('wiki_cache', {}))} entries",
         ]
         return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Backend-aware seam
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def get_entity_registry(config, team: Optional[str] = None) -> EntityRegistry:
+    """Return the entity registry for the configured backend.
+
+    Mirrors :func:`mempalace.link_store.get_link_store`: one seam every caller
+    routes through so the chroma (JSON) registry and the per-team Postgres
+    registry cannot drift. The same public ``EntityRegistry`` method surface
+    (``lookup`` / ``seed`` / ``research`` / ``confirm_research`` /
+    ``learn_from_text`` / ``extract_people_from_query`` / ``summary`` + the
+    ``people`` / ``projects`` / ``ambiguous_flags`` / ``mode`` properties) is
+    available on whatever this returns, so callers are backend-agnostic.
+
+    * ``chroma`` (default, host-local single-vault) → the JSON
+      :class:`EntityRegistry` loaded from ``~/.mempalace/entity_registry.json``
+      (or *config_dir*), byte-for-byte unchanged. The store is single-vault, so
+      *team* is accepted for a uniform signature but ignored.
+    * any team-scoped (server-mode) backend → a per-team
+      :class:`~mempalace.entity_registry_postgres.PostgresEntityRegistry`. On
+      Postgres a team is MANDATORY — the disambiguation knowledge is scoped to
+      one team's schema, so you cannot read or write another team's registry —
+      so this path runs *team* through ``require_write_team`` and RAISES when it
+      is ``None`` rather than silently routing into a default vault (which would
+      re-create the shared-default cross-tenant leak).
+
+    Args:
+        config: a ``MempalaceConfig`` (read for ``.backend``).
+        team: the resolved team. Ignored by the chroma JSON registry; MANDATORY
+            for team-scoped backends (resolve it with the strict resolver and
+            pass the result; ``None`` fails loud via ``require_write_team``).
+    """
+    backend = getattr(config, "backend", "chroma")
+    if backend == "chroma":
+        return EntityRegistry.load()
+    # Team-scoped (server-mode) backend: team is mandatory for reads AND writes
+    # (isolation is structural — one team's schema). Fail loud on None.
+    from .entity_registry_postgres import PostgresEntityRegistry
+    from .link_store import require_write_team
+    from .palace import _resolve_backend
+
+    return PostgresEntityRegistry.open(_resolve_backend(config), team=require_write_team(team))
