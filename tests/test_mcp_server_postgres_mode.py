@@ -804,6 +804,10 @@ def test_miner_post_processing_skips_host_global_json_on_postgres(monkeypatch, t
 
     def _run(backend_name):
         monkeypatch.setenv("MEMPALACE_BACKEND", backend_name)
+        # On the central backend a mine requires a resolvable team (fail-loud
+        # before ingest); set one so the run reaches the post-mine gating under
+        # test. Chroma ignores it.
+        monkeypatch.setenv("MEMPALACE_TEAM", "tteam")
         called.update(topic=0, hallways=0, entity=0)
         miner._mine_impl(str(tmp_path), str(tmp_path / "palace"), wing_override="w")
 
