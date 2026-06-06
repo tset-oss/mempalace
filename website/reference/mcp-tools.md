@@ -474,6 +474,56 @@ know about X".
 
 ---
 
+### `mempalace_team_fact_add`
+
+*Central HTTP server only (`postgres` backend).* Record a critical fact every
+agent on this team should know — the small set of must-know facts the whole team
+shares, e.g. "the prod DB is read-replica only" or "release freeze until Q3".
+This is for team-wide facts, not per-conversation memories (file those with
+`mempalace_add_drawer`).
+
+The fact is stored in this team's vault (`team_<slug>.critical_facts`) and is
+invisible to other teams — a fact added in one team is never visible to another.
+This is DISTINCT from the personal local identity in `~/.mempalace/identity.txt`
+(the L0 "who am I" layer): that file is host-local and per-developer and is never
+vaulted; team critical-facts are the shared, central team layer.
+
+Conservative defaults: a fact is capped at 2000 characters and a team holds at
+most 200 facts; over either cap the call returns a structured error.
+
+**Parameters:**
+
+- `fact` (string, required) — the critical fact to share (a short must-know line,
+  max 2000 chars).
+- `created_by` (string, optional) — author/agent label recorded with the fact.
+
+**Returns:** `{ backend, vault, added: { id, fact, created_at, created_by } }`.
+On `chroma` → `{ available: false, backend, reason }`. On the central server a
+call with no resolvable team raises a structured error (it never falls back to a
+default vault).
+
+---
+
+### `mempalace_team_facts`
+
+*Central HTTP server only (`postgres` backend).* List this team's critical facts
+— the must-know facts every agent on the team shares, recorded via
+`mempalace_team_fact_add`. Returned oldest first and isolated from other teams.
+
+On a local (`chroma`) install there is no team concept, so the tool reports
+`available: false`; the personal identity lives in `~/.mempalace/identity.txt`
+instead.
+
+**Parameters:** None
+
+**Returns:** `{ backend, vault, facts[], count }` where each fact is
+`{ id, fact, created_at, created_by }`. On `chroma` →
+`{ available: false, backend, reason }`. On the central server a call with no
+resolvable team raises a structured error (it never falls back to a default
+vault).
+
+---
+
 ### `mempalace_switch_team`
 
 *Central HTTP server only (`mempalace serve`).* Set the active team vault for

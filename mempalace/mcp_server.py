@@ -471,6 +471,40 @@ def _get_link_store(team=None):
     return store
 
 
+# ── Per-vault team critical-facts store (server mode only) ──────────────────
+# Mirrors the link-store cache: one PostgresTeamFacts per team, sharing the
+# storage backend's connection pool. The store owns the team's
+# team_<slug>.critical_facts table — the shared, vaulted facts every agent on a
+# team should see. This is DISTINCT from the personal local L0 identity.txt
+# (layers.py Layer0, ~/.mempalace/identity.txt): that file is host-local and
+# per-developer and is NOT vaulted; this is the team-shared central layer.
+_team_facts_by_team: dict = {}
+_team_facts_lock = threading.Lock()
+
+
+def _get_team_facts(team=None):
+    """Return the cached ``PostgresTeamFacts`` for the resolved team.
+
+    Postgres requires a team for reads AND writes (isolation is structural —
+    one team's schema), so this resolves it strictly and fails loud on None.
+    """
+    from .link_store import require_write_team
+    from .palace import _resolve_backend
+    from .team_facts_postgres import PostgresTeamFacts
+
+    t = require_write_team(team if team is not None else _resolve_team_strict())
+    key = f"pgfacts::{t}"
+    store = _team_facts_by_team.get(key)
+    if store is not None:
+        return store
+    with _team_facts_lock:
+        store = _team_facts_by_team.get(key)
+        if store is None:
+            store = PostgresTeamFacts(_resolve_backend(_config), team=t)
+            _team_facts_by_team[key] = store
+    return store
+
+
 def _index_drawer_entities(team, chunks, wing, room):
     """Best-effort: extract entities per chunk and index them per vault.
 
@@ -1668,6 +1702,59 @@ def tool_entities(
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+# Reason returned on chroma for the team critical-facts tools: there is no team
+# concept on a local install, so this is a central-server-only feature. The
+# personal "who am I" identity stays in the host-local ~/.mempalace/identity.txt
+# (layers.py Layer0) — this surface never reads or writes that file.
+_TEAM_FACTS_CHROMA_REASON = (
+    "Team critical-facts are a central-server feature (one shared, isolated "
+    "fact set per team). A local install has no team concept; the personal "
+    "identity lives in ~/.mempalace/identity.txt instead."
+)
+
+
+def tool_team_fact_add(fact: str, created_by: str = None):
+    """Record a critical fact every agent on this team should know.
+
+    For the small set of must-know facts the whole team shares — e.g. "the prod
+    DB is read-replica only" or "release freeze until Q3" — not per-conversation
+    memories (file those with ``mempalace_add_drawer``). The fact is stored in
+    this team's vault and is invisible to other teams. Central server only: on a
+    local install there is no team, so this reports the feature as unavailable
+    (the personal identity stays in ``~/.mempalace/identity.txt``).
+    """
+    if _config.backend == "chroma":
+        return {"available": False, "backend": "chroma", "reason": _TEAM_FACTS_CHROMA_REASON}
+    # Resolve the store FIRST so the postgres fail-loud-no-team raise propagates
+    # (surfaced as the structured JSON-RPC error), not swept into the validation
+    # error below — a team-less write must never leak into a shared vault.
+    store = _get_team_facts()
+    try:
+        added = store.add_fact(fact, created_by=created_by)
+    except ValueError as e:
+        return {"error": str(e)}
+    return {"backend": _config.backend, "vault": store._team, "added": added}
+
+
+def tool_team_facts():
+    """List this team's critical facts — the must-know facts every agent shares.
+
+    Returns the facts recorded with ``mempalace_team_fact_add`` for the current
+    team vault (oldest first), isolated from other teams. Central server only: on
+    a local install there is no team, so this reports the feature as unavailable.
+    """
+    if _config.backend == "chroma":
+        return {"available": False, "backend": "chroma", "reason": _TEAM_FACTS_CHROMA_REASON}
+    store = _get_team_facts()
+    facts = store.list_facts()
+    return {
+        "backend": _config.backend,
+        "vault": store._team,
+        "facts": facts,
+        "count": len(facts),
+    }
 
 
 def tool_check_duplicate(content: str, threshold: float = 0.9):
@@ -3223,6 +3310,33 @@ TOOLS = {
             "required": [],
         },
         "handler": tool_entities,
+    },
+    "mempalace_team_fact_add": {
+        "description": "Record a critical fact every agent on this team should know (e.g. 'the prod DB is read-replica only', 'release freeze until Q3'). For team-wide must-know facts, not per-conversation memories (use mempalace_add_drawer for those). Stored in this team's vault and invisible to other teams. Central server (postgres) only; on a local install there is no team and it reports available: false.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "fact": {
+                    "type": "string",
+                    "description": "The critical fact to share with the team (a short must-know line, max 2000 chars).",
+                },
+                "created_by": {
+                    "type": "string",
+                    "description": "Optional author/agent label recorded with the fact.",
+                },
+            },
+            "required": ["fact"],
+        },
+        "handler": tool_team_fact_add,
+    },
+    "mempalace_team_facts": {
+        "description": "List this team's critical facts — the must-know facts every agent on the team shares, recorded via mempalace_team_fact_add. Oldest first, isolated from other teams. Central server (postgres) only; on a local install it reports available: false.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+        "handler": tool_team_facts,
     },
     "mempalace_check_duplicate": {
         "description": "Check if content already exists in the palace before filing",

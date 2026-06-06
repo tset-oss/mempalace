@@ -41,6 +41,15 @@ class Layer0:
         Traits: warm, direct, remembers everything.
         People: Alice (creator), Bob (Alice's partner).
         Project: A journaling app that helps people process emotions.
+
+    This identity is HOST-LOCAL and PER-DEVELOPER — it stays on the user's
+    machine, is never vaulted, and is read only here. It is DISTINCT from the
+    team-shared "critical facts" surface (a central, team-vaulted Postgres
+    table exposed via the mempalace_team_fact_add / mempalace_team_facts MCP
+    tools; see mempalace.team_facts_postgres). Team critical-facts are the facts
+    every agent on a team should see; this personal L0 identity is "who am I" for
+    one machine. The two are complementary and never overlap — the team-facts
+    surface never reads or writes this file.
     """
 
     def __init__(self, identity_path: str = None):
