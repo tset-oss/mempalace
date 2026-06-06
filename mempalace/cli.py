@@ -489,6 +489,21 @@ def _maybe_run_mine_after_init(args, cfg) -> None:
 
 
 def cmd_mine(args):
+    # An explicit --team sets MEMPALACE_TEAM for the whole run before any
+    # config is read, so every downstream route (get_collection, closets,
+    # the knowledge graph, the per-team rebuild) lands in the same team
+    # vault. The same validation as `mempalace serve --default-team`.
+    team_arg = getattr(args, "team", None)
+    if team_arg:
+        name = team_arg.strip().lower()
+        if not re.fullmatch(r"[a-z0-9_]{1,40}", name):
+            print(
+                "--team must be 1-40 lowercase letters, digits or underscores (e.g. frontend).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        os.environ["MEMPALACE_TEAM"] = name
+
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     include_ignored = []
     for raw in args.include_ignored or []:
@@ -1531,6 +1546,15 @@ def main():
         ),
     )
     p_mine.add_argument("--wing", default=None, help="Wing name (default: directory name)")
+    p_mine.add_argument(
+        "--team",
+        default=None,
+        help=(
+            "Team vault to mine into (sets MEMPALACE_TEAM for the run). Required "
+            "on the central server backend; ignored by the local single-vault "
+            "backend. Falls back to MEMPALACE_TEAM / config when omitted."
+        ),
+    )
     p_mine.add_argument(
         "--no-gitignore",
         action="store_true",

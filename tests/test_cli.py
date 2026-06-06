@@ -1384,3 +1384,96 @@ def test_cmd_repair_from_sqlite_success_does_not_exit(mock_config_cls, tmp_path)
     with patch("mempalace.repair.rebuild_from_sqlite", return_value=fake_counts):
         # Should return cleanly; no SystemExit raised.
         cmd_repair(args)
+
+
+# ── cmd_mine --team plumbing (team-aware miner) ──────────────────────────
+
+
+def _mine_args(tmp_path, *, team=None, mode="projects"):
+    """A complete argparse.Namespace covering every attribute cmd_mine reads."""
+    return argparse.Namespace(
+        dir=str(tmp_path),
+        mode=mode,
+        wing=None,
+        team=team,
+        no_gitignore=False,
+        include_ignored=[],
+        agent="mempalace",
+        limit=0,
+        redetect_origin=False,
+        dry_run=False,
+        extract="exchange",
+        max_chunks_per_file=None,
+        palace=str(tmp_path / "palace"),
+    )
+
+
+def test_cmd_mine_accepts_team_arg_from_parser():
+    """The mine subparser accepts --team and threads it onto args.team."""
+    captured = {}
+
+    def fake_cmd_mine(args):
+        captured["team"] = args.team
+
+    with (
+        patch.dict("mempalace.cli.__dict__", {"cmd_mine": fake_cmd_mine}, clear=False),
+        patch.object(sys, "argv", ["mempalace", "mine", "/some/dir", "--team", "frontend"]),
+    ):
+        main()
+
+    assert captured["team"] == "frontend"
+
+
+def test_cmd_mine_team_arg_sets_env_for_run(tmp_path, monkeypatch):
+    """An explicit --team sets MEMPALACE_TEAM before the mine runs so every
+    downstream route lands in the same team vault."""
+    monkeypatch.delenv("MEMPALACE_TEAM", raising=False)
+    args = _mine_args(tmp_path, team="frontend")
+
+    seen_team = {}
+
+    def fake_mine(**kwargs):
+        seen_team["env"] = os.environ.get("MEMPALACE_TEAM")
+
+    with (
+        patch("mempalace.miner.mine", fake_mine),
+        patch("mempalace.cli.MempalaceConfig") as mock_cfg,
+    ):
+        mock_cfg.return_value.palace_path = str(tmp_path / "palace")
+        cmd_mine(args)
+
+    assert os.environ.get("MEMPALACE_TEAM") == "frontend"
+    assert seen_team["env"] == "frontend", "MEMPALACE_TEAM must be set before mine() runs"
+
+
+def test_cmd_mine_rejects_malformed_team(tmp_path):
+    """A --team value that is not a valid vault slug exits non-zero before
+    any mine begins."""
+    args = _mine_args(tmp_path, team="Not A Team!")
+
+    with (
+        patch("mempalace.miner.mine") as mock_mine,
+        patch("mempalace.cli.MempalaceConfig") as mock_cfg,
+    ):
+        mock_cfg.return_value.palace_path = str(tmp_path / "palace")
+        with pytest.raises(SystemExit) as exc:
+            cmd_mine(args)
+
+    assert exc.value.code == 1
+    mock_mine.assert_not_called()
+
+
+def test_cmd_mine_no_team_does_not_set_env(tmp_path, monkeypatch):
+    """Omitting --team leaves MEMPALACE_TEAM untouched (chroma path needs no
+    team; server-side resolution falls back to MEMPALACE_TEAM / config)."""
+    monkeypatch.delenv("MEMPALACE_TEAM", raising=False)
+    args = _mine_args(tmp_path, team=None)
+
+    with (
+        patch("mempalace.miner.mine"),
+        patch("mempalace.cli.MempalaceConfig") as mock_cfg,
+    ):
+        mock_cfg.return_value.palace_path = str(tmp_path / "palace")
+        cmd_mine(args)
+
+    assert os.environ.get("MEMPALACE_TEAM") is None

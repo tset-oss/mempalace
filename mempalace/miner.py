@@ -1626,6 +1626,9 @@ def _mine_impl(
     config = load_config(project_dir)
     palace_config = MempalaceConfig()
 
+    # Require a resolvable team on the server backend BEFORE ingesting.
+    _require_team_on_server_backend(palace_config)
+
     cfg_chunk_size = palace_config.chunk_size
     cfg_chunk_overlap = palace_config.chunk_overlap
     cfg_min_chunk_size = palace_config.min_chunk_size
@@ -1718,61 +1721,8 @@ def _mine_impl(
                 if not dry_run:
                     print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers}")
 
-        # Derived link layer (topic tunnels, within-wing hallways, entity
-        # tunnels) persists to host-global JSON (``~/.mempalace/tunnels.json`` /
-        # ``hallways.json``) via palace_graph/hallways. On the central, multi-
-        # team postgres deployment that single host file is a cross-tenant leak
-        # (one file, one host, many teams), so the host-global writes are gated
-        # to the chroma single-vault path. On postgres the link layer is owned
-        # and derived server-side per team — the miner writes no host-global
-        # link JSON. (The miner becomes team-aware and fires the per-team
-        # server-side rebuild in a later story; here we only gate the leak.)
-        if not dry_run and palace_config.backend == "chroma":
-            # Cross-wing topic tunnels: after every file in this wing has been
-            # processed, link this wing to any other wing that shares a
-            # confirmed TOPIC label. Out of scope for v1: manifest-dependency
-            # overlap, per-topic allow/deny lists, search-result surfacing.
-            try:
-                tunnels_added = _compute_topic_tunnels_for_wing(wing)
-                if tunnels_added:
-                    print(f"\n  Topic tunnels: +{tunnels_added} cross-wing link(s)")
-            except Exception as e:
-                # Tunnel computation must never fail a mine — degrade quietly.
-                print(
-                    f"\n  WARNING: topic tunnel computation skipped — {e}",
-                    file=sys.stderr,
-                )
-
-            # Within-wing hallways: link entities (people, projects, concepts)
-            # that co-occur in drawers across this wing's rooms. Mirrors the
-            # tunnel-compute fault-tolerance pattern — hallway computation
-            # must never fail a mine; it's a derived analytic, not load-bearing
-            # for the drawer write that already committed above.
-            try:
-                hallways_created = compute_hallways_for_wing(wing, col=collection)
-                if hallways_created:
-                    print(f"\n  Hallways: +{len(hallways_created)} within-wing entity link(s)")
-            except Exception as e:
-                print(
-                    f"\n  WARNING: hallway computation skipped — {e}",
-                    file=sys.stderr,
-                )
-
-            # Cross-wing entity tunnels: derived from the hallway records
-            # materialized just above. When an entity appears in hallways of
-            # this wing AND another wing, a tunnel bridges them. Runs in
-            # parallel with topic tunnels — both kinds coexist via
-            # ``kind="entity"`` / ``kind="topic"``. Same fault-tolerance
-            # pattern: never fail a mine over a derived analytic.
-            try:
-                entity_tunnels_added = _compute_entity_tunnels_for_wing(wing)
-                if entity_tunnels_added:
-                    print(f"\n  Entity tunnels: +{entity_tunnels_added} cross-wing entity link(s)")
-            except Exception as e:
-                print(
-                    f"\n  WARNING: entity tunnel computation skipped — {e}",
-                    file=sys.stderr,
-                )
+        if not dry_run:
+            _build_derived_links_post_mine(palace_config, wing, collection)
 
         if not dry_run:
             _validate_palace_fts5_after_mine(palace_path)
@@ -1888,6 +1838,127 @@ def _cleanup_mine_pid_file() -> None:
     except OSError:
         # Best-effort cleanup; never fail the mine over PID bookkeeping.
         pass
+
+
+def _build_derived_links_post_mine(palace_config, wing: str, collection) -> None:
+    """Build this wing's derived link layer after its drawers are filed.
+
+    On the local single-vault backend the derived link layer (topic
+    tunnels, within-wing hallways, entity tunnels) persists to host-global
+    JSON (``~/.mempalace/tunnels.json`` / ``hallways.json``) via
+    palace_graph/hallways. On the central, multi-team deployment that
+    single host file is a cross-tenant leak (one file, one host, many
+    teams), so the host-global writes stay on the single-vault path; on the
+    server backend the link layer is owned and derived per team
+    server-side, and the miner asks for the routed team's rebuild instead
+    of writing any host-global JSON. The caller invokes this only for a
+    real (non-dry-run) mine.
+    """
+    if palace_config.backend == "chroma":
+        # Cross-wing topic tunnels: after every file in this wing has been
+        # processed, link this wing to any other wing that shares a
+        # confirmed TOPIC label. Out of scope for v1: manifest-dependency
+        # overlap, per-topic allow/deny lists, search-result surfacing.
+        try:
+            tunnels_added = _compute_topic_tunnels_for_wing(wing)
+            if tunnels_added:
+                print(f"\n  Topic tunnels: +{tunnels_added} cross-wing link(s)")
+        except Exception as e:
+            # Tunnel computation must never fail a mine — degrade quietly.
+            print(
+                f"\n  WARNING: topic tunnel computation skipped — {e}",
+                file=sys.stderr,
+            )
+
+        # Within-wing hallways: link entities (people, projects, concepts)
+        # that co-occur in drawers across this wing's rooms. Mirrors the
+        # tunnel-compute fault-tolerance pattern — hallway computation
+        # must never fail a mine; it's a derived analytic, not load-bearing
+        # for the drawer write that already committed above.
+        try:
+            hallways_created = compute_hallways_for_wing(wing, col=collection)
+            if hallways_created:
+                print(f"\n  Hallways: +{len(hallways_created)} within-wing entity link(s)")
+        except Exception as e:
+            print(
+                f"\n  WARNING: hallway computation skipped — {e}",
+                file=sys.stderr,
+            )
+
+        # Cross-wing entity tunnels: derived from the hallway records
+        # materialized just above. When an entity appears in hallways of
+        # this wing AND another wing, a tunnel bridges them. Runs in
+        # parallel with topic tunnels — both kinds coexist via
+        # ``kind="entity"`` / ``kind="topic"``. Same fault-tolerance
+        # pattern: never fail a mine over a derived analytic.
+        try:
+            entity_tunnels_added = _compute_entity_tunnels_for_wing(wing)
+            if entity_tunnels_added:
+                print(f"\n  Entity tunnels: +{entity_tunnels_added} cross-wing entity link(s)")
+        except Exception as e:
+            print(
+                f"\n  WARNING: entity tunnel computation skipped — {e}",
+                file=sys.stderr,
+            )
+    else:
+        # On the server backend the link layer is owned and derived per
+        # team server-side, not written to host-global JSON. Once this
+        # wing's drawers are filed, ask for its derived links to be rebuilt
+        # for the routed team. Like the analytics above, this must never
+        # fail a committed mine.
+        _rebuild_derived_links_for_wing(palace_config.team, wing)
+
+
+def _require_team_on_server_backend(palace_config) -> None:
+    """Fail loud if a server-backend mine cannot name its team.
+
+    On the central server backend every team shares one host and one
+    process, so a mine that cannot name its team would silently land in
+    the wrong vault. Require a resolvable team (--team / MEMPALACE_TEAM /
+    config) and raise BEFORE ingesting anything. This is a configuration
+    error the operator must fix — distinct from the never-fail-a-mine
+    tolerance applied to the derived analytics. The local single-vault
+    backend keys by path and needs no team, so its behavior is unchanged.
+    """
+    if palace_config.backend != "chroma" and not palace_config.team:
+        raise ValueError(
+            "mine requires a team on the central backend — pass --team "
+            "<name> or set MEMPALACE_TEAM so writes land in the right "
+            "team vault."
+        )
+
+
+def _rebuild_derived_links_for_wing(team: str, wing: str) -> None:
+    """Request a rebuild of one team+wing's derived link layer.
+
+    On the server backend, tunnels and hallways are derived per team from
+    the already-filed drawers rather than written to host-global JSON. The
+    miner and the server file into the same vault, so both converge through
+    this one per-team rebuild entrypoint — the per-team derived-link
+    rebuild, wired when the derive engine is available.
+
+    Until that engine exists this is a safe no-op: it looks up the
+    entrypoint and skips quietly if it is not present yet. A rebuild
+    failure must never fail a committed mine (the drawers are already
+    safely filed); only a missing/unresolvable team fails loud, and that is
+    checked up front before any ingest.
+    """
+    try:
+        from . import link_store
+    except ImportError:
+        return
+
+    rebuild = getattr(link_store, "rebuild_derived_links", None)
+    if rebuild is None:
+        return
+
+    try:
+        rebuild(team=team, wing=wing)
+    except Exception as e:
+        print(
+            f"\n  WARNING: derived-link rebuild skipped — {e}",
+            file=sys.stderr,
+        )
 
 
 def _compute_topic_tunnels_for_wing(wing: str) -> int:

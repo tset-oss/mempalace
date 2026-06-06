@@ -2052,3 +2052,203 @@ def test_file_already_mined_handles_multiple_groups_under_one_source_file(tmp_pa
         "must iterate all groups for the source_file (mirroring the existing "
         "paginated pattern in the extract_mode-is-set branch)."
     )
+
+
+# ── Team-aware miner: fail-loud on the server backend, byte-unchanged on chroma ──
+
+
+class _FakeConfig:
+    """Minimal stand-in for MempalaceConfig exposing only backend + team."""
+
+    def __init__(self, backend, team):
+        self.backend = backend
+        self.team = team
+
+
+def test_mine_requires_team_on_server_backend(monkeypatch):
+    """On a non-chroma backend the miner must RAISE before ingest when no
+    team is resolvable (--team / MEMPALACE_TEAM / config all absent)."""
+    from mempalace import miner as miner_mod
+
+    monkeypatch.delenv("MEMPALACE_TEAM", raising=False)
+    monkeypatch.setenv("MEMPALACE_BACKEND", "postgres")
+
+    # The guard reads MempalaceConfig() inside _mine_impl; with postgres +
+    # no team, it must raise. We drive it through the public guard helper to
+    # prove the raise is reached BEFORE any collection is opened.
+    cfg = _FakeConfig(backend="postgres", team=None)
+    with pytest.raises(ValueError, match="requires a team on the central backend"):
+        miner_mod._require_team_on_server_backend(cfg)
+
+
+def test_mine_server_backend_no_team_raises_before_ingest(monkeypatch):
+    """End-to-end through mine(): postgres + no team raises before any
+    collection is opened or any drawer is written."""
+    from mempalace import miner as miner_mod
+
+    monkeypatch.delenv("MEMPALACE_TEAM", raising=False)
+    # _mine_impl imports MempalaceConfig from .config at call time, so patch
+    # it at the source module.
+    monkeypatch.setattr(
+        "mempalace.config.MempalaceConfig",
+        lambda: _FakeConfig(backend="postgres", team=None),
+    )
+
+    # If the guard fails to fire, get_collection would be reached — make it
+    # explode so a missing guard surfaces as the wrong error, not a silent
+    # write into a default vault.
+    def boom(*a, **k):
+        raise AssertionError("get_collection reached — guard did not fail loud first")
+
+    monkeypatch.setattr(miner_mod, "get_collection", boom)
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+        os.makedirs(project_root / "backend")
+        write_file(project_root / "backend" / "app.py", "print('x')\n" * 20)
+        with open(project_root / "mempalace.yaml", "w") as f:
+            yaml.dump(
+                {"wing": "test_project", "rooms": [{"name": "backend", "description": "B"}]},
+                f,
+            )
+        with pytest.raises(ValueError, match="requires a team on the central backend"):
+            mine(str(project_root), str(project_root / "palace"))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_mine_server_backend_with_team_does_not_raise(monkeypatch):
+    """postgres + an explicit team resolves cleanly (no raise)."""
+    from mempalace import miner as miner_mod
+
+    monkeypatch.setenv("MEMPALACE_TEAM", "frontend")
+    cfg = _FakeConfig(backend="postgres", team="frontend")
+    # Must not raise.
+    miner_mod._require_team_on_server_backend(cfg)
+
+
+def test_mine_chroma_needs_no_team(monkeypatch):
+    """chroma never requires a team — the guard is a no-op regardless."""
+    from mempalace import miner as miner_mod
+
+    monkeypatch.delenv("MEMPALACE_TEAM", raising=False)
+    miner_mod._require_team_on_server_backend(_FakeConfig(backend="chroma", team=None))
+    miner_mod._require_team_on_server_backend(_FakeConfig(backend="chroma", team="frontend"))
+
+
+def test_post_mine_chroma_writes_host_global_links(monkeypatch):
+    """On chroma the post-ingest step calls the host-global analytics
+    (byte-unchanged) and does NOT fire the server-side per-team rebuild."""
+    from mempalace import miner as miner_mod
+
+    calls = {"topics": 0, "hallways": 0, "entity": 0, "rebuild": 0}
+    monkeypatch.setattr(
+        miner_mod,
+        "_compute_topic_tunnels_for_wing",
+        lambda wing: calls.__setitem__("topics", calls["topics"] + 1) or 0,
+    )
+    monkeypatch.setattr(
+        miner_mod,
+        "compute_hallways_for_wing",
+        lambda wing, col=None: calls.__setitem__("hallways", calls["hallways"] + 1) or [],
+    )
+    monkeypatch.setattr(
+        miner_mod,
+        "_compute_entity_tunnels_for_wing",
+        lambda wing: calls.__setitem__("entity", calls["entity"] + 1) or 0,
+    )
+    monkeypatch.setattr(
+        miner_mod,
+        "_rebuild_derived_links_for_wing",
+        lambda team, wing: calls.__setitem__("rebuild", calls["rebuild"] + 1),
+    )
+
+    miner_mod._build_derived_links_post_mine(
+        _FakeConfig(backend="chroma", team=None), "test_project", object()
+    )
+
+    assert calls == {"topics": 1, "hallways": 1, "entity": 1, "rebuild": 0}
+
+
+def test_post_mine_server_fires_rebuild_not_host_global(monkeypatch):
+    """On a server backend the post-ingest step fires the per-team rebuild
+    hook and writes NO host-global link JSON (chroma analytics untouched)."""
+    from mempalace import miner as miner_mod
+
+    calls = {"topics": 0, "hallways": 0, "entity": 0, "rebuild_args": None}
+
+    def boom_topics(wing):
+        calls["topics"] += 1
+        return 0
+
+    def boom_hallways(wing, col=None):
+        calls["hallways"] += 1
+        return []
+
+    def boom_entity(wing):
+        calls["entity"] += 1
+        return 0
+
+    monkeypatch.setattr(miner_mod, "_compute_topic_tunnels_for_wing", boom_topics)
+    monkeypatch.setattr(miner_mod, "compute_hallways_for_wing", boom_hallways)
+    monkeypatch.setattr(miner_mod, "_compute_entity_tunnels_for_wing", boom_entity)
+    monkeypatch.setattr(
+        miner_mod,
+        "_rebuild_derived_links_for_wing",
+        lambda team, wing: calls.__setitem__("rebuild_args", (team, wing)),
+    )
+
+    miner_mod._build_derived_links_post_mine(
+        _FakeConfig(backend="postgres", team="frontend"), "test_project", object()
+    )
+
+    assert calls["topics"] == 0, "host-global topic tunnels must not run on the server backend"
+    assert calls["hallways"] == 0, "host-global hallways must not run on the server backend"
+    assert calls["entity"] == 0, "host-global entity tunnels must not run on the server backend"
+    assert calls["rebuild_args"] == ("frontend", "test_project")
+
+
+def test_rebuild_hook_is_safe_no_op_without_derive_engine(monkeypatch):
+    """The per-team rebuild hook is a safe no-op until the derive engine
+    exposes rebuild_derived_links — it must not raise when the entrypoint
+    is absent."""
+    from mempalace import link_store
+    from mempalace import miner as miner_mod
+
+    monkeypatch.delattr(link_store, "rebuild_derived_links", raising=False)
+    # Must not raise even though the entrypoint does not exist yet.
+    miner_mod._rebuild_derived_links_for_wing("frontend", "test_project")
+
+
+def test_rebuild_hook_calls_derive_engine_when_present(monkeypatch):
+    """When the derive engine exposes rebuild_derived_links, the hook calls
+    it with the captured (team, wing) — proving where H-later plugs in."""
+    from mempalace import link_store
+    from mempalace import miner as miner_mod
+
+    captured = {}
+    monkeypatch.setattr(
+        link_store,
+        "rebuild_derived_links",
+        lambda team, wing: captured.update(team=team, wing=wing),
+        raising=False,
+    )
+    miner_mod._rebuild_derived_links_for_wing("frontend", "test_project")
+    assert captured == {"team": "frontend", "wing": "test_project"}
+
+
+def test_rebuild_hook_never_fails_a_committed_mine(monkeypatch, capsys):
+    """A rebuild failure must degrade quietly — the drawers are already
+    filed, so a derived-analytic failure must never propagate."""
+    from mempalace import link_store
+    from mempalace import miner as miner_mod
+
+    def angry(team, wing):
+        raise RuntimeError("simulated rebuild explosion")
+
+    monkeypatch.setattr(link_store, "rebuild_derived_links", angry, raising=False)
+    # Must not raise.
+    miner_mod._rebuild_derived_links_for_wing("frontend", "test_project")
+    err = capsys.readouterr().err
+    assert "derived-link rebuild skipped" in err
