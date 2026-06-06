@@ -1982,14 +1982,13 @@ def _rebuild_derived_links_for_wing(team: str, wing: str) -> None:
     On the server backend, tunnels and hallways are derived per team from
     the already-filed drawers rather than written to host-global JSON. The
     miner and the server file into the same vault, so both converge through
-    this one per-team rebuild entrypoint — the per-team derived-link
-    rebuild, wired when the derive engine is available.
+    this one per-team rebuild entrypoint (``link_store.rebuild_derived_links``).
 
-    Until that engine exists this is a safe no-op: it looks up the
-    entrypoint and skips quietly if it is not present yet. A rebuild
-    failure must never fail a committed mine (the drawers are already
-    safely filed); only a missing/unresolvable team fails loud, and that is
-    checked up front before any ingest.
+    The lookup stays tolerant of a missing entrypoint (forward-compat, and
+    tests monkeypatch it away): it resolves the entrypoint and skips quietly
+    if absent. A rebuild failure must never fail a committed mine (the drawers
+    are already safely filed); only a missing/unresolvable team fails loud, and
+    that is checked up front before any ingest.
     """
     try:
         from . import link_store

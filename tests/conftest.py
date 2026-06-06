@@ -91,9 +91,22 @@ def _reset_mcp_cache():
         except (ImportError, AttributeError):
             pass
 
+    # Snapshot the team/backend env vars. The real CLI (cmd_mine / serve) writes
+    # os.environ["MEMPALACE_TEAM"] directly; pytest's monkeypatch cannot undo a
+    # raw write when the key started absent (delenv records nothing for a missing
+    # key), so a --team mine/serve test would otherwise LEAK MEMPALACE_TEAM into
+    # later tests and poison _canonical_default_team(). Restore on teardown.
+    _env_keys = ("MEMPALACE_TEAM", "MEMPALACE_BACKEND")
+    _env_snapshot = {_k: os.environ.get(_k) for _k in _env_keys}
+
     _clear_cache()
     yield
     _clear_cache()
+    for _k, _v in _env_snapshot.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
 
 
 @pytest.fixture(scope="session", autouse=True)
