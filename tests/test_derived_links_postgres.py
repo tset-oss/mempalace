@@ -337,14 +337,16 @@ def test_debouncer_drives_real_rebuild_against_db(backend, team):
 def test_explicit_tunnels_not_purged_by_derived_rebuild(backend, team):
     store = PostgresLinkStore(backend, team=team)
 
-    # A user-authored explicit tunnel touching wing_aya.
+    # A user-authored explicit tunnel touching wing_aya. Explicit tunnels are
+    # user data and are NEVER purged by a derived rebuild (entity OR topic).
     explicit = store.create_tunnel(
         "wing_aya", "diary", "wing_work", "notes", label="user link", kind="explicit"
     )
-    # A topic tunnel (agent/miner data) touching wing_aya.
-    topic = store.create_tunnel(
-        "wing_aya", "topic:focus", "wing_work", "topic:focus", label="topic", kind="topic"
-    )
+    # A topic tunnel backed by wing_topics labels: it survives because the
+    # rebuild RE-DERIVES it from the labels (purge + recompute), not because it
+    # is left untouched. Topic tunnels are now a DERIVED kind (H014t).
+    store.add_topics("wing_aya", ["focus"])
+    store.add_topics("wing_work", ["focus"])
 
     # Seed co-occurrence so a derived rebuild creates entity records for the wing.
     idx = PostgresEntityIndex(backend, team=team)
@@ -352,20 +354,24 @@ def test_explicit_tunnels_not_purged_by_derived_rebuild(backend, team):
     _seed_chunk(idx, "c2", ["Aya", "Lumi"], "wing_aya", "letters")
 
     store.rebuild_derived_links_for_wing("wing_aya", min_count=2)
+    # wing_work needs a rebuild too so the cross-wing topic pair materializes.
+    store.rebuild_derived_links_for_wing("wing_work", min_count=2)
 
     ids = {t["id"] for t in store.list_tunnels()}
-    # Explicit + topic tunnels survive the derived rebuild untouched.
-    assert explicit["id"] in ids
-    assert topic["id"] in ids
     kinds = {t["id"]: t["kind"] for t in store.list_tunnels()}
+    # The explicit tunnel survives the derived rebuild untouched.
+    assert explicit["id"] in ids
     assert kinds[explicit["id"]] == "explicit"
-    assert kinds[topic["id"]] == "topic"
+    # A topic tunnel for the shared "focus" label is derived (the kind coexists).
+    topic_tunnels = [t for t in store.list_tunnels() if t["kind"] == "topic"]
+    assert len(topic_tunnels) == 1
 
-    # A second rebuild still leaves the explicit/topic tunnels in place.
+    # A second rebuild still leaves the explicit tunnel and re-derives the topic.
     store.rebuild_derived_links_for_wing("wing_aya", min_count=2)
+    store.rebuild_derived_links_for_wing("wing_work", min_count=2)
     ids2 = {t["id"] for t in store.list_tunnels()}
     assert explicit["id"] in ids2
-    assert topic["id"] in ids2
+    assert len([t for t in store.list_tunnels() if t["kind"] == "topic"]) == 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────

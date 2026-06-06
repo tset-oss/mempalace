@@ -693,6 +693,43 @@ def _set_wing_topics(existing: dict, wing_key: str, topics_for_wing: list, coerc
         existing.pop("topics_by_wing", None)
 
 
+def _topics_go_to_team_vault() -> bool:
+    """True when confirmed topics route to the team vault, not host-global JSON.
+
+    On the central server backend the host-global ``topics_by_wing`` map is a
+    cross-tenant leak (one host file, many teams), so topics go to the routed
+    team's per-team ``wing_topics`` table instead. The local chroma backend
+    keeps its host-global topics path byte-unchanged.
+    """
+    from .config import MempalaceConfig
+
+    return MempalaceConfig().backend != "chroma"
+
+
+def _persist_wing_topics_to_vault(wing: str, topics_for_wing: list, coerce) -> None:
+    """Persist confirmed topics for *wing* to the routed team's ``wing_topics``.
+
+    The server-backend counterpart to ``_set_wing_topics`` (which writes the
+    host-global registry). Resolves the team from config and fails loud if it
+    cannot — a topic write that cannot name its team would land nowhere useful
+    on the central host. The labels then drive cross-wing topic tunnels via the
+    unchanged string-overlap matcher when the team+wing's derived links rebuild.
+    """
+    from .config import MempalaceConfig
+    from .link_store import require_write_team
+    from .link_store_postgres import PostgresLinkStore
+    from .palace import _resolve_backend
+
+    config = MempalaceConfig()
+    team = require_write_team(config.team or None)
+    labels = [coerce(t) for t in topics_for_wing]
+    labels = [t for t in labels if t]
+    if not labels:
+        return
+    store = PostgresLinkStore(_resolve_backend(config), team=team)
+    store.add_topics(wing, labels)
+
+
 def add_to_known_entities(entities_by_category: dict, wing: str = None) -> str:
     """Union ``entities_by_category`` into ``~/.mempalace/known_entities.json``.
 
@@ -708,13 +745,14 @@ def add_to_known_entities(entities_by_category: dict, wing: str = None) -> str:
     overwritten. A later compress pass can assign codes.
 
     When ``wing`` is provided AND ``entities_by_category`` contains a
-    ``topics`` list, those topics are also recorded under
-    ``topics_by_wing[wing]`` (case-insensitive dedup, preserving the
-    casing of the first observed name). This is the signal source for
-    ``palace_graph.compute_topic_tunnels`` at mine time. Topics for a
-    wing are *replaced*, not unioned, so a re-run of ``init`` reflects
-    the user's latest confirmation rather than accumulating stale labels
-    indefinitely.
+    ``topics`` list, those topics are recorded as the per-wing topic labels
+    that feed ``palace_graph.compute_topic_tunnels``. On the local chroma
+    backend they are written to the host-global ``topics_by_wing[wing]`` map
+    (case-insensitive dedup, preserving the casing of the first observed name;
+    *replaced*, not unioned, so a re-run reflects the latest confirmation). On
+    the central server backend the host-global topics map is a cross-tenant
+    leak, so the labels are routed to the routed team's per-team ``wing_topics``
+    table instead and the host-global map is left untouched.
 
     The in-process cache is invalidated on write so same-process callers
     (notably ``cmd_init`` → ``cmd_mine`` in sequence) see the update
@@ -789,7 +827,17 @@ def add_to_known_entities(entities_by_category: dict, wing: str = None) -> str:
             existing[category] = ordered
 
     if topics_for_wing is not None:
-        _set_wing_topics(existing, wing.strip(), topics_for_wing, _coerce_name)
+        # Topic labels are the substrate for cross-wing topic tunnels. On chroma
+        # they live in the host-global registry's ``topics_by_wing`` map. On the
+        # central multi-team backend that one host file is a cross-tenant leak,
+        # so the labels go to the routed team's per-team ``wing_topics`` table
+        # instead; the host-global topics map is NEVER written there. Topic-tunnel
+        # MATCHING is identical on both paths (the unchanged string-overlap
+        # ``compute_topic_tunnels``).
+        if _topics_go_to_team_vault():
+            _persist_wing_topics_to_vault(wing.strip(), topics_for_wing, _coerce_name)
+        else:
+            _set_wing_topics(existing, wing.strip(), topics_for_wing, _coerce_name)
 
     registry_path.write_text(_json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
     try:

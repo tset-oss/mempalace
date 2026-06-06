@@ -101,6 +101,7 @@ File verbatim content into the palace. Identical content (same deterministic dra
 | `content` | string | **Yes** | Verbatim content to store |
 | `source_file` | string | No | Where this came from |
 | `added_by` | string | No | Who is filing (default: "mcp") |
+| `topics` | array of string | No | Topic labels for this drawer's wing (e.g. `["Angular", "OpenAPI"]`). Wings sharing a label are auto-linked by a cross-wing topic tunnel (central/postgres only). Ignored on local installs. |
 
 **Returns:** `{ success, drawer_id, wing, room }`
 

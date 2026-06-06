@@ -261,12 +261,17 @@ def rebuild_derived_links(team: str, wing: str, min_count: int = 2) -> dict:
         preserving dynamics on survivors);
       * purges ONLY this wing's DERIVED entity tunnels (``kind='entity'``) and
         re-derives them via the shared
-        :func:`palace_graph.entity_tunnels_for_wing` — explicit and topic
-        tunnels are never touched.
+        :func:`palace_graph.entity_tunnels_for_wing`;
+      * purges ONLY this wing's TOPIC tunnels (``kind='topic'``) and re-derives
+        them from the team's ``wing_topics`` labels via the UNCHANGED
+        :func:`palace_graph.compute_topic_tunnels` string-overlap matcher.
+
+    Explicit (user-authored) tunnels are never touched; the entity and topic
+    kinds are purged independently, so the three coexist.
 
     ``team`` is REQUIRED and is passed straight through (the caller captured it
     in a request context / from the miner config — this function never resolves
-    it). Returns ``{"hallways": n, "entity_tunnels": m}``.
+    it). Returns ``{"hallways": n, "entity_tunnels": m, "topic_tunnels": k}``.
     """
     if not team:
         raise ValueError("rebuild_derived_links requires a team")

@@ -797,6 +797,7 @@ def compute_topic_tunnels(
     topics_by_wing: dict,
     min_count: int = 1,
     label_prefix: str = "shared topic",
+    create_tunnel_fn=None,
 ) -> list[dict]:
     """Create tunnels for every pair of wings that share >= ``min_count`` topics.
 
@@ -809,6 +810,15 @@ def compute_topic_tunnels(
             topic is enough; bumping to e.g. ``2`` requires multiple
             overlaps and filters out coincidental single-topic links.
         label_prefix: human-readable string prefixed to the tunnel label.
+        create_tunnel_fn: lets a caller route the tunnel write somewhere other
+            than the host-global ``tunnels.json``. Defaults to the module-level
+            :func:`create_tunnel` (chroma). The team-scoped Postgres derive
+            injects its per-team store's ``create_tunnel`` (which stamps
+            ``kind="topic"``) so the SAME case-insensitive string-overlap
+            matching lands in ``team_<slug>.tunnels`` instead of a shared host
+            file. The callback must accept the same ``(source_wing,
+            source_room, target_wing, target_room, label=, kind=)`` signature
+            ``create_tunnel`` exposes. The overlap logic itself is unchanged.
 
     Returns:
         List of tunnel dicts as returned by ``create_tunnel`` — one per
@@ -823,6 +833,9 @@ def compute_topic_tunnels(
     """
     if not topics_by_wing:
         return []
+
+    if create_tunnel_fn is None:
+        create_tunnel_fn = create_tunnel
 
     min_count = max(1, int(min_count))
 
@@ -865,7 +878,7 @@ def compute_topic_tunnels(
                 # are valid; this just keeps the displayed room consistent.
                 topic_name = topics_a[key] if topics_a[key] else topics_b[key]
                 room = topic_room(topic_name)
-                tunnel = create_tunnel(
+                tunnel = create_tunnel_fn(
                     source_wing=wa,
                     source_room=room,
                     target_wing=wb,
@@ -882,12 +895,18 @@ def topic_tunnels_for_wing(
     topics_by_wing: dict,
     min_count: int = 1,
     label_prefix: str = "shared topic",
+    create_tunnel_fn=None,
 ) -> list[dict]:
     """Compute topic tunnels involving a single wing.
 
     Used by the miner to incrementally update tunnels for the wing that
     just finished mining without recomputing pairs that don't involve it.
     Returns the list of tunnels created or refreshed.
+
+    ``create_tunnel_fn`` is passed straight through to
+    :func:`compute_topic_tunnels` so the team-scoped Postgres derive can route
+    the topic-tunnel write to its per-team store (see that function); it
+    defaults to the host-global :func:`create_tunnel` (chroma).
     """
     if not topics_by_wing or not isinstance(wing, str) or not wing.strip():
         return []
@@ -926,6 +945,7 @@ def topic_tunnels_for_wing(
                 slice_map,
                 min_count=min_count,
                 label_prefix=label_prefix,
+                create_tunnel_fn=create_tunnel_fn,
             )
         )
     return created

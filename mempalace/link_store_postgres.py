@@ -47,9 +47,15 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .backends.postgres import _qi, team_schema
+from .config import normalize_wing_name
 from .dynamics import initialize_dynamics_fields, merge_dynamics
 from .link_store import LinkStore
-from .palace_graph import _canonical_tunnel_id, _require_name, entity_tunnels_for_wing
+from .palace_graph import (
+    _canonical_tunnel_id,
+    _require_name,
+    entity_tunnels_for_wing,
+    topic_tunnels_for_wing,
+)
 
 logger = logging.getLogger("mempalace.link_store_postgres")
 
@@ -214,6 +220,9 @@ class PostgresLinkStore(LinkStore):
     def _hallways_table(self) -> str:
         return f"{_qi(self._schema)}.{_qi('hallways')}"
 
+    def _wing_topics_table(self) -> str:
+        return f"{_qi(self._schema)}.{_qi('wing_topics')}"
+
     def _ensure(self) -> None:
         """Create schema + ``tunnels`` table + wing-endpoint indexes once.
 
@@ -287,6 +296,27 @@ class PostgresLinkStore(LinkStore):
                     cur.execute(
                         f"CREATE INDEX IF NOT EXISTS {_qi('hallways_wing')} "
                         f"ON {self._hallways_table()} (wing)"
+                    )
+                    # Per-wing TOPIC labels — the substrate for topic tunnels.
+                    # Agents/the miner supply the labels (no LLM at tunnel time);
+                    # topic-tunnel MATCHING is pure case-insensitive string
+                    # overlap of these per-wing label sets (the unchanged
+                    # palace_graph.compute_topic_tunnels). On chroma the same
+                    # labels live in the host-global
+                    # known_entities.json["topics_by_wing"]; on the central
+                    # multi-team deployment that one host file is a cross-tenant
+                    # leak, so each team's labels live in its own schema instead.
+                    # PK (topic, wing) makes re-adding a label idempotent.
+                    cur.execute(
+                        f"CREATE TABLE IF NOT EXISTS {self._wing_topics_table()} ("
+                        "  topic text NOT NULL,"
+                        "  wing text NOT NULL,"
+                        "  PRIMARY KEY (topic, wing)"
+                        ")"
+                    )
+                    cur.execute(
+                        f"CREATE INDEX IF NOT EXISTS {_qi('wing_topics_wing')} "
+                        f"ON {self._wing_topics_table()} (wing)"
                     )
             self._ensured = True
 
@@ -696,6 +726,52 @@ class PostgresLinkStore(LinkStore):
                 )
                 return [_row_to_hallway(r) for r in cur.fetchall()]
 
+    # -- per-wing topic labels (the topic-tunnel substrate) ---------------
+    def add_topics(self, wing: str, topics) -> int:
+        """Record one or more TOPIC labels for *wing* (idempotent upsert).
+
+        Each ``(topic, wing)`` pair is inserted ``ON CONFLICT DO NOTHING``, so
+        re-supplying a label an agent (or the miner) already filed is harmless.
+        Blank/whitespace topics and a blank wing are skipped. Topics are stored
+        verbatim (first-observed casing); the case-insensitive overlap match
+        happens later in the unchanged ``compute_topic_tunnels``. Returns the
+        number of pairs offered (pre-dedup).
+        """
+        if not isinstance(wing, str) or not wing.strip():
+            return 0
+        wing = wing.strip()
+        labels = [t.strip() for t in topics if isinstance(t, str) and t.strip()]
+        if not labels:
+            return 0
+        self._ensure()
+        rows = [(t, wing) for t in labels]
+        with self._backend._conn() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    f"INSERT INTO {self._wing_topics_table()} (topic, wing) "
+                    "VALUES (%s, %s) ON CONFLICT (topic, wing) DO NOTHING",
+                    rows,
+                )
+        return len(rows)
+
+    def topics_by_wing(self) -> dict:
+        """Return this team's ``{wing: [topic, ...]}`` map (verbatim casing).
+
+        The exact shape ``palace_graph.compute_topic_tunnels`` consumes. Reads
+        are team-scoped — this only ever sees the calling team's schema, so
+        team A's labels can never link team B's wings.
+        """
+        self._ensure()
+        out: dict = {}
+        with self._backend._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT wing, topic FROM {self._wing_topics_table()} ORDER BY wing, topic"
+                )
+                for wing, topic in cur.fetchall():
+                    out.setdefault(wing, []).append(topic)
+        return out
+
     # -- the incremental rebuild entrypoint -------------------------------
     def rebuild_derived_links_for_wing(self, wing: str, min_count: int = 2) -> dict:
         """Recompute one wing's DERIVED link layer from entity_occurrences.
@@ -717,20 +793,37 @@ class PostgresLinkStore(LinkStore):
              :func:`palace_graph.entity_tunnels_for_wing`, with its tunnel-write
              callback routed to THIS store's ``create_tunnel(kind='entity')`` so
              the construction is shared, not re-implemented, and lands in this
-             team's ``tunnels`` table.
+             team's ``tunnels`` table;
+          4. rebuilds this wing's TOPIC tunnels the SAME way — PURGES this
+             wing's prior ``kind='topic'`` tunnels (and ONLY those), reads this
+             team's ``wing_topics`` into the ``{wing: [topic]}`` shape, and
+             re-derives via the UNCHANGED
+             :func:`palace_graph.topic_tunnels_for_wing` (pure case-insensitive
+             string overlap of the per-wing labels — no LLM at tunnel time),
+             with the tunnel-write callback routed to THIS store's
+             ``create_tunnel(kind='topic')``. The labels are agent/miner-supplied
+             (``tool_add_drawer``'s ``topics`` / ``tool_diary_write``'s ``topic``
+             / the miner), so topic-tunnel parity with chroma holds without an
+             offline LLM.
 
-        The recompute is NOT atomic: the hallway purge+upsert, the entity-tunnel
-        purge, and the per-tunnel re-creates each run on their own connection, so
-        a crash mid-rebuild can leave this wing's derived layer half-rebuilt. That
-        is acceptable here — the derived layer is non-gating (the verbatim drawers
-        and the entity index are the recall floor) and the rebuild is a pure
-        purge+recompute over the current ``entity_occurrences`` state, so it is
-        history-independent and the next rebuild for this wing fully heals it.
+        Explicit (``kind='explicit'``) tunnels are NEVER touched by any of the
+        purges — they are user-authored. Entity and topic tunnels are purged
+        INDEPENDENTLY by their own ``kind``, so the three kinds coexist and a
+        rebuild of one never deletes the others.
 
-        Returns ``{"hallways": n, "entity_tunnels": m}``.
+        The recompute is NOT atomic: the hallway purge+upsert, the entity- and
+        topic-tunnel purges, and the per-tunnel re-creates each run on their own
+        connection, so a crash mid-rebuild can leave this wing's derived layer
+        half-rebuilt. That is acceptable here — the derived layer is non-gating
+        (the verbatim drawers and the entity index are the recall floor) and the
+        rebuild is a pure purge+recompute over the current ``entity_occurrences``
+        / ``wing_topics`` state, so it is history-independent and the next
+        rebuild for this wing fully heals it.
+
+        Returns ``{"hallways": n, "entity_tunnels": m, "topic_tunnels": k}``.
         """
         if not isinstance(wing, str) or not wing.strip():
-            return {"hallways": 0, "entity_tunnels": 0}
+            return {"hallways": 0, "entity_tunnels": 0, "topic_tunnels": 0}
         self._ensure()
 
         hallways = self.compute_hallways_for_wing(wing, min_count=min_count)
@@ -760,20 +853,85 @@ class PostgresLinkStore(LinkStore):
         created = entity_tunnels_for_wing(
             wing, all_hallways, create_tunnel_fn=_create_entity_tunnel
         )
-        return {"hallways": len(hallways), "entity_tunnels": len(created)}
 
-    def _purge_wing_entity_tunnels(self, wing: str) -> None:
-        """Delete this wing's derived entity tunnels, never explicit/topic ones.
+        topic_created = self._rebuild_topic_tunnels_for_wing(wing)
+        return {
+            "hallways": len(hallways),
+            "entity_tunnels": len(created),
+            "topic_tunnels": len(topic_created),
+        }
 
-        Matches ``kind='entity'`` AND (``source_wing = wing`` OR
-        ``target_wing = wing``). The ``kind`` predicate is what protects
-        user-authored explicit tunnels (and agent/miner topic tunnels) from a
-        derived rebuild — only the server-derived entity links are purged.
+    def _rebuild_topic_tunnels_for_wing(self, wing: str) -> list:
+        """Purge + re-derive this wing's TOPIC tunnels from ``wing_topics``.
+
+        Purges ONLY this wing's ``kind='topic'`` tunnels (never explicit or
+        entity tunnels), then re-derives via the UNCHANGED
+        :func:`palace_graph.topic_tunnels_for_wing` — pure case-insensitive
+        string overlap of the per-wing labels — feeding the whole team's
+        ``wing_topics`` map so the OTHER endpoint of a shared-topic pair is
+        visible, and routing the tunnel write to THIS store's
+        ``create_tunnel(kind='topic')`` so records land in the team vault.
+        Returns the topic tunnels created/refreshed for this wing.
         """
+        self._purge_wing_topic_tunnels(wing)
+
+        topics_map = self.topics_by_wing()
+        if not topics_map:
+            return []
+
+        def _create_topic_tunnel(
+            source_wing, source_room, target_wing, target_room, label="", kind="topic"
+        ):
+            return self.create_tunnel(
+                source_wing,
+                source_room,
+                target_wing,
+                target_room,
+                label=label,
+                kind=kind,
+            )
+
+        return topic_tunnels_for_wing(wing, topics_map, create_tunnel_fn=_create_topic_tunnel)
+
+    def _purge_wing_topic_tunnels(self, wing: str) -> None:
+        """Delete this wing's TOPIC tunnels, never explicit/entity ones.
+
+        Matches ``kind='topic'`` AND (``source_wing`` OR ``target_wing`` equals
+        this wing). ``topic_tunnels_for_wing`` canonicalizes the wing slug it
+        stamps on the endpoints (``normalize_wing_name``), so the purge matches
+        BOTH the raw wing and its normalized form to clear the prior rows
+        regardless of which form the enqueueing write used.
+        """
+        norm = normalize_wing_name(wing.strip()) if wing and wing.strip() else wing
+        endpoints = {wing, norm}
         with self._backend._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"DELETE FROM {self._table()} "
-                    "WHERE kind = 'entity' AND (source_wing = %s OR target_wing = %s)",
-                    (wing, wing),
+                    "WHERE kind = 'topic' "
+                    "AND (source_wing = ANY(%s) OR target_wing = ANY(%s))",
+                    (list(endpoints), list(endpoints)),
+                )
+
+    def _purge_wing_entity_tunnels(self, wing: str) -> None:
+        """Delete this wing's derived entity tunnels, never explicit/topic ones.
+
+        Matches ``kind='entity'`` AND (``source_wing`` OR ``target_wing`` equals
+        this wing). The ``kind`` predicate is what protects user-authored explicit
+        tunnels (and agent/miner topic tunnels) from a derived rebuild — only the
+        server-derived entity links are purged. ``entity_tunnels_for_wing`` stamps
+        a normalized endpoint slug, so — like the topic purge — match BOTH the raw
+        wing and its normalized form to clear prior rows regardless of which form
+        the enqueueing write used (otherwise a slug-form mismatch could leave a
+        stale derived entity tunnel behind a rebuild).
+        """
+        norm = normalize_wing_name(wing.strip()) if wing and wing.strip() else wing
+        endpoints = {wing, norm}
+        with self._backend._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"DELETE FROM {self._table()} "
+                    "WHERE kind = 'entity' "
+                    "AND (source_wing = ANY(%s) OR target_wing = ANY(%s))",
+                    (list(endpoints), list(endpoints)),
                 )

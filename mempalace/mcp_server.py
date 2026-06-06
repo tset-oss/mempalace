@@ -547,6 +547,28 @@ def _unindex_drawer_entities(team, drawer_ids):
         logger.debug("entity index delete failed (best-effort)", exc_info=True)
 
 
+def _index_wing_topics(team, wing, topics):
+    """Best-effort: persist agent/miner-supplied TOPIC labels for a wing's vault.
+
+    No-op on chroma (chroma keeps its host-global ``topics_by_wing`` path). On
+    the central postgres backend the labels persist to the team's per-team
+    ``wing_topics`` table (the substrate the topic-tunnel derive reads), so an
+    agent can supply the labels that drive topic tunnels without an offline LLM
+    — topic-tunnel MATCHING stays pure case-insensitive string overlap of these
+    per-wing labels. NEVER raises: like ``_index_drawer_entities``, a topic-index
+    failure must not fail or undo the verbatim drawer/diary write.
+    """
+    if _config.backend == "chroma":
+        return
+    labels = [t for t in (topics or []) if isinstance(t, str) and t.strip()]
+    if not labels:
+        return
+    try:
+        _get_link_store(team).add_topics(wing, labels)
+    except Exception:
+        logger.debug("wing-topics index update failed (best-effort)", exc_info=True)
+
+
 # Server-side closet rebuild (eventual-consistency). The CLI miner builds
 # closets; a miner-less central deployment writing through add_drawer would have
 # an empty closet index, silently disabling the closet ranking boost in search.
@@ -2005,6 +2027,7 @@ def tool_add_drawer(
     source_file: str = None,
     added_by: str = "mcp",
     vault: str = None,
+    topics: list = None,
 ):
     """File verbatim content into a wing/room. Checks for duplicates first.
 
@@ -2017,6 +2040,14 @@ def tool_add_drawer(
     ``parent_drawer_id`` — ``tool_get_drawer(drawer_id)`` and
     ``tool_delete_drawer(drawer_id)`` report "not found" on the chunked
     path because no row is stored under the logical group id.
+
+    ``topics`` is an optional list of TOPIC labels for this drawer's wing
+    (e.g. ``["Angular", "OpenAPI"]``). On the central postgres backend they
+    persist to the team's per-team ``wing_topics`` table and drive cross-wing
+    TOPIC tunnels (wings sharing a label are linked) via pure case-insensitive
+    string overlap — no LLM at tunnel time. Best-effort: a topic-index failure
+    never fails the verbatim write. Ignored on local (chroma) installs, which
+    keep their own host-global topics path.
     """
     global _metadata_cache
     try:
@@ -2102,6 +2133,9 @@ def tool_add_drawer(
             # Best-effort per-vault entity index (server mode); never fails the
             # write. Single physical row -> one (id, text) chunk pair.
             _index_drawer_entities(add_team, [(drawer_id, content)], wing, room)
+            # Best-effort per-vault topic labels (server mode); never fails the
+            # write. Drives cross-wing topic tunnels via the rebuild below.
+            _index_wing_topics(add_team, wing, topics)
             # Best-effort server-side closet rebuild (server mode); never fails the write.
             _enqueue_closet_rebuild(add_team, source_file, wing, room)
             # Best-effort server-side derived-link rebuild (server mode); never fails the write.
@@ -2145,6 +2179,8 @@ def tool_add_drawer(
         # chunk is tagged with the entities in its OWN text slice (per-chunk,
         # matching the chroma miner) — not the whole-drawer set on every id.
         _index_drawer_entities(add_team, list(zip(chunk_ids, chunk_docs)), wing, room)
+        # Best-effort per-vault topic labels (server mode); never fails the write.
+        _index_wing_topics(add_team, wing, topics)
         # Best-effort server-side closet rebuild (server mode); never fails the write.
         _enqueue_closet_rebuild(add_team, source_file, wing, room)
         # Best-effort server-side derived-link rebuild (server mode); never fails the write.
@@ -2694,6 +2730,10 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             # wiring as tool_add_drawer/tool_update_drawer, so diary entities are
             # queryable via the entity index. Never fails the diary write.
             _index_drawer_entities(diary_team, [(entry_id, entry)], wing, room)
+            # Best-effort per-vault topic label (server mode): the diary's topic
+            # tag is a wing topic, so it drives cross-wing topic tunnels the same
+            # way an add_drawer topics label does. Never fails the diary write.
+            _index_wing_topics(diary_team, wing, [topic])
             logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic}")
             return {
                 "success": True,
@@ -2744,6 +2784,8 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         col.add(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
         # Best-effort per-vault entity index (server mode); per-chunk, never fails.
         _index_drawer_entities(diary_team, list(zip(chunk_ids, chunk_docs)), wing, room)
+        # Best-effort per-vault topic label (server mode); never fails the write.
+        _index_wing_topics(diary_team, wing, [topic])
         logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic} ({len(chunk_ids)} chunks)")
         return {
             "success": True,
@@ -3443,6 +3485,11 @@ TOOLS = {
                 "vault": {
                     "type": "string",
                     "description": "Team vault to file into (central/postgres deployments only). Omit for this machine's primary team; '<team>' to file into another team's vault. Ignored on local installs.",
+                },
+                "topics": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional topic labels for this drawer's wing (e.g. ['Angular', 'OpenAPI']). Wings sharing a label are auto-linked by a cross-wing topic tunnel (central/postgres only). Ignored on local installs.",
                 },
             },
             "required": ["wing", "room", "content"],
