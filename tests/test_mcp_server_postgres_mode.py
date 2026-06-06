@@ -369,3 +369,154 @@ def test_postgres_backend_reconnect_drops_pool_but_stays_usable():
     assert backend._pool_obj is None, "next op must lazily re-open a fresh pool"
     assert backend._ensured == set(), "DDL-ensured cache must be cleared"
     assert backend._closed is False, "reconnect (unlike close) keeps the backend usable"
+
+
+# ==================== kg_neighbors MCP tool (H004) ====================
+#
+# The validation / clamp / bad-entity / direction / chroma-unsupported cases
+# stub _call_kg so they need no database and always run. The happy path drives
+# the real per-team Postgres handle through _get_kg and uses the live-DB
+# self-skip convention.
+
+import os  # noqa: E402
+import uuid  # noqa: E402
+
+psycopg = pytest.importorskip("psycopg")  # noqa: E402
+
+from mempalace.backends.postgres import PostgresBackend, team_schema  # noqa: E402
+from mempalace.knowledge_graph_postgres import PostgresKnowledgeGraph  # noqa: E402
+
+
+def _dsn():
+    return (
+        os.environ.get("MEMPALACE_TEST_PG_URL")
+        or os.environ.get("MEMPALACE_DATABASE_URL")
+        or "postgresql://mempalace:mempalace@localhost:5432/mempalace"
+    )
+
+
+def _reachable():
+    try:
+        with psycopg.connect(_dsn(), connect_timeout=3) as c:
+            c.execute("SELECT 1")
+        return True
+    except Exception:
+        return False
+
+
+_PG_LIVE = pytest.mark.skipif(not _reachable(), reason="no reachable Postgres")
+
+
+def test_kg_neighbors_clamps_depth_to_one_through_four(monkeypatch):
+    """depth 0 clamps up to 1 and depth 5 clamps down to 4 (mirrors max_hops)."""
+    seen = {}
+
+    def _spy(op):
+        class _KG:
+            def neighbors(self, name, **kw):
+                seen.update(kw)
+                seen["name"] = name
+                return {"neighbors": [], "truncated": False, "depth": kw["depth"]}
+
+        return op(_KG())
+
+    monkeypatch.setattr(m, "_call_kg", _spy)
+
+    res = m.tool_kg_neighbors("Max", depth=0)
+    assert seen["depth"] == 1
+    assert res["depth"] == 1
+
+    res = m.tool_kg_neighbors("Max", depth=5)
+    assert seen["depth"] == 4
+    assert res["depth"] == 4
+
+
+def test_kg_neighbors_bad_entity_returns_structured_error(monkeypatch):
+    """A blank/invalid entity is rejected as {"error": ...}, not an exception."""
+    called = {"hit": False}
+    monkeypatch.setattr(m, "_call_kg", lambda op: called.__setitem__("hit", True))
+
+    res = m.tool_kg_neighbors("   ")
+    assert "error" in res
+    assert "unsupported" not in res
+    assert called["hit"] is False  # rejected before any graph call
+
+
+def test_kg_neighbors_bad_target_returns_structured_error(monkeypatch):
+    """An invalid target is rejected as {"error": ...} before the graph call."""
+    called = {"hit": False}
+    monkeypatch.setattr(m, "_call_kg", lambda op: called.__setitem__("hit", True))
+
+    res = m.tool_kg_neighbors("Max", target="   ")
+    assert "error" in res
+    assert called["hit"] is False
+
+
+def test_kg_neighbors_invalid_direction_returns_structured_error(monkeypatch):
+    """direction outside the allowed set yields a structured error."""
+    called = {"hit": False}
+    monkeypatch.setattr(m, "_call_kg", lambda op: called.__setitem__("hit", True))
+
+    res = m.tool_kg_neighbors("Max", direction="sideways")
+    assert res == {"error": "direction must be 'outgoing', 'incoming', or 'both'"}
+    assert called["hit"] is False
+
+
+def test_kg_neighbors_unsupported_on_chroma_backend_is_structured(monkeypatch):
+    """The local SQLite stub's NotImplementedError surfaces as a structured
+    {"error": ..., "unsupported": True}, never a crash and never empty."""
+
+    def _raises(op):
+        from mempalace.knowledge_graph import KnowledgeGraph
+
+        # Drive the real SQLite stub path (H003): its neighbors() raises.
+        return op(
+            KnowledgeGraph.__new__(KnowledgeGraph)  # no DB file needed; stub raises first
+        )
+
+    monkeypatch.setattr(m, "_call_kg", _raises)
+
+    res = m.tool_kg_neighbors("Max", depth=2)
+    assert res.get("unsupported") is True
+    assert "error" in res
+    assert "Postgres" in res["error"]
+
+
+@_PG_LIVE
+def test_kg_neighbors_happy_path_multi_hop_against_live_pg(pg_env):
+    """End-to-end multi-hop walk through the real per-team Postgres KG handle."""
+    monkeypatch = pg_env
+    team = "t" + uuid.uuid4().hex[:10]
+
+    backend = PostgresBackend(dsn=_dsn())
+    try:
+        # Seed A -> B -> C -> D in this team's vault.
+        seed = PostgresKnowledgeGraph(backend, team=team)
+        seed.add_triple("A", "rel", "B")
+        seed.add_triple("B", "rel", "C")
+        seed.add_triple("C", "rel", "D")
+
+        # Route the server's per-team handle at the same live backend + vault.
+        monkeypatch.setenv("MEMPALACE_TEAM", team)
+        monkeypatch.setattr("mempalace.palace._resolve_backend", lambda cfg: backend)
+        token = m._active_team_var.set(team)
+        m._kg_by_path.pop(f"pgkg::{team}", None)
+        try:
+            res = m.tool_kg_neighbors("A", depth=3, direction="outgoing")
+        finally:
+            m._active_team_var.reset(token)
+            m._kg_by_path.pop(f"pgkg::{team}", None)
+
+        assert res["entity"] == "A"
+        assert res["depth"] == 3
+        assert res["direction"] == "outgoing"
+        assert res["truncated"] is False
+        objects_by_hop = {(n["hop"], n["object"]) for n in res["neighbors"]}
+        assert objects_by_hop == {(1, "B"), (2, "C"), (3, "D")}
+        assert res["count"] == 3
+    finally:
+        with psycopg.connect(_dsn()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(f'DROP SCHEMA IF EXISTS "{team_schema(team)}" CASCADE')
+            conn.commit()
+        backend.close()

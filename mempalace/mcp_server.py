@@ -2122,6 +2122,61 @@ def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
     return {"entity": entity, "as_of": as_of, "facts": results, "count": len(results)}
 
 
+def tool_kg_neighbors(
+    entity: str,
+    depth: int = 2,
+    direction: str = "outgoing",
+    as_of: str = None,
+    target: str = None,
+    predicates: list = None,
+):
+    """Walk the knowledge graph multiple hops out from an entity.
+
+    Follows typed relationships up to ``depth`` hops away (clamped to 1-4) to
+    surface indirect connections a single-hop query misses — e.g. who Max's
+    teammates' employers are. ``direction`` picks which way edges are followed
+    (outgoing, incoming, or both); ``as_of`` restricts every hop to facts valid
+    at that point in time; ``target`` keeps only paths that reach a named
+    entity; ``predicates`` limits every hop to specific relationship types.
+    """
+    try:
+        entity = sanitize_kg_value(entity, "entity")
+        as_of = sanitize_iso_temporal(as_of, "as_of")
+        if target is not None:
+            target = sanitize_kg_value(target, "target")
+    except ValueError as e:
+        return {"error": str(e)}
+
+    if direction not in ("outgoing", "incoming", "both"):
+        return {"error": "direction must be 'outgoing', 'incoming', or 'both'"}
+
+    depth = max(1, min(depth, 4))
+
+    try:
+        result = _call_kg(
+            lambda kg: kg.neighbors(
+                entity,
+                depth=depth,
+                direction=direction,
+                as_of=as_of,
+                target=target,
+                predicates=predicates,
+            )
+        )
+    except NotImplementedError as e:
+        return {"error": str(e), "unsupported": True}
+
+    return {
+        "entity": entity,
+        "depth": result["depth"],
+        "direction": direction,
+        "as_of": as_of,
+        "neighbors": result["neighbors"],
+        "count": len(result["neighbors"]),
+        "truncated": result["truncated"],
+    }
+
+
 def tool_kg_add(
     subject: str,
     predicate: str,
@@ -2715,6 +2770,41 @@ TOOLS = {
             "required": ["entity"],
         },
         "handler": tool_kg_query,
+    },
+    "mempalace_kg_neighbors": {
+        "description": "Walk the knowledge graph multiple hops out from an entity to surface indirect connections a single-hop query misses. E.g. from 'Max' reach his teammates and their projects. depth follows up to 4 hops; direction picks outgoing (entity→?), incoming (?→entity), or both; target keeps only paths reaching a named entity; predicates limits hops to specific relationship types; as_of filters to facts valid at a point in time.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "entity": {
+                    "type": "string",
+                    "description": "Entity to start the walk from (e.g. 'Max', 'MyProject', 'Alice')",
+                },
+                "depth": {
+                    "type": "integer",
+                    "description": "How many hops to follow out from the entity (default: 2, clamped to 1-4)",
+                },
+                "direction": {
+                    "type": "string",
+                    "description": "outgoing (entity→?), incoming (?→entity), or both (default: outgoing)",
+                },
+                "as_of": {
+                    "type": "string",
+                    "description": "Date/datetime filter — only facts valid at this time, applied to every hop (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional)",
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Keep only paths that reach this entity (optional)",
+                },
+                "predicates": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Restrict every hop to these relationship types (optional)",
+                },
+            },
+            "required": ["entity"],
+        },
+        "handler": tool_kg_neighbors,
     },
     "mempalace_kg_add": {
         "description": "Add a fact to the knowledge graph. Subject → predicate → object with optional time window. E.g. ('Max', 'started_school', 'Year 7', valid_from='2026-09-01'). Pass valid_to to backfill an already-ended historical fact in a single call.",
