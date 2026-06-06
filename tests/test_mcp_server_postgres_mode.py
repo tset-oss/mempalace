@@ -169,8 +169,30 @@ def test_wal_sink_config_validation(monkeypatch):
     assert cfg.wal_sink == "postgres"
     monkeypatch.setenv("MEMPALACE_WAL_SINK", "POSTGRES")  # case-insensitive
     assert cfg.wal_sink == "postgres"
+    # Unrecognised -> the backend-aware default (chroma here -> jsonl).
+    monkeypatch.setenv("MEMPALACE_BACKEND", "chroma")
     monkeypatch.setenv("MEMPALACE_WAL_SINK", "garbage")
-    assert cfg.wal_sink == "jsonl"  # unrecognised -> safe default
+    assert cfg.wal_sink == "jsonl"
+
+
+def test_wal_sink_defaults_to_postgres_on_postgres_backend(monkeypatch):
+    """The central/postgres deploy defaults the audit sink to the team-tagged
+    postgres table (not the host-global jsonl file), while chroma stays jsonl
+    and an explicit value always wins."""
+    from mempalace.config import MempalaceConfig
+
+    monkeypatch.delenv("MEMPALACE_WAL_SINK", raising=False)
+
+    monkeypatch.setenv("MEMPALACE_BACKEND", "postgres")
+    assert MempalaceConfig().wal_sink == "postgres"
+
+    monkeypatch.setenv("MEMPALACE_BACKEND", "chroma")
+    assert MempalaceConfig().wal_sink == "jsonl"
+
+    # An explicit override beats the backend-aware default in both directions.
+    monkeypatch.setenv("MEMPALACE_BACKEND", "postgres")
+    monkeypatch.setenv("MEMPALACE_WAL_SINK", "jsonl")
+    assert MempalaceConfig().wal_sink == "jsonl"
 
 
 def test_wal_log_routes_to_postgres_sink_with_redaction_and_team(pg_env):

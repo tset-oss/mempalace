@@ -475,14 +475,21 @@ def _get_link_store(team=None):
     return store
 
 
-def _index_drawer_entities(team, drawer_ids, content, wing, room):
-    """Best-effort: extract entities from ``content`` and index them per vault.
+def _index_drawer_entities(team, chunks, wing, room):
+    """Best-effort: extract entities per chunk and index them per vault.
 
     No-op on chroma (the miner stamps entities there). NEVER raises — an
     entity-index failure must not fail or undo a verbatim drawer write
-    (verbatim-always). Entities are extracted once over the full content and the
-    same set is written for every physical drawer id (each chunk of a chunked
-    drawer), so an ``entity=`` lookup hits whatever physical row search returns.
+    (verbatim-always). Entities are extracted PER CHUNK — each ``(drawer_id,
+    text)`` pair is run through ``_extract_entities_for_metadata`` on its OWN
+    text and only that chunk's own entity set is written to its own id. This
+    matches the chroma miner (which extracts per physical drawer/chunk), so an
+    ``entity=`` lookup hits the chunks that actually mention the entity and
+    co-occurrence counts per physical chunk with no over-count.
+
+    ``chunks`` is an iterable of ``(drawer_id, text)`` pairs — one per physical
+    row written. The single-doc add path passes one pair; the chunked path
+    passes one pair per chunk slice.
     """
     if _config.backend == "chroma":
         return
@@ -490,10 +497,12 @@ def _index_drawer_entities(team, drawer_ids, content, wing, room):
         from .miner import _extract_entities_for_metadata
 
         idx = _get_entity_index(team)
-        entities_str = _extract_entities_for_metadata(content, known=idx.known_entities())
-        entities = [e for e in entities_str.split(";") if e]
-        if entities:
-            idx.add(drawer_ids, entities, wing, room)
+        known = idx.known_entities()
+        for drawer_id, text in chunks:
+            entities_str = _extract_entities_for_metadata(text, known=known)
+            entities = [e for e in entities_str.split(";") if e]
+            if entities:
+                idx.add([drawer_id], entities, wing, room)
     except Exception:
         logger.debug("entity index update failed (best-effort)", exc_info=True)
 
@@ -1544,6 +1553,63 @@ def tool_list_vaults():
     }
 
 
+def _resolve_parent_drawers(rows, team):
+    """Collapse entity-index chunk rows to their logical parent drawers.
+
+    ``rows`` are ``{drawer_id, wing, room}`` dicts from
+    ``PostgresEntityIndex.drawers_for_entity`` — one per PHYSICAL row that
+    mentions the entity (a chunk id on the chunked path). Each returned dict is
+    the LOGICAL parent (``parent_drawer_id`` from the chunk metadata, or the row
+    itself for a single-chunk drawer) with the mentioning chunk ids attached:
+
+        {"drawer_id": <parent>, "wing", "room", "chunk_ids": [<mentioning ids>]}
+
+    so the navigator's "everything about entity X" list reaches the WHOLE memory
+    even when the entity appears in only one chunk of a multi-chunk drawer, while
+    the chunk ids remain available for a verbatim ``get_drawer`` fetch.
+
+    The parent lookup is one batched metadata read against the drawers
+    collection; if it fails (best-effort), each physical row falls back to being
+    its own parent so the list is never empty.
+    """
+    if not rows:
+        return []
+    by_id = {r["drawer_id"]: r for r in rows if r.get("drawer_id")}
+    parent_of: dict = {}
+    try:
+        col = _get_collection(team=team)
+        if col is not None:
+            fetched = col.get(ids=list(by_id), include=["metadatas"])
+            ids = fetched.get("ids") if isinstance(fetched, dict) else getattr(fetched, "ids", None)
+            metas = (
+                fetched.get("metadatas")
+                if isinstance(fetched, dict)
+                else getattr(fetched, "metadatas", None)
+            )
+            for i, did in enumerate(ids or []):
+                meta = _safe_meta(metas[i]) if metas and i < len(metas) else {}
+                parent = meta.get("parent_drawer_id") or did
+                parent_of[did] = parent
+    except Exception:
+        logger.debug("parent-drawer resolution failed (best-effort)", exc_info=True)
+
+    grouped: dict = {}
+    order: list = []
+    for did, row in by_id.items():
+        # A row with no resolvable parent metadata is its own parent.
+        parent = parent_of.get(did, did)
+        if parent not in grouped:
+            grouped[parent] = {
+                "drawer_id": parent,
+                "wing": row.get("wing"),
+                "room": row.get("room"),
+                "chunk_ids": [],
+            }
+            order.append(parent)
+        grouped[parent]["chunk_ids"].append(did)
+    return [grouped[p] for p in order]
+
+
 def tool_entities(
     entity: str = None, wing: str = None, min_count: int = 2, limit: int = 50, vault: str = None
 ):
@@ -1577,12 +1643,21 @@ def tool_entities(
         idx = _get_entity_index(team)
         if entity:
             rows = idx.drawers_for_entity(entity)
+            # Per-chunk tagging narrows the index to the chunks that actually
+            # mention the entity, so a chunked drawer whose entity appears in
+            # only one chunk would otherwise surface as a lone chunk — not the
+            # whole memory. Resolve each returned chunk to its parent drawer
+            # (``parent_drawer_id`` on the chunk metadata; a single-chunk drawer
+            # is its own parent) and dedupe the presented list to PARENTS so the
+            # navigator always reaches the whole memory. The mentioning chunk
+            # ids stay attached per parent for verbatim fetch via get_drawer.
+            parents = _resolve_parent_drawers(rows, team)
             return {
                 "backend": _config.backend,
                 "vault": team,
                 "entity": entity,
-                "drawer_count": len({r["drawer_id"] for r in rows}),
-                "drawers": rows,
+                "drawer_count": len(parents),
+                "drawers": parents,
                 "hint": f"Pass entity='{entity}' to mempalace_search for the verbatim content.",
             }
         top = idx.top_entities(
@@ -1857,8 +1932,9 @@ def tool_add_drawer(
                     "The palace index may be stale; run reconnect or repair."
                 )
             _metadata_cache = None
-            # Best-effort per-vault entity index (server mode); never fails the write.
-            _index_drawer_entities(add_team, [drawer_id], content, wing, room)
+            # Best-effort per-vault entity index (server mode); never fails the
+            # write. Single physical row -> one (id, text) chunk pair.
+            _index_drawer_entities(add_team, [(drawer_id, content)], wing, room)
             # Best-effort server-side closet rebuild (server mode); never fails the write.
             _enqueue_closet_rebuild(add_team, source_file, wing, room)
             logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
@@ -1896,8 +1972,10 @@ def tool_add_drawer(
             )
         _metadata_cache = None
         # Best-effort per-vault entity index (server mode). Keyed on the physical
-        # chunk ids actually written so delete/update stay consistent.
-        _index_drawer_entities(add_team, chunk_ids, content, wing, room)
+        # chunk ids actually written so delete/update stay consistent, and each
+        # chunk is tagged with the entities in its OWN text slice (per-chunk,
+        # matching the chroma miner) — not the whole-drawer set on every id.
+        _index_drawer_entities(add_team, list(zip(chunk_ids, chunk_docs)), wing, room)
         # Best-effort server-side closet rebuild (server mode); never fails the write.
         _enqueue_closet_rebuild(add_team, source_file, wing, room)
         logger.info(f"Filed drawer: {drawer_id} → {wing}/{room} ({len(chunk_ids)} chunks)")
@@ -2140,11 +2218,26 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         # Best-effort: re-index entities (server mode). An update can change the
         # content, wing, or room, any of which alters the entity rows, so drop
         # and re-extract from the new state rather than leaving stale rows.
+        #
+        # The add path keys a chunked drawer's entity rows on its physical chunk
+        # ids (``{drawer_id}_chunk_NNNNNN``), but this single-row update writes
+        # only ``drawer_id``. Unindexing the bare id alone would ORPHAN any
+        # ``{drawer_id}_chunk_*`` rows a prior chunked add left behind (and a
+        # re-chunk that shrinks the count would strand stale high-index rows).
+        # So drop by the parent prefix — the bare id plus every chunk-id row —
+        # then re-index the new content keyed on the single physical id actually
+        # written, leaving no orphans regardless of the prior chunk count.
         if _config.backend != "chroma":
             upd_team = _resolve_team()
-            _unindex_drawer_entities(upd_team, [drawer_id])
+            try:
+                _get_entity_index(upd_team).delete_by_parent(drawer_id)
+            except Exception:
+                logger.debug("entity index parent-delete failed (best-effort)", exc_info=True)
             _index_drawer_entities(
-                upd_team, [drawer_id], new_doc, new_meta.get("wing"), new_meta.get("room")
+                upd_team,
+                [(drawer_id, new_doc)],
+                new_meta.get("wing"),
+                new_meta.get("room"),
             )
 
         logger.info(f"Updated drawer: {drawer_id}")
@@ -2369,7 +2462,10 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     else:
         wing = f"wing_{agent_name.replace(' ', '_')}"
     room = "diary"
-    col = _get_collection(create=True)
+    # Resolve the target vault once so the collection write and the per-vault
+    # entity index below agree on the team. Chroma is single-vault (team None).
+    diary_team = _resolve_team() if _config.backend != "chroma" else None
+    col = _get_collection(create=True, team=diary_team)
     if not col:
         return _no_palace()
 
@@ -2411,6 +2507,10 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
                 documents=[entry],
                 metadatas=[{**base_metadata, "chunk_index": 0}],
             )
+            # Best-effort per-vault entity index (server mode) — same per-chunk
+            # wiring as tool_add_drawer/tool_update_drawer, so diary entities are
+            # queryable via the entity index. Never fails the diary write.
+            _index_drawer_entities(diary_team, [(entry_id, entry)], wing, room)
             logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic}")
             return {
                 "success": True,
@@ -2452,9 +2552,15 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
                     **base_metadata,
                     "chunk_index": chunk_idx,
                     "parent_entry_id": entry_id,
+                    # Also stamp parent_drawer_id so the entity navigator resolves
+                    # a mentioning diary chunk back to the whole entry (it dedupes
+                    # on parent_drawer_id, the same field the chunked add path uses).
+                    "parent_drawer_id": entry_id,
                 }
             )
         col.add(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
+        # Best-effort per-vault entity index (server mode); per-chunk, never fails.
+        _index_drawer_entities(diary_team, list(zip(chunk_ids, chunk_docs)), wing, room)
         logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic} ({len(chunk_ids)} chunks)")
         return {
             "success": True,

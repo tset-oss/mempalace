@@ -369,15 +369,20 @@ class MempalaceConfig:
     def wal_sink(self):
         """Where the write-ahead audit log is written: ``jsonl`` or ``postgres``.
 
-        ``MEMPALACE_WAL_SINK`` env > config file > ``jsonl`` (the default). With
-        ``postgres`` the redacted audit entries go to a central table (with a
-        team column) on the server-mode backend; the local jsonl file stays the
-        default and the fallback when a database write fails. Any unrecognised
-        value is treated as ``jsonl``.
+        ``MEMPALACE_WAL_SINK`` env > config file > a backend-aware default. On
+        the central/postgres deploy the default is ``postgres`` so audit rows
+        land in the team-tagged central table (rather than a host-global jsonl
+        file shared by every team); on chroma the default stays ``jsonl`` (the
+        local single-vault path). An explicit env/config value always wins, so
+        an operator can force jsonl on postgres or vice versa. With ``postgres``
+        the local jsonl file remains the fallback when a database write fails.
+        Any unrecognised value falls back to the backend-aware default.
         """
+        backend_default = "postgres" if self.backend == "postgres" else "jsonl"
         env_val = os.environ.get("MEMPALACE_WAL_SINK")
-        raw = str(env_val or self._file_config.get("wal_sink") or "jsonl").strip().lower()
-        return raw if raw in ("jsonl", "postgres") else "jsonl"
+        explicit = env_val if env_val is not None else self._file_config.get("wal_sink")
+        raw = str(explicit or backend_default).strip().lower()
+        return raw if raw in ("jsonl", "postgres") else backend_default
 
     @property
     def people_map(self):

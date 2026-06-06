@@ -632,7 +632,19 @@ def _load_known_entities() -> frozenset:
     """Flat set of every known entity name (across all categories).
 
     Cached by mtime; invalidated when the registry file changes.
+
+    The host-global ``~/.mempalace/known_entities.json`` is a single-user,
+    single-vault artifact: on the central/postgres deploy it is the SERVER
+    process's home, shared by every team, not the engineer's. So the read is
+    gated to the chroma backend. On postgres the per-vault known set
+    (``PostgresEntityIndex.known_entities()``) is injected explicitly via the
+    ``known=`` argument of ``_extract_entities_for_metadata`` (the MCP write
+    path already does this); the host JSON is never opened for a team vault.
     """
+    from .config import MempalaceConfig
+
+    if MempalaceConfig().backend != "chroma":
+        return frozenset()
     _refresh_known_entities_cache()
     return _ENTITY_REGISTRY_CACHE["names"]
 

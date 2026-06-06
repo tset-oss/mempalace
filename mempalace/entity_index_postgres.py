@@ -122,6 +122,31 @@ class PostgresEntityIndex:
                 cur.execute(f"DELETE FROM {self._table()} WHERE drawer_id = ANY(%s)", (ids,))
         self._invalidate_known()
 
+    def delete_by_parent(self, parent_id: str) -> None:
+        """Remove the bare ``parent_id`` row AND every ``{parent_id}_chunk_*`` row.
+
+        Re-indexing a drawer on update must clear ALL its prior physical rows,
+        not just the bare id: a drawer originally filed as multiple chunks keyed
+        its entity rows on ``{parent_id}_chunk_NNNNNN``. Deleting only the bare id
+        would orphan those chunk rows, and a re-chunk that shrinks the chunk count
+        would leave stale high-index rows behind. Matching the parent id plus the
+        chunk-id prefix clears them all regardless of the prior chunk count.
+        """
+        if not parent_id:
+            return
+        # Escape LIKE wildcards in the id so a literal '%' / '_' in a drawer id
+        # is matched literally, then append the chunk-id suffix pattern.
+        escaped = parent_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        chunk_pattern = f"{escaped}\\_chunk\\_%"
+        self._ensure()
+        with self._backend._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"DELETE FROM {self._table()} WHERE drawer_id = %s OR drawer_id LIKE %s",
+                    (parent_id, chunk_pattern),
+                )
+        self._invalidate_known()
+
     # -- reads ------------------------------------------------------------
     def known_entities(self) -> frozenset:
         """Per-vault known-entity set: accumulated occurrences UNION kg_add names.
