@@ -115,6 +115,10 @@ class TestQueries:
         results = seeded_kg.query_relationship("does")
         assert len(results) == 2  # swimming + chess
 
+    def test_neighbors_not_supported_on_sqlite(self, seeded_kg):
+        with pytest.raises(NotImplementedError, match="only available on the Postgres backend"):
+            seeded_kg.neighbors("Alice")
+
 
 class TestInvalidation:
     def test_invalidate_sets_valid_to(self, seeded_kg):

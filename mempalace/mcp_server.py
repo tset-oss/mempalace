@@ -316,6 +316,14 @@ def _get_kg(canonical_path=None) -> KnowledgeGraph:
     # Server-mode backends store the KG centrally in the team's vault schema
     # (PostgresKnowledgeGraph), sharing the storage backend's connection pool.
     # Cached per team rather than per filesystem path.
+    #
+    # This per-team pg cache (keyed ``pgkg::<team>``) is the single handle path
+    # for every KG capability, including multi-hop ``kg.neighbors(...)``: callers
+    # reach it via _get_kg / _call_kg and never branch on the backend. The
+    # PostgresKnowledgeGraph implements neighbors() for real; the SQLite
+    # KnowledgeGraph raises NotImplementedError from a signature-compatible stub.
+    # The handle is NOT obtained through kg_factory — that selection happens once
+    # here and is cached, so the consumer always calls the same kg object.
     if _config.backend != "chroma":
         from .knowledge_graph_postgres import PostgresKnowledgeGraph
         from .palace import _resolve_backend

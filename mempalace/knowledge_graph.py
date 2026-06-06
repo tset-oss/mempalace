@@ -424,6 +424,31 @@ class KnowledgeGraph:
 
         return results
 
+    def neighbors(
+        self,
+        name: str,
+        depth: int = 2,
+        direction: str = "outgoing",
+        as_of: str = None,
+        target: str = None,
+        predicates: Optional[list] = None,
+        limit: int = 500,
+        expand_cap: int = 50,
+    ):
+        """Multi-hop neighborhood walk — Postgres backend only.
+
+        This mirrors :meth:`PostgresKnowledgeGraph.neighbors` exactly so a
+        consumer can call ``kg.neighbors(...)`` against whichever backend the
+        per-team KG handle resolved to without branching on the backend type.
+        The recursive multi-hop walk has no SQLite implementation, so this
+        signature-compatible stub raises a clear error instead of silently
+        returning nothing.
+        """
+        raise NotImplementedError(
+            "multi-hop kg_neighbors is only available on the Postgres backend; "
+            "the local SQLite knowledge graph supports single-hop kg_query only"
+        )
+
     def query_relationship(self, predicate: str, as_of: str = None):
         """Get all triples with a given relationship type."""
         as_of = sanitize_iso_temporal(as_of, "as_of")
