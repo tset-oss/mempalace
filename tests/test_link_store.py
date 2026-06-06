@@ -213,9 +213,20 @@ class TestGetLinkStore:
         store = link_store.get_link_store(_FakeConfig("chroma"), team="frontend")
         assert isinstance(store, link_store.JsonLinkStore)
 
-    def test_postgres_raises_not_implemented_placeholder(self):
-        with pytest.raises(NotImplementedError, match="next story"):
-            link_store.get_link_store(_FakeConfig("postgres"), team="frontend")
+    def test_postgres_with_team_returns_postgres_store(self):
+        """The postgres path now returns a per-team PostgresLinkStore. Backend
+        construction is lazy (no connection until first use), so this builds the
+        store without a live DB."""
+        from mempalace.link_store_postgres import PostgresLinkStore
+
+        store = link_store.get_link_store(_FakeConfig("postgres"), team="frontend")
+        assert isinstance(store, PostgresLinkStore)
+
+    def test_postgres_without_team_raises(self):
+        """On postgres a team is MANDATORY (reads AND writes are team-scoped).
+        A None team fails loud rather than routing into a default vault."""
+        with pytest.raises(ValueError, match="no team resolved"):
+            link_store.get_link_store(_FakeConfig("postgres"), team=None)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

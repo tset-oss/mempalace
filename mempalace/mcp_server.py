@@ -444,6 +444,37 @@ def _get_entity_index(team=None):
     return idx
 
 
+# ── Per-vault explicit-tunnel store (server mode only) ──────────────────────
+# Mirrors the entity-index cache: one PostgresLinkStore per team, sharing the
+# storage backend's connection pool. The store owns the team's team_<slug>.tunnels
+# table (the per-team replacement for the host-global tunnels.json).
+_link_store_by_team: dict = {}
+_link_store_lock = threading.Lock()
+
+
+def _get_link_store(team=None):
+    """Return the cached ``PostgresLinkStore`` for the resolved team.
+
+    Postgres requires a team for reads AND writes (isolation is structural —
+    one team's schema), so this resolves it strictly and fails loud on None.
+    """
+    from .link_store import require_write_team
+    from .link_store_postgres import PostgresLinkStore
+    from .palace import _resolve_backend
+
+    t = require_write_team(team if team is not None else _resolve_team_strict())
+    key = f"pglink::{t}"
+    store = _link_store_by_team.get(key)
+    if store is not None:
+        return store
+    with _link_store_lock:
+        store = _link_store_by_team.get(key)
+        if store is None:
+            store = PostgresLinkStore(_resolve_backend(_config), team=t)
+            _link_store_by_team[key] = store
+    return store
+
+
 def _index_drawer_entities(team, drawer_ids, content, wing, room):
     """Best-effort: extract entities from ``content`` and index them per vault.
 

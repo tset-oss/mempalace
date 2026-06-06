@@ -204,19 +204,25 @@ def get_link_store(config, team: Optional[str] = None) -> LinkStore:
     * ``chroma`` (default, host-local single-vault) → :class:`JsonLinkStore`.
       The store is single-vault, so *team* is accepted for a uniform call
       signature but ignored — chroma does not require a team.
-    * any team-scoped (server-mode) backend → not yet available; raises
-      :class:`NotImplementedError`. The team-scoped store lands in the next
-      story, and no production consumer routes through this seam until the
-      consumer-wiring story, so this placeholder is safe and deliberate.
+    * any team-scoped (server-mode) backend → a per-team Postgres
+      :class:`~mempalace.link_store_postgres.PostgresLinkStore`. On Postgres a
+      team is MANDATORY for every operation — reads AND writes are scoped to
+      one team's schema, so you cannot list/follow another team's tunnels — so
+      this path runs *team* through :func:`require_write_team` and RAISES when
+      it is ``None`` rather than silently routing into a default vault.
 
     Args:
         config: a ``MempalaceConfig`` (read for ``.backend``).
-        team: the resolved team for a team-scoped write. Ignored by the
-            chroma JSON store; required by team-scoped backends (resolve it
-            with the strict resolver and pass the result, or use
-            :func:`require_write_team`).
+        team: the resolved team. Ignored by the chroma JSON store; MANDATORY
+            for team-scoped backends (resolve it with the strict resolver and
+            pass the result; ``None`` fails loud via :func:`require_write_team`).
     """
     backend = getattr(config, "backend", "chroma")
     if backend == "chroma":
         return JsonLinkStore()
-    raise NotImplementedError("postgres link store lands in the next story")
+    # Team-scoped (server-mode) backend: team is mandatory for reads AND writes
+    # (isolation is structural — one team's schema). Fail loud on None.
+    from .link_store_postgres import PostgresLinkStore
+    from .palace import _resolve_backend
+
+    return PostgresLinkStore(_resolve_backend(config), team=require_write_team(team))
