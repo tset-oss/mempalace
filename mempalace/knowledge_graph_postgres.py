@@ -55,9 +55,29 @@ def _temporal_filter_sql(as_of: str) -> tuple[str, list]:
     vf = _pg_temporal_start_expr("t.valid_from")
     vt = _pg_temporal_end_expr("t.valid_to")
     return (
-        f" AND (t.valid_from IS NULL OR {vf} <= %s) "
-        f"AND (t.valid_to IS NULL OR {vt} >= %s)",
+        f" AND (t.valid_from IS NULL OR {vf} <= %s) AND (t.valid_to IS NULL OR {vt} >= %s)",
         [as_of_key, as_of_key],
+    )
+
+
+def _temporal_filter_sql_named(column_prefix: str, key: str = "as_of") -> str:
+    """As-of filter SQL referencing a NAMED parameter ``%(key)s``.
+
+    Unlike :func:`_temporal_filter_sql` (which emits two positional ``%s``
+    placeholders), this returns SQL that references the as-of value through a
+    single named placeholder. The recursive multi-hop read references the
+    same as-of value at both the anchor term and the recursive term, so a named
+    placeholder lets one bound value satisfy every reference without the caller
+    threading the parameter list in a fragile position-dependent order. The
+    edge-validity test is applied once per hop, so a path whose edges have
+    disjoint validity windows is traversable only when every edge is itself
+    valid at the as-of instant.
+    """
+    vf = _pg_temporal_start_expr(f"{column_prefix}.valid_from")
+    vt = _pg_temporal_end_expr(f"{column_prefix}.valid_to")
+    return (
+        f" AND ({column_prefix}.valid_from IS NULL OR {vf} <= %({key})s) "
+        f"AND ({column_prefix}.valid_to IS NULL OR {vt} >= %({key})s)"
     )
 
 
@@ -213,8 +233,17 @@ class PostgresKnowledgeGraph:
                     "  confidence, source_closet, source_file, source_drawer_id, adapter_name"
                     ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     (
-                        triple_id, sub_id, pred, obj_id, valid_from, valid_to,
-                        confidence, source_closet, source_file, source_drawer_id, adapter_name,
+                        triple_id,
+                        sub_id,
+                        pred,
+                        obj_id,
+                        valid_from,
+                        valid_to,
+                        confidence,
+                        source_closet,
+                        source_file,
+                        source_drawer_id,
+                        adapter_name,
                     ),
                 )
                 return triple_id
@@ -306,6 +335,209 @@ class PostgresKnowledgeGraph:
                         )
         return results
 
+    def neighbors(
+        self,
+        name: str,
+        depth: int = 2,
+        direction: str = "outgoing",
+        as_of: str = None,
+        target: str = None,
+        predicates: Optional[list] = None,
+        limit: int = 500,
+        expand_cap: int = 50,
+    ):
+        """Bounded multi-hop neighborhood walk over the temporal triples.
+
+        Starting at ``name``, walk up to ``depth`` hops along edges in the
+        requested ``direction`` ("outgoing", "incoming", or "both"), returning
+        one row per reached edge with its hop number, the edge endpoints as
+        NAMES (joined from ``kg_entities``), and the triple-id path taken to
+        reach it.
+
+        Bounding (both bounds are required — a final row LIMIT alone does NOT
+        constrain the recursive frontier):
+        * ``depth`` is clamped to at most 4 hops.
+        * ``expand_cap`` caps how many edges are followed out of each reached
+          node, bounding the per-level frontier so a dense hub cannot blow up
+          the working set.
+        * ``limit`` caps the total rows returned.
+        The returned dict carries ``truncated=True`` when EITHER cap clips the
+        result (a node had more outgoing edges than ``expand_cap``, or the total
+        row count reached ``limit``).
+
+        Temporal semantics are point-in-time PER EDGE: when ``as_of`` is given,
+        every hop's edge must independently satisfy the as-of validity test, so
+        a path whose edges have disjoint validity windows is traversable only
+        when each edge is itself valid at the single ``as_of`` instant.
+
+        ``target`` restricts the result to paths that reach the named entity.
+        ``predicates`` restricts every hop to the given predicate names.
+
+        This is a read-only walk; it issues no DDL and never mutates the
+        relational source of truth.
+        """
+        self._ensure()
+        as_of = sanitize_iso_temporal(as_of, "as_of")
+        if direction not in ("outgoing", "incoming", "both"):
+            raise ValueError(
+                f"direction={direction!r} must be one of 'outgoing', 'incoming', or 'both'"
+            )
+        depth = max(1, min(int(depth), 4))
+        expand_cap = max(1, int(expand_cap))
+        limit = max(1, int(limit))
+
+        start_id = self._entity_id(name)
+        params: dict = {
+            "start_id": start_id,
+            "max_depth": depth,
+            # Fetch one extra edge per node so a node whose real out-degree
+            # exceeds ``expand_cap`` is detected (the surplus row is dropped
+            # from the traversal but flips the truncation flag).
+            "expand_probe": expand_cap + 1,
+            "row_limit": limit,
+        }
+        if as_of:
+            params["as_of"] = _temporal_start_key(as_of)
+        temporal_sql = _temporal_filter_sql_named("e") if as_of else ""
+
+        # Predicate typed-filter (named list param), applied to EVERY hop.
+        pred_sql = ""
+        if predicates:
+            params["predicates"] = [p.lower().replace(" ", "_") for p in predicates]
+            pred_sql = " AND e.predicate = ANY(%(predicates)s)"
+
+        target_sql = ""
+        if target:
+            params["target_id"] = self._entity_id(target)
+            target_sql = " WHERE w.endpoint = %(target_id)s"
+
+        triples = self._triples()
+
+        # One edge-expansion fragment, parameterized by the frontier-id and the
+        # visited-path expressions so the anchor (start entity, empty path) and
+        # the recursive term (frontier node, accumulated path) share identical
+        # as-of, predicate, cycle-guard, and per-node-cap logic. ``next_id`` is
+        # the entity an edge leads to in the walk direction: outgoing follows
+        # subject -> object, incoming follows object -> subject. "both" is the
+        # UNION ALL of the two; the cycle guard (the triple-id ``path``) is
+        # shared, so an A->B->A cycle is rejected regardless of which side each
+        # hop traverses. ``LIMIT %(expand_probe)s`` (= expand_cap + 1) bounds
+        # the per-level frontier while still revealing a node that overflowed.
+        def _expansion(frontier_expr: str, path_expr: str) -> str:
+            def _leg(next_col: str, match_col: str, edge_dir: str) -> str:
+                return (
+                    "SELECT e.id AS triple_id, "
+                    f"e.{next_col} AS next_id, e.predicate, "
+                    "e.valid_from, e.valid_to, e.confidence, e.source_closet, "
+                    "e.subject AS edge_subject, e.object AS edge_object, "
+                    f"'{edge_dir}' AS edge_direction "
+                    f"FROM {triples} e "
+                    f"WHERE e.{match_col} = {frontier_expr} "
+                    f"AND NOT (e.id = ANY({path_expr}))"
+                    f"{temporal_sql}{pred_sql}"
+                )
+
+            if direction == "outgoing":
+                body = _leg("object", "subject", "outgoing")
+            elif direction == "incoming":
+                body = _leg("subject", "object", "incoming")
+            else:  # both
+                body = (
+                    _leg("object", "subject", "outgoing")
+                    + " UNION ALL "
+                    + _leg("subject", "object", "incoming")
+                )
+            return (
+                "SELECT * FROM ( " + body + " ) step ORDER BY step.triple_id LIMIT %(expand_probe)s"
+            )
+
+        anchor = _expansion("%(start_id)s", "ARRAY[]::text[]")
+        recursive = _expansion("w.endpoint", "w.path")
+
+        # The walk carries the visited triple-id ``path`` (cycle guard) and the
+        # ``hop`` counter (depth clamp). The outer query joins ``kg_entities``
+        # twice to surface both edge endpoints as NAMES (mirroring
+        # ``query_entity``'s edge-name join). ``LIMIT row_limit + 1`` lets the
+        # caller see whether the total-row cap clipped the result.
+        sql = (
+            "WITH RECURSIVE walk AS ( "
+            "  SELECT s.triple_id, s.next_id AS endpoint, s.predicate, "
+            "    s.valid_from, s.valid_to, s.confidence, s.source_closet, "
+            "    s.edge_subject, s.edge_object, s.edge_direction, "
+            "    1 AS hop, ARRAY[s.triple_id] AS path "
+            "  FROM ( " + anchor + " ) s "
+            "  UNION ALL "
+            "  SELECT n.triple_id, n.next_id AS endpoint, n.predicate, "
+            "    n.valid_from, n.valid_to, n.confidence, n.source_closet, "
+            "    n.edge_subject, n.edge_object, n.edge_direction, "
+            "    w.hop + 1 AS hop, w.path || n.triple_id AS path "
+            "  FROM walk w "
+            "  CROSS JOIN LATERAL ( " + recursive + " ) n "
+            "  WHERE w.hop < %(max_depth)s "
+            ") "
+            "SELECT w.triple_id, w.hop, w.predicate, w.valid_from, w.valid_to, "
+            "  w.confidence, w.source_closet, w.edge_direction, w.path, "
+            "  subj.name AS subject_name, obj.name AS object_name "
+            "FROM walk w "
+            f"JOIN {self._entities()} subj ON w.edge_subject = subj.id "
+            f"JOIN {self._entities()} obj ON w.edge_object = obj.id "
+            + target_sql
+            + " ORDER BY w.hop, w.triple_id "
+            "LIMIT %(row_limit)s + 1"
+        )
+
+        with self._backend._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                fetched = cur.fetchall()
+                # A per-node out-degree above ``expand_cap`` clips the frontier:
+                # detected by any single frontier node yielding the probe count
+                # (expand_cap + 1) of edges within the depth bound.
+                cur.execute(
+                    "WITH RECURSIVE walk AS ( "
+                    "  SELECT s.triple_id, s.next_id AS endpoint, "
+                    "    1 AS hop, ARRAY[s.triple_id] AS path, "
+                    "    (SELECT count(*) FROM ( " + anchor + " ) ac) AS deg "
+                    "  FROM ( " + anchor + " ) s "
+                    "  UNION ALL "
+                    "  SELECT n.triple_id, n.next_id AS endpoint, "
+                    "    w.hop + 1 AS hop, w.path || n.triple_id AS path, "
+                    "    (SELECT count(*) FROM ( " + recursive + " ) rc) AS deg "
+                    "  FROM walk w "
+                    "  CROSS JOIN LATERAL ( " + recursive + " ) n "
+                    "  WHERE w.hop < %(max_depth)s "
+                    ") "
+                    "SELECT bool_or(deg >= %(expand_probe)s) FROM walk",
+                    params,
+                )
+                clip_row = cur.fetchone()
+                expand_clipped = bool(clip_row and clip_row[0])
+
+        truncated = len(fetched) > limit or expand_clipped
+        rows = []
+        for r in fetched[:limit]:
+            rows.append(
+                {
+                    "hop": r[1],
+                    "direction": r[7],
+                    "subject": r[9],
+                    "predicate": r[2],
+                    "object": r[10],
+                    "valid_from": r[3],
+                    "valid_to": r[4],
+                    "confidence": r[5],
+                    "source_closet": r[6],
+                    "current": r[4] is None,
+                    "path": list(r[8]),
+                }
+            )
+
+        return {
+            "neighbors": rows,
+            "truncated": truncated,
+            "depth": depth,
+        }
+
     def query_relationship(self, predicate: str, as_of: str = None):
         self._ensure()
         as_of = sanitize_iso_temporal(as_of, "as_of")
@@ -381,9 +613,7 @@ class PostgresKnowledgeGraph:
                 triples = int(cur.fetchone()[0])
                 cur.execute(f"SELECT COUNT(*) FROM {self._triples()} WHERE valid_to IS NULL")
                 current = int(cur.fetchone()[0])
-                cur.execute(
-                    f"SELECT DISTINCT predicate FROM {self._triples()} ORDER BY predicate"
-                )
+                cur.execute(f"SELECT DISTINCT predicate FROM {self._triples()} ORDER BY predicate")
                 predicates = [r[0] for r in cur.fetchall()]
         return {
             "entities": entities,
