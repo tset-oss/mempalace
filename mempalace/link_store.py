@@ -9,9 +9,9 @@ host-global file is a cross-tenant leak: one file, one host, many teams.
 This module introduces ONE seam — :class:`LinkStore` plus
 :func:`get_link_store` — that every explicit-tunnel writer and every
 hallway reader routes through, so the local (chroma) JSON store and the
-per-team Postgres store cannot drift apart. The Postgres implementation
-lands in a later story; today the resolver returns the JSON store for the
-chroma backend and raises a clear, deliberate placeholder for postgres.
+per-team Postgres store cannot drift apart. The resolver returns the JSON
+store for the chroma backend and the per-team Postgres store (which requires
+a resolved team) for the postgres backend.
 
 Contract guarantees the JSON store preserves verbatim (so consumers can
 route through the seam with zero behavior change):

@@ -931,8 +931,11 @@ def mine_formats(
         # tunnels linking this wing to others that share confirmed topics.
         # Mirrors the post-loop tunnel block in miner._mine_impl: tunnel-compute
         # failures must never fail a mine, so any exception is logged and
-        # skipped quietly.
-        if not dry_run:
+        # skipped quietly. The host-global ``~/.mempalace/tunnels.json`` write is
+        # gated to chroma — on the central, multi-team postgres deployment that
+        # single host file is a cross-tenant leak, so the server owns and
+        # derives the link layer per team instead (mirrors miner._mine_impl).
+        if not dry_run and palace_config.backend == "chroma":
             try:
                 tunnels_added = _compute_topic_tunnels_for_wing(wing)
                 if tunnels_added:
@@ -948,6 +951,7 @@ def mine_formats(
                     file=sys.stderr,
                 )
 
+        if not dry_run:
             # End-of-mine FTS5 integrity check (#1537). Mirrors _mine_impl;
             # raises MineValidationError to cmd_mine if PRAGMA quick_check
             # finds malformed FTS5 rows so a corrupted palace cannot silently

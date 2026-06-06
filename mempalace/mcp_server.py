@@ -79,10 +79,6 @@ from .palace_graph import (  # noqa: E402
     traverse,
     find_tunnels,
     graph_stats,
-    create_tunnel,
-    list_tunnels,
-    delete_tunnel,
-    follow_tunnels,
 )
 
 from .knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
@@ -1742,6 +1738,22 @@ def tool_traverse_graph(start_room: str, max_hops: int = 2):
     return traverse(start_room, col=col, max_hops=max_hops)
 
 
+def _link_store_for_request():
+    """Return the link store for the current request, routed through the seam.
+
+    On chroma this is the host-local JSON store (team ignored — single vault),
+    so explicit-tunnel CRUD behaves byte-identically to the direct
+    ``palace_graph`` calls it replaces. On a team-scoped (postgres) backend the
+    team is resolved IN-REQUEST via the strict resolver and the seam returns the
+    per-team ``PostgresLinkStore``; an unresolvable team RAISES (no silent
+    default vault), so a tunnel write can never leak across teams.
+    """
+    from .link_store import get_link_store
+
+    team = None if _config.backend == "chroma" else _resolve_team_strict()
+    return get_link_store(_config, team)
+
+
 def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
     """Find rooms that bridge two wings — the hallways connecting domains."""
     try:
@@ -1778,6 +1790,13 @@ def tool_create_tunnel(
     Example: an API design discussion in project_api connects to the
     database schema in project_database.
     """
+    # Resolve the link store FIRST. On postgres this resolves the team
+    # in-request via the strict resolver and RAISES (no default vault) when the
+    # team is unresolvable — that fail-loud raise must propagate, not be swept
+    # into the validation {"error": ...} below, so a team-less write surfaces as
+    # an error rather than silently leaking into a shared vault. On chroma the
+    # team is ignored and this never raises.
+    store = _link_store_for_request()
     # sanitize_name and create_tunnel both raise ValueError for invalid or
     # missing endpoints (empty/non-string names, and create_tunnel's
     # room-existence checks). Catch both so the real reason is surfaced
@@ -1788,7 +1807,7 @@ def tool_create_tunnel(
         source_room = sanitize_name(source_room, "source_room")
         target_wing = sanitize_name(target_wing, "target_wing")
         target_room = sanitize_name(target_room, "target_room")
-        return create_tunnel(
+        return store.create_tunnel(
             source_wing,
             source_room,
             target_wing,
@@ -1803,29 +1822,35 @@ def tool_create_tunnel(
 
 def tool_list_tunnels(wing: str = None):
     """List all explicit cross-wing tunnels, optionally filtered by wing."""
+    # Resolve the store first so the postgres fail-loud-no-team raise is not
+    # masked by the wing-validation error handler (see tool_create_tunnel).
+    store = _link_store_for_request()
     try:
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
-    return list_tunnels(wing)
+    return store.list_tunnels(wing)
 
 
 def tool_delete_tunnel(tunnel_id: str):
     """Delete an explicit tunnel by its ID."""
     if not tunnel_id or not isinstance(tunnel_id, str):
         return {"error": "tunnel_id is required"}
-    return delete_tunnel(tunnel_id)
+    return _link_store_for_request().delete_tunnel(tunnel_id)
 
 
 def tool_follow_tunnels(wing: str, room: str):
     """Follow explicit tunnels from a room to see connected drawers in other wings."""
+    # Resolve the store first so the postgres fail-loud-no-team raise is not
+    # masked by the name-validation error handler (see tool_create_tunnel).
+    store = _link_store_for_request()
     try:
         wing = sanitize_name(wing, "wing")
         room = sanitize_name(room, "room")
     except ValueError as e:
         return {"error": str(e)}
     col = _get_collection()
-    return follow_tunnels(wing, room, col=col)
+    return store.follow_tunnels(wing, room, col=col)
 
 
 # ==================== WRITE TOOLS ====================

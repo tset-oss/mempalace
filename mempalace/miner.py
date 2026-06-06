@@ -1718,7 +1718,16 @@ def _mine_impl(
                 if not dry_run:
                     print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers}")
 
-        if not dry_run:
+        # Derived link layer (topic tunnels, within-wing hallways, entity
+        # tunnels) persists to host-global JSON (``~/.mempalace/tunnels.json`` /
+        # ``hallways.json``) via palace_graph/hallways. On the central, multi-
+        # team postgres deployment that single host file is a cross-tenant leak
+        # (one file, one host, many teams), so the host-global writes are gated
+        # to the chroma single-vault path. On postgres the link layer is owned
+        # and derived server-side per team — the miner writes no host-global
+        # link JSON. (The miner becomes team-aware and fires the per-team
+        # server-side rebuild in a later story; here we only gate the leak.)
+        if not dry_run and palace_config.backend == "chroma":
             # Cross-wing topic tunnels: after every file in this wing has been
             # processed, link this wing to any other wing that shares a
             # confirmed TOPIC label. Out of scope for v1: manifest-dependency
@@ -1765,6 +1774,7 @@ def _mine_impl(
                     file=sys.stderr,
                 )
 
+        if not dry_run:
             _validate_palace_fts5_after_mine(palace_path)
 
         print(f"\n{'=' * 55}")

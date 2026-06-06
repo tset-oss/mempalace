@@ -1398,7 +1398,11 @@ class TestWriteTools:
     def test_tool_create_tunnel_surfaces_value_error(self, monkeypatch):
         """Regression for #1473: a ValueError from create_tunnel (e.g. a
         missing room) must be returned to the caller as a clear error,
-        not escape and get wrapped as the opaque 'Internal tool error'."""
+        not escape and get wrapped as the opaque 'Internal tool error'.
+
+        The tool now routes through the link-store seam; on chroma the JSON
+        store delegates to palace_graph.create_tunnel, so that is the patch
+        target (the seam preserves the #1473 surfacing contract verbatim)."""
         from mempalace import mcp_server
 
         msg = "Target room 'does-not-exist-probe' does not exist in wing 'wing_minerva'"
@@ -1406,7 +1410,7 @@ class TestWriteTools:
         def _raise(*args, **kwargs):
             raise ValueError(msg)
 
-        monkeypatch.setattr(mcp_server, "create_tunnel", _raise)
+        monkeypatch.setattr("mempalace.palace_graph.create_tunnel", _raise)
 
         result = mcp_server.tool_create_tunnel(
             source_wing="wing_minerva",

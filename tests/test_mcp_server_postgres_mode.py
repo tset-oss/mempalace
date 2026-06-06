@@ -551,6 +551,273 @@ def test_kg_neighbors_unsupported_on_chroma_backend_is_structured(monkeypatch):
     assert "Postgres" in res["error"]
 
 
+# ==================== explicit-tunnel tools through the link-store seam (H010) ====
+#
+# The four explicit-tunnel CRUD tools (create / list / follow / delete) now route
+# through get_link_store(_config, team): on chroma the seam returns the JSON store
+# (byte-identical to the prior direct palace_graph calls); on postgres it returns
+# the per-team PostgresLinkStore, with the team resolved in-request via the strict
+# resolver (RAISE on None — no default vault). The no-DB tests stub the seam /
+# palace_graph; the e2e + isolation tests use the live-DB self-skip convention.
+
+
+def test_tunnel_tools_use_json_store_on_chroma(monkeypatch):
+    """On chroma the tools route through the seam to the JSON store, which
+    delegates to palace_graph verbatim — byte-identical to the prior direct
+    calls. We assert the JSON delegate is hit and no team is required."""
+    monkeypatch.setenv("MEMPALACE_BACKEND", "chroma")
+    token = m._active_team_var.set(None)  # no team available at all
+    try:
+        calls = {}
+
+        def _spy_create(*a, **kw):
+            calls["create"] = (a, kw)
+            return {"id": "T1", "kind": "explicit"}
+
+        monkeypatch.setattr("mempalace.palace_graph.create_tunnel", _spy_create)
+        monkeypatch.setattr("mempalace.palace_graph.list_tunnels", lambda wing=None: [{"id": "T1"}])
+        monkeypatch.setattr("mempalace.palace_graph.delete_tunnel", lambda tid: {"deleted": tid})
+        monkeypatch.setattr(
+            "mempalace.palace_graph.follow_tunnels",
+            lambda wing, room, col=None, config=None: [{"direction": "outgoing"}],
+        )
+        monkeypatch.setattr(m, "_get_collection", lambda *a, **k: None)
+
+        # create — no team needed on chroma (single vault); JSON delegate hit.
+        res = m.tool_create_tunnel("wing_a", "room_a", "wing_b", "room_b", label="x")
+        assert res == {"id": "T1", "kind": "explicit"}
+        assert "create" in calls
+        assert calls["create"][1]["label"] == "x"
+
+        # list / delete / follow all route to the JSON delegates too.
+        assert m.tool_list_tunnels() == [{"id": "T1"}]
+        assert m.tool_delete_tunnel("T1") == {"deleted": "T1"}
+        assert m.tool_follow_tunnels("wing_a", "room_a") == [{"direction": "outgoing"}]
+    finally:
+        m._active_team_var.reset(token)
+
+
+def test_tunnel_tool_write_raises_on_postgres_without_resolvable_team(monkeypatch):
+    """fail-loud: a tunnel-tool write on postgres with no explicit team and no
+    active session team RAISES rather than routing into a default vault. No DB
+    is touched — the strict resolver returns None before any store is built."""
+    monkeypatch.setenv("MEMPALACE_BACKEND", "postgres")
+    monkeypatch.setenv("MEMPALACE_TEAM", "configured_default")
+    token = m._active_team_var.set(None)
+    try:
+        # Sanity: the strict resolver is ambiguous here (no explicit, no active).
+        assert m._resolve_team_strict() is None
+
+        # The fail-loud raise propagates (it is NOT swallowed by the tool's
+        # name-validation error handler).
+        with pytest.raises(ValueError, match="no team resolved"):
+            m.tool_create_tunnel("wing_a", "room_a", "wing_b", "room_b")
+        with pytest.raises(ValueError, match="no team resolved"):
+            m.tool_list_tunnels()
+        with pytest.raises(ValueError, match="no team resolved"):
+            m.tool_delete_tunnel("some_id")
+        with pytest.raises(ValueError, match="no team resolved"):
+            m.tool_follow_tunnels("wing_a", "room_a")
+    finally:
+        m._active_team_var.reset(token)
+
+
+@_PG_LIVE
+def test_tunnel_tools_round_trip_in_team_vault_on_postgres(pg_env):
+    """e2e: create -> list -> follow -> delete through the tools operate in the
+    team vault (PostgresLinkStore) and round-trip via the H008 store."""
+    monkeypatch = pg_env
+    team = "t" + uuid.uuid4().hex[:10]
+
+    backend = PostgresBackend(dsn=_dsn())
+    monkeypatch.setattr("mempalace.palace._resolve_backend", lambda cfg: backend)
+    monkeypatch.setattr(m, "_get_collection", lambda *a, **k: None)
+    token = m._active_team_var.set(team)
+    m._link_store_by_team.pop(f"pglink::{team}", None)
+    try:
+        created = m.tool_create_tunnel(
+            "wing_code",
+            "auth",
+            "wing_people",
+            "users",
+            label="same concept",
+            target_drawer_id="drawer_users_1",
+        )
+        assert "error" not in created
+        assert created["kind"] == "explicit"
+        assert created["label"] == "same concept"
+
+        # list — visible through the tool.
+        listed = m.tool_list_tunnels()
+        assert [t["id"] for t in listed] == [created["id"]]
+
+        # follow — outgoing from the source endpoint.
+        connections = m.tool_follow_tunnels("wing_code", "auth")
+        assert len(connections) == 1
+        assert connections[0]["direction"] == "outgoing"
+        assert connections[0]["connected_wing"] == "wing_people"
+        assert connections[0]["tunnel_id"] == created["id"]
+
+        # The row physically lives in the H008 per-team store.
+        from mempalace.link_store_postgres import PostgresLinkStore
+
+        store = PostgresLinkStore(backend, team=team)
+        assert [t["id"] for t in store.list_tunnels()] == [created["id"]]
+
+        # delete — through the tool; the vault is now empty.
+        assert m.tool_delete_tunnel(created["id"]) == {"deleted": created["id"]}
+        assert m.tool_list_tunnels() == []
+    finally:
+        m._active_team_var.reset(token)
+        m._link_store_by_team.pop(f"pglink::{team}", None)
+        with psycopg.connect(_dsn()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(f'DROP SCHEMA IF EXISTS "{team_schema(team)}" CASCADE')
+            conn.commit()
+        backend.close()
+
+
+@_PG_LIVE
+def test_tunnel_tools_isolate_teams_on_postgres(pg_env):
+    """second-team isolation: a tunnel created via team A's context is invisible
+    to the same tools running in team B's context."""
+    monkeypatch = pg_env
+    team_a = "t" + uuid.uuid4().hex[:10]
+    team_b = "t" + uuid.uuid4().hex[:10]
+
+    backend = PostgresBackend(dsn=_dsn())
+    monkeypatch.setattr("mempalace.palace._resolve_backend", lambda cfg: backend)
+    monkeypatch.setattr(m, "_get_collection", lambda *a, **k: None)
+    for t in (team_a, team_b):
+        m._link_store_by_team.pop(f"pglink::{t}", None)
+    try:
+        # Team A creates a tunnel.
+        tok_a = m._active_team_var.set(team_a)
+        try:
+            created = m.tool_create_tunnel("wing_a", "r1", "wing_b", "r2", label="A-only")
+            assert "error" not in created
+        finally:
+            m._active_team_var.reset(tok_a)
+
+        # Team B sees nothing — the tools query team B's schema only.
+        tok_b = m._active_team_var.set(team_b)
+        try:
+            assert m.tool_list_tunnels() == []
+            assert m.tool_follow_tunnels("wing_a", "r1") == []
+        finally:
+            m._active_team_var.reset(tok_b)
+
+        # Team A still sees its own tunnel.
+        tok_a = m._active_team_var.set(team_a)
+        try:
+            assert [t["id"] for t in m.tool_list_tunnels()] == [created["id"]]
+        finally:
+            m._active_team_var.reset(tok_a)
+    finally:
+        for t in (team_a, team_b):
+            m._link_store_by_team.pop(f"pglink::{t}", None)
+        with psycopg.connect(_dsn()) as conn:
+            with conn.cursor() as cur:
+                for t in (team_a, team_b):
+                    cur.execute(f'DROP SCHEMA IF EXISTS "{team_schema(t)}" CASCADE')
+            conn.commit()
+        backend.close()
+
+
+@_PG_LIVE
+def test_tunnel_tool_writes_no_host_global_json_on_postgres(pg_env, monkeypatch):
+    """no host-global JSON: creating a tunnel via the tool on postgres lands in
+    the PG table and never calls the host-global tunnels.json writer."""
+    monkeypatch = pg_env
+    team = "t" + uuid.uuid4().hex[:10]
+
+    # The host-global JSON writer is palace_graph.create_tunnel (it serializes to
+    # ~/.mempalace/tunnels.json via _save_tunnels). On the postgres path it must
+    # NEVER be reached — the PostgresLinkStore writes a per-team table instead.
+    json_writer = {"hit": False}
+    monkeypatch.setattr(
+        "mempalace.palace_graph.create_tunnel",
+        lambda *a, **k: json_writer.__setitem__("hit", True) or {},
+    )
+
+    backend = PostgresBackend(dsn=_dsn())
+    monkeypatch.setattr("mempalace.palace._resolve_backend", lambda cfg: backend)
+    monkeypatch.setattr(m, "_get_collection", lambda *a, **k: None)
+    token = m._active_team_var.set(team)
+    m._link_store_by_team.pop(f"pglink::{team}", None)
+    try:
+        created = m.tool_create_tunnel("wing_a", "r1", "wing_b", "r2", label="pg-only")
+        assert "error" not in created
+
+        # The host-global JSON writer was never invoked on the postgres path.
+        assert json_writer["hit"] is False
+
+        # The tunnel really lives in the team's PG table.
+        from mempalace.link_store_postgres import PostgresLinkStore
+
+        store = PostgresLinkStore(backend, team=team)
+        assert [t["id"] for t in store.list_tunnels()] == [created["id"]]
+    finally:
+        m._active_team_var.reset(token)
+        m._link_store_by_team.pop(f"pglink::{team}", None)
+        with psycopg.connect(_dsn()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(f'DROP SCHEMA IF EXISTS "{team_schema(team)}" CASCADE')
+            conn.commit()
+        backend.close()
+
+
+def test_miner_post_processing_skips_host_global_json_on_postgres(monkeypatch, tmp_path):
+    """miner gating: on a postgres config the miner's host-global link writers
+    (topic tunnels / hallways / entity tunnels) are NOT invoked, and on chroma
+    they ARE. Exercises the real miner._mine_impl post-mine block by driving a
+    zero-file mine (no ChromaDB needed) and spying on the three compute helpers."""
+    import mempalace.miner as miner
+
+    called = {"topic": 0, "hallways": 0, "entity": 0}
+    monkeypatch.setattr(
+        miner,
+        "_compute_topic_tunnels_for_wing",
+        lambda wing: called.__setitem__("topic", called["topic"] + 1) or 0,
+    )
+    monkeypatch.setattr(
+        miner,
+        "compute_hallways_for_wing",
+        lambda wing, col=None: called.__setitem__("hallways", called["hallways"] + 1) or [],
+    )
+    monkeypatch.setattr(
+        miner,
+        "_compute_entity_tunnels_for_wing",
+        lambda wing: called.__setitem__("entity", called["entity"] + 1) or 0,
+    )
+    # The post-mine block also runs the FTS5 integrity check; stub it (no DB).
+    monkeypatch.setattr(miner, "_validate_palace_fts5_after_mine", lambda path: None)
+    # The post-mine block runs once after the (single-wing) file loop completes
+    # without exception. Stub the file scan + per-file ingest + collection
+    # openers so no ChromaDB is needed; process_file returns one drawer so the
+    # loop body runs the normal success path.
+    (tmp_path / "f.txt").write_text("hello world content for mining" * 5)
+    monkeypatch.setattr(miner, "scan_project", lambda *a, **k: [tmp_path / "f.txt"])
+    monkeypatch.setattr(miner, "get_collection", lambda path: object())
+    monkeypatch.setattr(miner, "get_closets_collection", lambda path: object())
+    monkeypatch.setattr(miner, "process_file", lambda **k: (1, "general", None))
+
+    def _run(backend_name):
+        monkeypatch.setenv("MEMPALACE_BACKEND", backend_name)
+        called.update(topic=0, hallways=0, entity=0)
+        miner._mine_impl(str(tmp_path), str(tmp_path / "palace"), wing_override="w")
+
+    _run("postgres")
+    assert called == {"topic": 0, "hallways": 0, "entity": 0}, (
+        "postgres must NOT write host-global tunnels/hallways JSON"
+    )
+
+    _run("chroma")
+    assert called == {"topic": 1, "hallways": 1, "entity": 1}, (
+        "chroma must still write the host-global link layer (byte-identical)"
+    )
+
+
 @_PG_LIVE
 def test_kg_neighbors_happy_path_multi_hop_against_live_pg(pg_env):
     """End-to-end multi-hop walk through the real per-team Postgres KG handle."""

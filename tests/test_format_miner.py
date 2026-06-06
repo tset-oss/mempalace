@@ -1491,6 +1491,9 @@ def test_mine_formats_threads_chunk_size_from_user_config(monkeypatch, tmp_path:
         chunk_size = 1234
         chunk_overlap = 56
         min_chunk_size = 78
+        # The post-mine block gates its host-global topic-tunnel write on the
+        # backend; this fake exercises the default chroma single-vault path.
+        backend = "chroma"
 
         @property
         def palace_path(self):
