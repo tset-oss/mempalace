@@ -30,7 +30,7 @@ from collections import Counter, OrderedDict, defaultdict
 from datetime import datetime, timezone
 
 from .config import MempalaceConfig, normalize_wing_name
-from .dynamics import initialize_dynamics_fields
+from .dynamics import initialize_dynamics_fields, merge_dynamics
 from .palace import get_collection as _get_palace_collection
 from .palace import mine_lock
 
@@ -643,15 +643,11 @@ def create_tunnel(
                 # Preserve L7 dynamics fields across re-creation events.
                 # Without this, a label update (or any re-create) would
                 # reset the connection's strength / stability / access_count
-                # — defeating the living-connection layer. Backfill any
-                # still-missing fields so legacy records also pick up
-                # defaults on next touch. Per PR #1578 review
-                # (gemini-code-assist, medium priority): use dict-update
-                # with a comprehension so the field list lives in one place
-                # and future schema expansion can't drop a field by accident.
-                _dyn_fields = ("strength", "stability", "last_activated", "access_count")
-                tunnel.update({k: existing[k] for k in _dyn_fields if k in existing})
-                initialize_dynamics_fields(tunnel)
+                # — defeating the living-connection layer. merge_dynamics
+                # carries the four fields from the prior record then backfills
+                # any still-missing field, so the field list lives in one
+                # place shared with the hallway recompute path.
+                merge_dynamics(tunnel, existing)
                 existing.clear()
                 existing.update(tunnel)
                 _save_tunnels(tunnels, config)

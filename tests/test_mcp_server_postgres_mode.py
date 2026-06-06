@@ -371,6 +371,53 @@ def test_postgres_backend_reconnect_drops_pool_but_stays_usable():
     assert backend._closed is False, "reconnect (unlike close) keeps the backend usable"
 
 
+# ==================== _resolve_team_strict (fail-loud team resolution) ====================
+#
+# _resolve_team_strict returns None on ambiguity so a server-mode writer can
+# RAISE, instead of _resolve_team's silent _canonical_default_team() fallback
+# (which would re-create the shared-default cross-tenant leak). No DB needed.
+
+
+def test_resolve_team_strict_returns_none_when_no_explicit_and_no_active_team(monkeypatch):
+    monkeypatch.setenv("MEMPALACE_TEAM", "configured_default")
+    token = m._active_team_var.set(None)
+    try:
+        # Sanity: the non-strict resolver DOES default (proving the strict one
+        # is not merely echoing an empty configured team).
+        assert m._resolve_team() == m._canonical_default_team()
+        # Strict: ambiguous -> None, never the canonical default.
+        result = m._resolve_team_strict()
+        assert result is None
+        assert result != m._canonical_default_team()
+    finally:
+        m._active_team_var.reset(token)
+
+
+def test_resolve_team_strict_returns_explicit_slug_when_given(monkeypatch):
+    token = m._active_team_var.set(None)
+    try:
+        assert m._resolve_team_strict("backend") == "backend"
+    finally:
+        m._active_team_var.reset(token)
+
+
+def test_resolve_team_strict_returns_active_team_when_set(monkeypatch):
+    monkeypatch.setenv("MEMPALACE_TEAM", "configured_default")
+    token = m._active_team_var.set("frontend")
+    try:
+        assert m._resolve_team_strict() == "frontend"
+    finally:
+        m._active_team_var.reset(token)
+
+
+def test_resolve_team_strict_explicit_overrides_active_team():
+    token = m._active_team_var.set("frontend")
+    try:
+        assert m._resolve_team_strict("backend") == "backend"
+    finally:
+        m._active_team_var.reset(token)
+
+
 # ==================== kg_neighbors MCP tool (H004) ====================
 #
 # The validation / clamp / bad-entity / direction / chroma-unsupported cases

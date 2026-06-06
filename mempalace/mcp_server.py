@@ -255,6 +255,29 @@ def _resolve_team(explicit=None):
     return _valid_team(explicit) or _valid_team(_active_team_var.get()) or _canonical_default_team()
 
 
+def _resolve_team_strict(explicit=None):
+    """Resolve the team vault for a server-mode WRITER, or ``None`` on ambiguity.
+
+    Strict variant of :func:`_resolve_team`. It applies the same
+    :func:`_valid_team` validation to the explicit ``vault=`` / ``team=``
+    argument and then to the per-session active team
+    (:data:`_active_team_var`), but it does **NOT** fall through to
+    :func:`_canonical_default_team`. When neither an explicit argument nor an
+    active session team is set, it returns ``None`` instead of a slug.
+
+    Strict means: return ``None`` on ambiguity so the caller can RAISE; never
+    silently default. A writer that cannot resolve a team must fail loud rather
+    than route the write into the shared ``team_default`` vault (which would
+    re-create the cross-tenant shared-default leak inside Postgres). This is why
+    the RAISE path that :func:`_resolve_team` makes unreachable is reachable
+    here.
+
+    :func:`_resolve_team` (with its ``_canonical_default_team`` fallback) stays
+    the path for chroma / single-vault legacy reads and the bulk-vault loop.
+    """
+    return _valid_team(explicit) or _valid_team(_active_team_var.get())
+
+
 _kg_by_path: dict[str, KnowledgeGraph] = {}
 _kg_cache_lock = threading.Lock()
 _palace_flag_given: bool = bool(_args.palace)

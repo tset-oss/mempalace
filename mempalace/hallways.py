@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from itertools import combinations
 from typing import Optional
 
-from .dynamics import initialize_dynamics_fields
+from .dynamics import merge_dynamics
 
 logger = logging.getLogger("mempalace_hallways")
 
@@ -314,11 +314,12 @@ def compute_hallways_for_wing(
             "created_by": "auto",
         }
         # Apply preserved dynamics if this entity pair existed in the
-        # prior wing snapshot. Then initialize any still-missing fields
+        # prior wing snapshot, then backfill any still-missing fields
         # (the new-pair case + the legacy-record case both land cleanly).
+        # merge_dynamics is the single source of truth shared with the
+        # tunnel re-create path in palace_graph.py.
         preserved = existing_dynamics_lookup.get(key, {})
-        record.update(preserved)
-        initialize_dynamics_fields(record)
+        merge_dynamics(record, preserved)
         created.append(record)
 
     # 4. Persist — preserve other-wing records, replace this wing's records.

@@ -23,6 +23,7 @@ from mempalace.dynamics import (
     STRENGTH_FLOOR,
     apply_decay,
     initialize_dynamics_fields,
+    merge_dynamics,
     potentiate,
 )
 
@@ -309,3 +310,81 @@ class TestIntegrationScenarios:
             potentiate(conn, now=T0 + timedelta(minutes=minutes_offset))
         assert conn["stability"] == DEFAULT_STABILITY
         assert conn["access_count"] == 5
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# merge_dynamics — shared preserve helper for hallway + tunnel recompute
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestMergeDynamics:
+    """``merge_dynamics`` is the single source of truth for the four-field
+    preserve previously inlined in palace_graph.py (tunnel re-create) and
+    hallways.py (hallway recompute)."""
+
+    def test_preserves_all_four_dynamics_fields_from_existing(self):
+        """The accumulated weights on the prior record win over the freshly
+        built target's defaults."""
+        existing = {
+            "strength": 3.7,
+            "stability": 2.4,
+            "last_activated": (T0 + timedelta(days=2)).isoformat(),
+            "access_count": 9,
+        }
+        target = _fresh_connection()
+        merge_dynamics(target, existing, now=T0)
+        assert target["strength"] == 3.7
+        assert target["stability"] == 2.4
+        assert target["last_activated"] == (T0 + timedelta(days=2)).isoformat()
+        assert target["access_count"] == 9
+
+    def test_initializes_missing_fields_when_existing_empty(self):
+        """A brand-new pair (no prior record) lands on the defaults via the
+        deferred initialize_dynamics_fields call."""
+        target = _fresh_connection()
+        merge_dynamics(target, {}, now=T0)
+        assert target["strength"] == DEFAULT_STRENGTH
+        assert target["stability"] == DEFAULT_STABILITY
+        # created_at anchors last_activated for a fresh record.
+        assert target["last_activated"] == T0.isoformat()
+        assert target["access_count"] == 0
+
+    def test_partial_existing_preserves_present_and_backfills_rest(self):
+        """If the prior record only carries some fields (a legacy record),
+        the present ones are preserved and the rest are backfilled."""
+        existing = {"strength": 4.2, "access_count": 5}
+        target = _fresh_connection()
+        merge_dynamics(target, existing, now=T0)
+        assert target["strength"] == 4.2
+        assert target["access_count"] == 5
+        # Backfilled from defaults / created_at.
+        assert target["stability"] == DEFAULT_STABILITY
+        assert target["last_activated"] == T0.isoformat()
+
+    def test_returns_and_mutates_target_leaving_existing_untouched(self):
+        existing = {"strength": 2.0, "stability": 1.5, "access_count": 3}
+        target = _fresh_connection()
+        returned = merge_dynamics(target, existing, now=T0)
+        assert returned is target
+        # existing is read-only — no backfilled keys leak into it.
+        assert "last_activated" not in existing
+
+    def test_matches_prior_inline_tunnel_recreate_behavior(self):
+        """Reproduces the exact tunnel re-create preserve that lived inline
+        at palace_graph.py: copy the four fields then initialize."""
+        existing = {
+            "strength": 1.25,
+            "stability": 1.1,
+            "last_activated": (T0 + timedelta(hours=6)).isoformat(),
+            "access_count": 2,
+        }
+        # Inline reference behavior, recreated by hand.
+        reference = _fresh_connection()
+        _dyn_fields = ("strength", "stability", "last_activated", "access_count")
+        reference.update({k: existing[k] for k in _dyn_fields if k in existing})
+        initialize_dynamics_fields(reference, now=T0)
+
+        target = _fresh_connection()
+        merge_dynamics(target, existing, now=T0)
+        for k in _dyn_fields:
+            assert target[k] == reference[k]

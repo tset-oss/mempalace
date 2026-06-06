@@ -102,6 +102,34 @@ def initialize_dynamics_fields(connection: dict, *, now: Optional[datetime] = No
     return connection
 
 
+# The four dynamics fields preserved across a recompute / re-creation event.
+# Kept as one tuple so the field list lives in a single place and a future
+# schema expansion can't drop a field by accident on one of the two callers.
+_DYNAMICS_FIELDS = ("strength", "stability", "last_activated", "access_count")
+
+
+def merge_dynamics(target: dict, existing: dict, *, now: Optional[datetime] = None) -> dict:
+    """Carry the four dynamics fields from ``existing`` onto ``target``.
+
+    When a hall or tunnel is recomputed (mining) or re-created (a label
+    update), the accumulated living-connection weights must survive. This
+    copies whichever of ``strength`` / ``stability`` / ``last_activated`` /
+    ``access_count`` are present on the prior ``existing`` record onto
+    ``target`` (overwriting ``target``'s freshly-built defaults), then defers
+    to :func:`initialize_dynamics_fields` so any still-missing field is
+    backfilled (the brand-new-pair and legacy-record cases both land cleanly).
+
+    Mutates and returns ``target``. ``existing`` is read-only. Reproduces the
+    inline preserve logic (4-field copy then backfill) that previously lived in
+    both ``palace_graph.py`` (tunnel re-create) and ``hallways.py`` (hallway
+    recompute).
+
+    ``now`` is forwarded to :func:`initialize_dynamics_fields` for tests.
+    """
+    target.update({k: existing[k] for k in _DYNAMICS_FIELDS if k in existing})
+    return initialize_dynamics_fields(target, now=now)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Hebbian potentiation — strengthen on co-access
 # ─────────────────────────────────────────────────────────────────────────────
@@ -251,6 +279,7 @@ __all__ = [
     "SPACED_INTERVAL_HOURS",
     "STABILITY_INCREMENT",
     "initialize_dynamics_fields",
+    "merge_dynamics",
     "potentiate",
     "apply_decay",
 ]
