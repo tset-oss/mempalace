@@ -41,14 +41,37 @@ into one team's schema would contaminate that team with other teams' links.
 
 from __future__ import annotations
 
+import logging
 import threading
 from datetime import datetime, timezone
 from typing import Optional
 
 from .backends.postgres import _qi, team_schema
-from .dynamics import initialize_dynamics_fields
+from .dynamics import initialize_dynamics_fields, merge_dynamics
 from .link_store import LinkStore
-from .palace_graph import _canonical_tunnel_id, _require_name
+from .palace_graph import _canonical_tunnel_id, _require_name, entity_tunnels_for_wing
+
+logger = logging.getLogger("mempalace.link_store_postgres")
+
+# Pinned bound on the entity_occurrences rows scanned for ONE wing's derived
+# rebuild. This is the entity-occurrence scan substrate the co-occurrence derive
+# counts over — a row PER (entity, chunk) pair, so it is denser than the closet
+# group scan (REBUILD_FETCH_CAP=500) or the closet reconcile scan
+# (RECONCILE_SCAN_CAP=5000). We DELIBERATELY do not inherit either closet cap:
+# those bound closet GROUPS, not a wing-wide co-occurrence scan. A wing with a
+# few thousand drawers, each tagged with several entities per chunk, easily
+# exceeds 5000 (entity, chunk) rows, so a too-small cap would silently drop real
+# co-occurrence. 50_000 rows keeps the in-memory pair count bounded (a few MB)
+# while comfortably covering a large single wing.
+#
+# Truncate-not-paginate: when a wing exceeds this cap the derive uses only the
+# first WING_SCAN_CAP rows (ORDER BY drawer_id so the truncation is deterministic
+# across rebuilds) and LOGS a truncation warning. We truncate rather than
+# paginate because the derive is a NON-GATING analytic over a single wing (the
+# verbatim drawers and the entity index are the recall floor); an unbounded
+# multi-page scan on a pathological wing would be a worse failure mode than a
+# bounded, observable approximation.
+WING_SCAN_CAP = 50_000
 
 
 def _row_to_tunnel(row: tuple) -> dict:
@@ -118,6 +141,62 @@ _SELECT_COLUMNS = (
 )
 
 
+def _hallway_id(wing: str, entity_a: str, entity_b: str) -> str:
+    """Symmetric derived-hallway id — identical scheme to ``hallways._hallway_id``.
+
+    Sorting the pair before hashing makes ``(Aya, Lumi)`` and ``(Lumi, Aya)``
+    one record, so an idempotent rebuild upserts the same row instead of
+    creating a parallel one. Kept byte-identical to the chroma hallway id so the
+    two backends' hallway ids match for the same wing + pair.
+    """
+    import hashlib
+
+    a, b = sorted([entity_a, entity_b])
+    key = f"{wing}::{a}::{b}".encode("utf-8")
+    suffix = hashlib.sha256(key).hexdigest()[:8]
+    return f"hallway_{wing}_{a}_{b}_{suffix}"
+
+
+def _row_to_hallway(row: tuple) -> dict:
+    """Map a ``hallways`` row to the dict shape the JSON hallway store returns."""
+    (
+        id_,
+        wing,
+        entity_a,
+        entity_b,
+        co_occurrence_count,
+        rooms,
+        label,
+        created_at,
+        updated_at,
+        strength,
+        stability,
+        last_activated,
+        access_count,
+    ) = row
+
+    def _iso(dt) -> str:
+        return dt.isoformat() if hasattr(dt, "isoformat") else dt
+
+    record: dict = {
+        "id": id_,
+        "wing": wing,
+        "entity_a": entity_a,
+        "entity_b": entity_b,
+        "co_occurrence_count": co_occurrence_count,
+        "rooms": list(rooms or []),
+        "label": label or "",
+        "created_at": _iso(created_at),
+    }
+    if updated_at is not None:
+        record["updated_at"] = _iso(updated_at)
+    record["strength"] = strength
+    record["stability"] = stability
+    record["last_activated"] = _iso(last_activated)
+    record["access_count"] = access_count
+    return record
+
+
 class PostgresLinkStore(LinkStore):
     """Explicit-tunnel store backed by a team vault's ``tunnels`` table."""
 
@@ -131,6 +210,9 @@ class PostgresLinkStore(LinkStore):
     # -- schema -----------------------------------------------------------
     def _table(self) -> str:
         return f"{_qi(self._schema)}.{_qi('tunnels')}"
+
+    def _hallways_table(self) -> str:
+        return f"{_qi(self._schema)}.{_qi('hallways')}"
 
     def _ensure(self) -> None:
         """Create schema + ``tunnels`` table + wing-endpoint indexes once.
@@ -177,6 +259,34 @@ class PostgresLinkStore(LinkStore):
                     cur.execute(
                         f"CREATE INDEX IF NOT EXISTS {_qi('tunnels_target_wing')} "
                         f"ON {self._table()} (target_wing)"
+                    )
+                    # The derived within-wing entity hallways table. A hallway
+                    # is the co-occurrence fact "entity_a and entity_b travel
+                    # together inside this wing"; the cross-wing entity tunnels
+                    # (kind='entity', in the tunnels table above) are derived
+                    # FROM these rows. The four dynamics fields live as discrete
+                    # columns (mirroring the tunnels table) so an incremental
+                    # rebuild can preserve accumulated weights via ON CONFLICT.
+                    cur.execute(
+                        f"CREATE TABLE IF NOT EXISTS {self._hallways_table()} ("
+                        "  id text PRIMARY KEY,"
+                        "  wing text NOT NULL,"
+                        "  entity_a text NOT NULL,"
+                        "  entity_b text NOT NULL,"
+                        "  co_occurrence_count integer NOT NULL,"
+                        "  rooms text[] NOT NULL DEFAULT '{}',"
+                        "  label text NOT NULL DEFAULT '',"
+                        "  created_at timestamptz NOT NULL,"
+                        "  updated_at timestamptz,"
+                        "  strength double precision NOT NULL,"
+                        "  stability double precision NOT NULL,"
+                        "  last_activated timestamptz NOT NULL,"
+                        "  access_count integer NOT NULL"
+                        ")"
+                    )
+                    cur.execute(
+                        f"CREATE INDEX IF NOT EXISTS {_qi('hallways_wing')} "
+                        f"ON {self._hallways_table()} (wing)"
                     )
             self._ensured = True
 
@@ -359,20 +469,311 @@ class PostgresLinkStore(LinkStore):
 
         return connections
 
-    # -- derived hallways (a later story) ---------------------------------
-    def compute_hallways_for_wing(self, wing: str, col=None, min_count: int = 2) -> list[dict]:
-        """Not yet implemented on Postgres — the derived link layer lands later.
+    # -- derived hallways + entity tunnels --------------------------------
+    def _co_occurrence_for_wing(self, wing: str) -> tuple[dict, dict, bool]:
+        """Count entity-pair co-occurrence PER PHYSICAL CHUNK for one wing.
 
-        Derived within-wing entity hallways are computed server-side from the
-        vaulted entity occurrences in a later story. No production consumer
-        routes hallway reads through this seam yet, so a clear placeholder is
-        safe and deliberate (it is not a silent no-op).
+        Reads this team's ``entity_occurrences`` rows for ``wing`` (each row is
+        one ``(entity, drawer_id)`` pair — and ``drawer_id`` is the PHYSICAL
+        chunk id the per-chunk tagging from the write path stamped). Grouping by
+        ``drawer_id`` reconstructs each chunk's own entity set, so two entities
+        co-occur once per chunk they SHARE — no over-count, no whole-drawer
+        inflation, and no ``COUNT(DISTINCT logical_key)`` column needed (the
+        per-chunk tagging IS the substrate).
+
+        Returns ``(pair_counts, pair_rooms, truncated)`` where:
+          * ``pair_counts``: ``{(entity_a, entity_b): count}`` with the pair
+            sorted (symmetric key — matches ``hallways._hallway_id``);
+          * ``pair_rooms``: ``{(entity_a, entity_b): set(rooms)}``;
+          * ``truncated``: ``True`` when the wing exceeded ``WING_SCAN_CAP``
+            rows and the scan was clipped (an observability signal).
+
+        The scan is bounded by ``WING_SCAN_CAP`` rows, ordered by ``drawer_id``
+        so a clipped scan keeps whole chunks together and is deterministic
+        across rebuilds.
         """
-        raise NotImplementedError("derived hallways land in a later story")
+        from collections import defaultdict
+        from itertools import combinations
+
+        # Fetch one extra row past the cap to detect truncation without a second
+        # COUNT query: if the cap+1th row exists, the wing exceeded the cap.
+        rows: list[tuple] = []
+        with self._backend._conn() as conn:
+            with conn.cursor() as cur:
+                # The entity_occurrences table is owned by PostgresEntityIndex and
+                # only exists once that vault has indexed an entity. A vault that
+                # never tagged an entity has no co-occurrence substrate, so derive
+                # nothing rather than raise UndefinedTable.
+                cur.execute("SELECT to_regclass(%s)", (f"{self._schema}.entity_occurrences",))
+                if cur.fetchone()[0] is None:
+                    return {}, {}, False
+                cur.execute(
+                    f"SELECT drawer_id, entity, room FROM {self._table_entities()} "
+                    "WHERE wing = %s ORDER BY drawer_id LIMIT %s",
+                    (wing, WING_SCAN_CAP + 1),
+                )
+                rows = cur.fetchall()
+
+        truncated = len(rows) > WING_SCAN_CAP
+        if truncated:
+            rows = rows[:WING_SCAN_CAP]
+            logger.warning(
+                "derived-link rebuild truncated team=%s wing=%s cap=%s "
+                "(co-occurrence derived from the first %s entity rows only)",
+                self._team,
+                wing,
+                WING_SCAN_CAP,
+                WING_SCAN_CAP,
+            )
+
+        # Group the entity rows back into per-chunk entity sets.
+        chunk_entities: dict[str, set] = defaultdict(set)
+        chunk_room: dict[str, Optional[str]] = {}
+        for drawer_id, entity, room in rows:
+            if not drawer_id or not entity:
+                continue
+            chunk_entities[drawer_id].add(entity)
+            if room and isinstance(room, str) and room.strip():
+                chunk_room.setdefault(drawer_id, room)
+
+        pair_counts: dict[tuple, int] = defaultdict(int)
+        pair_rooms: dict[tuple, set] = defaultdict(set)
+        for drawer_id, ents in chunk_entities.items():
+            if len(ents) < 2:
+                continue
+            room = chunk_room.get(drawer_id)
+            for a, b in combinations(sorted(ents), 2):
+                if a == b:
+                    continue
+                key = (a, b)
+                pair_counts[key] += 1
+                if room:
+                    pair_rooms[key].add(room)
+
+        return pair_counts, pair_rooms, truncated
+
+    def _table_entities(self) -> str:
+        return f"{_qi(self._schema)}.{_qi('entity_occurrences')}"
+
+    def compute_hallways_for_wing(self, wing: str, col=None, min_count: int = 2) -> list[dict]:
+        """Derive + persist this wing's entity hallways from entity_occurrences.
+
+        Server-side counterpart to :func:`hallways.compute_hallways_for_wing`:
+        instead of scanning a chroma collection's ``entities`` metadata, it
+        counts co-occurrence over this team's vaulted ``entity_occurrences``
+        rows (per physical chunk). It PURGES this wing's prior derived hallway
+        rows and re-upserts the recomputed set, PRESERVING accumulated dynamics
+        on records that survive the recompute (via the dynamics columns the
+        ON CONFLICT leaves untouched). Records for other wings are untouched.
+
+        ``col`` is accepted for signature parity with the JSON store but unused
+        (the substrate is the entity index, not a collection). Returns this
+        wing's hallway dicts in the same shape the JSON store returns.
+        """
+        if not isinstance(wing, str) or not wing.strip():
+            return []
+        min_count = max(1, int(min_count))
+        self._ensure()
+
+        pair_counts, pair_rooms, _truncated = self._co_occurrence_for_wing(wing)
+
+        # Load the wing's CURRENT hallway dynamics BEFORE the purge, keyed by the
+        # symmetric (entity_a, entity_b) pair, so accumulated strength/stability/
+        # last_activated/access_count survive a recompute. Without this the purge
+        # would wipe the living-connection weights every rebuild. This mirrors the
+        # JSON store's pre-recompute existing-dynamics lookup + merge_dynamics.
+        existing_dynamics: dict = {}
+        for prior in self.list_hallways(wing):
+            key = tuple(sorted([prior.get("entity_a"), prior.get("entity_b")]))
+            existing_dynamics[key] = {
+                k: prior[k]
+                for k in ("strength", "stability", "last_activated", "access_count")
+                if k in prior
+            }
+
+        now = datetime.now(timezone.utc)
+        records: list[dict] = []
+        for key in sorted(pair_counts.keys()):
+            count = pair_counts[key]
+            if count < min_count:
+                continue
+            entity_a, entity_b = key
+            rooms = sorted(pair_rooms.get(key, set()))
+            room_summary = ", ".join(rooms[:3]) if rooms else "(no room tags)"
+            if len(rooms) > 3:
+                room_summary += f", +{len(rooms) - 3} more"
+            record: dict = {
+                "id": _hallway_id(wing, entity_a, entity_b),
+                "wing": wing,
+                "entity_a": entity_a,
+                "entity_b": entity_b,
+                "co_occurrence_count": count,
+                "rooms": rooms,
+                "label": (
+                    f"{entity_a} ↔ {entity_b} (co-occur in {count} drawers across "
+                    f"{len(rooms) or 'no'} room{'s' if len(rooms) != 1 else ''}: {room_summary})"
+                ),
+                "created_at": now.isoformat(),
+            }
+            # Carry forward preserved dynamics (then backfill missing fields).
+            # merge_dynamics is the single source of truth shared with the JSON
+            # hallway recompute + the tunnel re-create path.
+            merge_dynamics(record, existing_dynamics.get(key, {}), now=now)
+            records.append(record)
+
+        self._purge_wing_hallways(wing)
+        self._upsert_hallways(wing, records, now)
+        return records
+
+    def _purge_wing_hallways(self, wing: str) -> None:
+        """Delete this wing's prior derived hallway rows (other wings kept)."""
+        with self._backend._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"DELETE FROM {self._hallways_table()} WHERE wing = %s", (wing,))
+
+    def _upsert_hallways(self, wing: str, records: list[dict], now: datetime) -> None:
+        """Insert the recomputed hallway rows, carrying preserved dynamics.
+
+        Each record already has its four dynamics fields set by
+        ``merge_dynamics`` in :meth:`compute_hallways_for_wing` (preserved from
+        the pre-purge row, or seeded fresh for a brand-new pair). The wing's rows
+        were just purged so each is a fresh INSERT; the ``ON CONFLICT`` is a
+        belt-and-braces guard for a concurrent rebuild re-creating the same id —
+        it refreshes the recomputed count/rooms/label but, crucially, does NOT
+        touch the dynamics columns, so accumulated weights are never clobbered.
+        """
+        if not records:
+            return
+        with self._backend._conn() as conn:
+            with conn.cursor() as cur:
+                for rec in records:
+                    cur.execute(
+                        f"INSERT INTO {self._hallways_table()} ("
+                        "  id, wing, entity_a, entity_b, co_occurrence_count, rooms,"
+                        "  label, created_at, updated_at,"
+                        "  strength, stability, last_activated, access_count"
+                        ") VALUES ("
+                        "  %(id)s, %(wing)s, %(entity_a)s, %(entity_b)s,"
+                        "  %(co_occurrence_count)s, %(rooms)s, %(label)s, %(created_at)s, NULL,"
+                        "  %(strength)s, %(stability)s, %(last_activated)s, %(access_count)s"
+                        ") ON CONFLICT (id) DO UPDATE SET"
+                        "  co_occurrence_count = EXCLUDED.co_occurrence_count,"
+                        "  rooms = EXCLUDED.rooms,"
+                        "  label = EXCLUDED.label,"
+                        "  updated_at = %(now)s",
+                        {
+                            "id": rec["id"],
+                            "wing": rec["wing"],
+                            "entity_a": rec["entity_a"],
+                            "entity_b": rec["entity_b"],
+                            "co_occurrence_count": rec["co_occurrence_count"],
+                            "rooms": list(rec["rooms"]),
+                            "label": rec["label"],
+                            "created_at": now,
+                            "now": now,
+                            "strength": rec["strength"],
+                            "stability": rec["stability"],
+                            "last_activated": rec["last_activated"],
+                            "access_count": rec["access_count"],
+                        },
+                    )
 
     def list_hallways(self, wing: Optional[str] = None) -> list[dict]:
-        """Not yet implemented on Postgres — the derived link layer lands later.
+        """List this team's derived hallway rows, optionally filtered by wing."""
+        self._ensure()
+        clauses = ""
+        params: tuple = ()
+        if wing:
+            clauses = " WHERE wing = %s"
+            params = (wing,)
+        with self._backend._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, wing, entity_a, entity_b, co_occurrence_count, rooms, label, "
+                    "created_at, updated_at, strength, stability, last_activated, access_count "
+                    f"FROM {self._hallways_table()}{clauses} ORDER BY entity_a, entity_b",
+                    params,
+                )
+                return [_row_to_hallway(r) for r in cur.fetchall()]
 
-        See :meth:`compute_hallways_for_wing`.
+    # -- the incremental rebuild entrypoint -------------------------------
+    def rebuild_derived_links_for_wing(self, wing: str, min_count: int = 2) -> dict:
+        """Recompute one wing's DERIVED link layer from entity_occurrences.
+
+        This is the per-wing recompute the debounced worker and the miner hook
+        both call. In one pass it:
+
+          1. recomputes + persists this wing's hallways
+             (:meth:`compute_hallways_for_wing`, which purges the wing's prior
+             hallway rows first);
+          2. PURGES this wing's prior DERIVED entity tunnels — rows with
+             ``kind='entity'`` where ``wing`` is one endpoint — and ONLY those.
+             Explicit (``kind='explicit'``) and topic (``kind='topic'``) tunnels
+             are NEVER touched: a derived rebuild must not delete user-authored
+             links;
+          3. re-derives the cross-wing entity tunnels by feeding ALL of this
+             team's hallway rows (this wing's freshly recomputed set + every
+             other wing's persisted rows) into the SHARED
+             :func:`palace_graph.entity_tunnels_for_wing`, with its tunnel-write
+             callback routed to THIS store's ``create_tunnel(kind='entity')`` so
+             the construction is shared, not re-implemented, and lands in this
+             team's ``tunnels`` table.
+
+        The recompute is NOT atomic: the hallway purge+upsert, the entity-tunnel
+        purge, and the per-tunnel re-creates each run on their own connection, so
+        a crash mid-rebuild can leave this wing's derived layer half-rebuilt. That
+        is acceptable here — the derived layer is non-gating (the verbatim drawers
+        and the entity index are the recall floor) and the rebuild is a pure
+        purge+recompute over the current ``entity_occurrences`` state, so it is
+        history-independent and the next rebuild for this wing fully heals it.
+
+        Returns ``{"hallways": n, "entity_tunnels": m}``.
         """
-        raise NotImplementedError("derived hallways land in a later story")
+        if not isinstance(wing, str) or not wing.strip():
+            return {"hallways": 0, "entity_tunnels": 0}
+        self._ensure()
+
+        hallways = self.compute_hallways_for_wing(wing, min_count=min_count)
+
+        # Purge ONLY this wing's derived entity tunnels (kind='entity' with this
+        # wing as an endpoint). Explicit + topic tunnels are user/agent data and
+        # are left untouched.
+        self._purge_wing_entity_tunnels(wing)
+
+        # Re-derive cross-wing entity tunnels from the full hallway set so the
+        # other endpoints of a cross-wing pair are visible. Route the tunnel
+        # write through THIS store so the records land in the team vault.
+        all_hallways = self.list_hallways()
+
+        def _create_entity_tunnel(
+            source_wing, source_room, target_wing, target_room, label="", kind="entity"
+        ):
+            return self.create_tunnel(
+                source_wing,
+                source_room,
+                target_wing,
+                target_room,
+                label=label,
+                kind=kind,
+            )
+
+        created = entity_tunnels_for_wing(
+            wing, all_hallways, create_tunnel_fn=_create_entity_tunnel
+        )
+        return {"hallways": len(hallways), "entity_tunnels": len(created)}
+
+    def _purge_wing_entity_tunnels(self, wing: str) -> None:
+        """Delete this wing's derived entity tunnels, never explicit/topic ones.
+
+        Matches ``kind='entity'`` AND (``source_wing = wing`` OR
+        ``target_wing = wing``). The ``kind`` predicate is what protects
+        user-authored explicit tunnels (and agent/miner topic tunnels) from a
+        derived rebuild — only the server-derived entity links are purged.
+        """
+        with self._backend._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"DELETE FROM {self._table()} "
+                    "WHERE kind = 'entity' AND (source_wing = %s OR target_wing = %s)",
+                    (wing, wing),
+                )

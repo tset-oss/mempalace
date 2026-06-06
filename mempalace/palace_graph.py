@@ -935,6 +935,7 @@ def entity_tunnels_for_wing(
     wing: str,
     hallways: list,
     label_prefix: str = "shared entity",
+    create_tunnel_fn=None,
 ) -> list:
     """Compute entity tunnels involving a single wing.
 
@@ -952,9 +953,27 @@ def entity_tunnels_for_wing(
 
     Topic tunnels are NOT replaced — both systems coexist for one release
     cycle while entity tunnels prove out. Deprecation is a separate PR.
+
+    The ``hallways`` argument is a list of hallway-shaped dicts
+    (``wing`` / ``entity_a`` / ``entity_b``). The chroma path passes the
+    host-global JSON hallway records; the team-scoped Postgres path passes
+    its per-team derived hallway rows in the SAME shape — so the cross-wing
+    entity-tunnel construction here is shared, not re-implemented per backend.
+
+    ``create_tunnel_fn`` lets a caller route the tunnel write somewhere other
+    than the host-global ``tunnels.json``. It defaults to the module-level
+    :func:`create_tunnel` (chroma). The team-scoped Postgres derive injects
+    its per-team store's ``create_tunnel`` (bound with ``kind="entity"``) so
+    the same construction lands in ``team_<slug>.tunnels`` instead of a shared
+    host file. The callback must accept the same
+    ``(source_wing, source_room, target_wing, target_room, label=, kind=)``
+    signature ``create_tunnel`` exposes.
     """
     if not hallways or not isinstance(wing, str) or not wing.strip():
         return []
+
+    if create_tunnel_fn is None:
+        create_tunnel_fn = create_tunnel
 
     wing_norm = normalize_wing_name(wing.strip())
 
@@ -994,7 +1013,7 @@ def entity_tunnels_for_wing(
         for other_norm in other_wings_norm:
             other_display = wings_for_entity[other_norm]
             room = f"entity:{entity}"
-            tunnel = create_tunnel(
+            tunnel = create_tunnel_fn(
                 source_wing=own_wing_display,
                 source_room=room,
                 target_wing=other_display,

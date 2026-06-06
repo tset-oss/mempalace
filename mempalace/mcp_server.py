@@ -605,6 +605,61 @@ def _enqueue_closet_rebuild(team, source_file, wing, room):
         logger.debug("closet rebuild enqueue failed (best-effort)", exc_info=True)
 
 
+# Server-side derived-link rebuild (eventual-consistency). On the central
+# postgres backend the link layer (within-wing entity hallways + cross-wing
+# entity tunnels) is DERIVED per team from the per-chunk entity_occurrences,
+# not written to host-global JSON. A lazily-started in-process debounce
+# coalescer recomputes a (team, wing)'s derived links after each write through
+# the SAME entrypoint the miner uses (link_store.rebuild_derived_links). The
+# rebuild is best-effort and NEVER fails or undoes the verbatim drawer write,
+# mirroring _enqueue_closet_rebuild above.
+_derived_link_debouncer = None
+_derived_link_debouncer_lock = threading.Lock()
+
+
+def _get_derived_link_debouncer():
+    """Return the process-wide derived-link debounce coalescer, starting it lazily.
+
+    The debounce window honours ``MEMPALACE_DERIVE_DEBOUNCE_SECONDS`` (tests set
+    it to 0 for deterministic, sleep-free flushing) and defaults otherwise.
+    """
+    global _derived_link_debouncer
+    if _derived_link_debouncer is not None:
+        return _derived_link_debouncer
+    with _derived_link_debouncer_lock:
+        if _derived_link_debouncer is None:
+            from .link_store import DEFAULT_DERIVE_DEBOUNCE_SECONDS, DerivedLinkDebouncer
+
+            raw = os.environ.get("MEMPALACE_DERIVE_DEBOUNCE_SECONDS")
+            try:
+                debounce = float(raw) if raw is not None else DEFAULT_DERIVE_DEBOUNCE_SECONDS
+            except (TypeError, ValueError):
+                debounce = DEFAULT_DERIVE_DEBOUNCE_SECONDS
+            _derived_link_debouncer = DerivedLinkDebouncer(debounce_seconds=debounce)
+            _derived_link_debouncer.start()
+    return _derived_link_debouncer
+
+
+def _enqueue_derived_link_rebuild(team, wing):
+    """Best-effort: schedule a server-side derived-link rebuild for ``(team, wing)``.
+
+    No-op on chroma (chroma stays on its legacy regex hallways path; the central
+    write-path derive this maintains is postgres-only). Captures ``team`` HERE —
+    inside the request context — and passes it explicitly so the background
+    worker never relies on the per-session team contextvar (which a background
+    thread does not inherit). NEVER raises: a derive failure must not fail the
+    drawer write.
+    """
+    if _config.backend == "chroma":
+        return
+    if not team or not wing:
+        return
+    try:
+        _get_derived_link_debouncer().enqueue(team, wing)
+    except Exception:
+        logger.debug("derived-link rebuild enqueue failed (best-effort)", exc_info=True)
+
+
 def _start_closet_reconcile():
     """Re-enqueue groups with missing closets, bounded and OFF the boot path.
 
@@ -2049,6 +2104,8 @@ def tool_add_drawer(
             _index_drawer_entities(add_team, [(drawer_id, content)], wing, room)
             # Best-effort server-side closet rebuild (server mode); never fails the write.
             _enqueue_closet_rebuild(add_team, source_file, wing, room)
+            # Best-effort server-side derived-link rebuild (server mode); never fails the write.
+            _enqueue_derived_link_rebuild(add_team, wing)
             logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
             return {
                 "success": True,
@@ -2090,6 +2147,8 @@ def tool_add_drawer(
         _index_drawer_entities(add_team, list(zip(chunk_ids, chunk_docs)), wing, room)
         # Best-effort server-side closet rebuild (server mode); never fails the write.
         _enqueue_closet_rebuild(add_team, source_file, wing, room)
+        # Best-effort server-side derived-link rebuild (server mode); never fails the write.
+        _enqueue_derived_link_rebuild(add_team, wing)
         logger.info(f"Filed drawer: {drawer_id} → {wing}/{room} ({len(chunk_ids)} chunks)")
         return {
             "success": True,
@@ -2132,9 +2191,13 @@ def tool_delete_drawer(drawer_id: str):
         _metadata_cache = None
         # Best-effort: drop the drawer's entity rows (server mode). Same team
         # _get_collection() resolved (implicit session/default).
-        _unindex_drawer_entities(
-            _resolve_team() if _config.backend != "chroma" else None, [drawer_id]
-        )
+        del_team = _resolve_team() if _config.backend != "chroma" else None
+        _unindex_drawer_entities(del_team, [drawer_id])
+        # Best-effort server-side derived-link rebuild for the deleted drawer's
+        # wing (a delete removes co-occurrence rows). Never fails the delete.
+        del_wing = deleted_meta.get("wing") if isinstance(deleted_meta, dict) else None
+        if del_team and del_wing:
+            _enqueue_derived_link_rebuild(del_team, del_wing)
         logger.info(f"Deleted drawer: {drawer_id}")
         return {"success": True, "drawer_id": drawer_id}
     except Exception as e:
@@ -2351,6 +2414,14 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 new_meta.get("wing"),
                 new_meta.get("room"),
             )
+            # Best-effort server-side derived-link rebuild for the new wing AND
+            # the prior wing when the update moved the drawer (a wing change
+            # alters co-occurrence on BOTH wings). Never fails the write.
+            new_wing = new_meta.get("wing")
+            old_wing = (old_meta or {}).get("wing")
+            for w in {new_wing, old_wing}:
+                if w:
+                    _enqueue_derived_link_rebuild(upd_team, w)
 
         logger.info(f"Updated drawer: {drawer_id}")
         return {

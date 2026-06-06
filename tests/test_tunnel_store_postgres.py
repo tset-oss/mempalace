@@ -287,13 +287,13 @@ def test_kind_round_trip(backend, team, kind):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Derived hallways are a later story — clear placeholder
+# Derived hallways are now implemented (server-side derive over entity rows).
+# Full behavior lives in tests/test_derived_links_postgres.py; here we only
+# assert the methods no longer raise the old placeholder on an empty vault.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_hallway_methods_raise_not_implemented(backend, team):
+def test_hallway_methods_return_empty_on_empty_vault(backend, team):
     store = PostgresLinkStore(backend, team=team)
-    with pytest.raises(NotImplementedError, match="later story"):
-        store.compute_hallways_for_wing("wing_a")
-    with pytest.raises(NotImplementedError, match="later story"):
-        store.list_hallways()
+    assert store.compute_hallways_for_wing("wing_a") == []
+    assert store.list_hallways() == []
