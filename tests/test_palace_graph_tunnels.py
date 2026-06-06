@@ -929,3 +929,216 @@ class TestTunnelDynamicsIntegration:
         assert recreated["stability"] == DEFAULT_STABILITY
         assert recreated["access_count"] == 0
         assert "last_activated" in recreated
+
+
+class _FakeVaultCollection:
+    """A lightweight stand-in for a per-team collection.
+
+    Mirrors the central Postgres collection's ``_schema`` attribute
+    (``team_<slug>``) — the physical isolation boundary build_graph keys on —
+    and serves the metadata rows passed in. No database required, so the
+    isolation test stays fast. ``_schema=None`` reproduces the local chroma
+    single-vault collection, which carries no schema.
+    """
+
+    def __init__(self, metadatas, schema=None):
+        self._schema = schema
+        self._metadatas = list(metadatas)
+        self._ids = [f"id_{i}" for i in range(len(self._metadatas))]
+
+    def count(self):
+        return len(self._metadatas)
+
+    def get(self, limit=1000, offset=0, include=None):
+        return {
+            "ids": self._ids[offset : offset + limit],
+            "metadatas": self._metadatas[offset : offset + limit],
+        }
+
+
+class TestGraphCacheTeamIsolation:
+    """The module-level graph cache must be keyed per vault so one team's
+    warm graph can never be served to another within the TTL window.
+
+    Before the per-team keying fix the cache was a single global slot that
+    a warm hit returned regardless of ``col``/``config`` — so on the central
+    multi-team server, team B calling build_graph/traverse/find_tunnels within
+    the 60s TTL of team A received TEAM A's graph. These tests pin the fix.
+    """
+
+    def setup_method(self):
+        palace_graph.invalidate_graph_cache()
+
+    def teardown_method(self):
+        palace_graph.invalidate_graph_cache()
+
+    def test_interleaved_teams_get_their_own_graph(self):
+        """Two teams, one process. Team A builds and warms its cache; team B
+        then calls build_graph within the TTL and must get ITS OWN graph,
+        never team A's.
+
+        NON-VACUOUS: under the old single-global-slot logic, build_graph's
+        warm-hit branch ignored ``col`` entirely and returned team A's cached
+        ``(nodes, edges)`` for team B's call — so ``nodes_b`` would equal
+        ``nodes_a`` (containing ``alpha_room``, not ``bravo_room``) and the
+        ``"alpha_room" not in nodes_b`` assertion would fail.
+        """
+        col_a = _FakeVaultCollection(
+            [
+                {"room": "alpha_room", "wing": "wing_a1", "hall": "h", "date": "2026-01-01"},
+                {"room": "alpha_room", "wing": "wing_a2", "hall": "h", "date": "2026-01-02"},
+            ],
+            schema="team_alpha",
+        )
+        col_b = _FakeVaultCollection(
+            [
+                {"room": "bravo_room", "wing": "wing_b1", "hall": "h", "date": "2026-02-01"},
+                {"room": "bravo_room", "wing": "wing_b2", "hall": "h", "date": "2026-02-02"},
+            ],
+            schema="team_bravo",
+        )
+
+        # Team A builds first and warms the cache.
+        nodes_a, _ = palace_graph.build_graph(col=col_a)
+        assert "alpha_room" in nodes_a
+        assert "bravo_room" not in nodes_a
+
+        # Team B builds within the TTL window — must NOT receive team A's graph.
+        nodes_b, _ = palace_graph.build_graph(col=col_b)
+        assert "bravo_room" in nodes_b
+        assert "alpha_room" not in nodes_b
+
+        # traverse and find_tunnels both go through build_graph — same isolation.
+        b_traverse = palace_graph.traverse("bravo_room", col=col_b)
+        b_rooms = {r["room"] for r in b_traverse}
+        assert "bravo_room" in b_rooms
+        assert "alpha_room" not in b_rooms
+
+        b_tunnels = palace_graph.find_tunnels(col=col_b)
+        tunnel_rooms = {t["room"] for t in b_tunnels}
+        assert tunnel_rooms == {"bravo_room"}
+
+        # Team A's warm cache is untouched — it still serves alpha, not bravo.
+        nodes_a2, _ = palace_graph.build_graph(col=col_a)
+        assert "alpha_room" in nodes_a2
+        assert "bravo_room" not in nodes_a2
+
+    def test_warm_hit_for_same_team_is_reused(self):
+        """A second call for the SAME team within the TTL returns the cached
+        graph without rescanning — the keying narrows reuse to one vault, it
+        does not disable caching."""
+        rows = [{"room": "x", "wing": "w1", "hall": "h", "date": "2026-01-01"}]
+        col1 = _FakeVaultCollection(rows, schema="team_alpha")
+        nodes1, edges1 = palace_graph.build_graph(col=col1)
+
+        # Same team (same schema), but an empty collection on the second call.
+        # A warm hit must reuse team_alpha's graph rather than rescan col2.
+        col2 = _FakeVaultCollection([], schema="team_alpha")
+        nodes2, edges2 = palace_graph.build_graph(col=col2)
+        assert nodes2 == nodes1
+        assert edges2 == edges1
+
+    def test_invalidate_targets_one_team_and_leaves_others(self):
+        """``invalidate_graph_cache(col=...)`` evicts only that team's entry;
+        other teams' warm caches survive. A no-arg call clears everything."""
+        col_a = _FakeVaultCollection(
+            [{"room": "alpha_room", "wing": "wing_a", "hall": "h", "date": "2026-01-01"}],
+            schema="team_alpha",
+        )
+        col_b = _FakeVaultCollection(
+            [{"room": "bravo_room", "wing": "wing_b", "hall": "h", "date": "2026-02-01"}],
+            schema="team_bravo",
+        )
+        palace_graph.build_graph(col=col_a)
+        palace_graph.build_graph(col=col_b)
+        assert palace_graph._vault_cache_key(col_a) in palace_graph._graph_cache
+        assert palace_graph._vault_cache_key(col_b) in palace_graph._graph_cache
+
+        # Evict only team A.
+        palace_graph.invalidate_graph_cache(col=col_a)
+        assert palace_graph._vault_cache_key(col_a) not in palace_graph._graph_cache
+        assert palace_graph._vault_cache_key(col_b) in palace_graph._graph_cache
+
+        # No-arg call clears the rest (the single-vault default).
+        palace_graph.invalidate_graph_cache()
+        assert len(palace_graph._graph_cache) == 0
+
+    def test_chroma_single_vault_collapses_to_one_bucket(self):
+        """A chroma collection carries no ``_schema``; build_graph keys it to
+        the single default bucket so a warm hit is reused across collections —
+        byte-identical to the pre-fix single-vault behavior."""
+        col1 = _FakeVaultCollection(
+            [{"room": "auth", "wing": "wing_code", "hall": "h", "date": "2026-01-01"}],
+            schema=None,
+        )
+        nodes1, edges1 = palace_graph.build_graph(col=col1)
+        # Different chroma collection, no schema — still the default bucket,
+        # so the warm hit returns the first graph (matches legacy behavior).
+        col2 = _FakeVaultCollection([], schema=None)
+        nodes2, edges2 = palace_graph.build_graph(col=col2)
+        assert nodes2 == nodes1
+        assert edges2 == edges1
+        assert list(palace_graph._graph_cache.keys()) == [palace_graph._DEFAULT_VAULT_KEY]
+
+
+class TestGraphCacheBounded:
+    """The per-team cache must stay bounded on a many-team host: an LRU cap on
+    the number of cached vaults, plus opportunistic TTL eviction. The TTL alone
+    is not eviction — an unbounded per-team dict would be a memory regression."""
+
+    def setup_method(self):
+        palace_graph.invalidate_graph_cache()
+
+    def teardown_method(self):
+        palace_graph.invalidate_graph_cache()
+
+    def test_cap_evicts_least_recently_used_team(self, monkeypatch):
+        """Filling past the cap evicts the least-recently-used vault, so the
+        cache never grows beyond ``_GRAPH_CACHE_MAX_VAULTS`` entries."""
+        monkeypatch.setattr(palace_graph, "_GRAPH_CACHE_MAX_VAULTS", 3)
+
+        def _vault(slug):
+            return _FakeVaultCollection(
+                [{"room": f"r_{slug}", "wing": f"w_{slug}", "hall": "h", "date": "2026-01-01"}],
+                schema=f"team_{slug}",
+            )
+
+        # Warm three teams up to the cap.
+        for slug in ("alpha", "bravo", "charlie"):
+            palace_graph.build_graph(col=_vault(slug))
+        assert len(palace_graph._graph_cache) == 3
+
+        # Touch alpha so bravo becomes the least-recently-used entry.
+        palace_graph.build_graph(col=_vault("alpha"))
+
+        # A fourth distinct team pushes the cache over the cap → LRU (bravo) is dropped.
+        palace_graph.build_graph(col=_vault("delta"))
+        assert len(palace_graph._graph_cache) == 3
+        keys = set(palace_graph._graph_cache.keys())
+        assert "schema:team_bravo" not in keys
+        assert {"schema:team_alpha", "schema:team_charlie", "schema:team_delta"} == keys
+
+    def test_idle_team_evicted_after_ttl(self, monkeypatch):
+        """A vault not read again past the TTL is purged on the next build,
+        so idle teams don't linger in the cache indefinitely."""
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(palace_graph.time, "time", lambda: clock["now"])
+
+        col_a = _FakeVaultCollection(
+            [{"room": "alpha_room", "wing": "wing_a", "hall": "h", "date": "2026-01-01"}],
+            schema="team_alpha",
+        )
+        palace_graph.build_graph(col=col_a)
+        assert "schema:team_alpha" in palace_graph._graph_cache
+
+        # Advance past the TTL and build a different (idle-aware) vault.
+        clock["now"] += palace_graph._GRAPH_CACHE_TTL + 1.0
+        col_b = _FakeVaultCollection(
+            [{"room": "bravo_room", "wing": "wing_b", "hall": "h", "date": "2026-02-01"}],
+            schema="team_bravo",
+        )
+        palace_graph.build_graph(col=col_b)
+
+        # The idle team_alpha entry was purged; only the fresh team_bravo remains.
+        assert "schema:team_alpha" not in palace_graph._graph_cache
+        assert "schema:team_bravo" in palace_graph._graph_cache

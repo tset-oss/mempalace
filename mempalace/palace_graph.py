@@ -26,7 +26,7 @@ import logging
 import os
 import threading
 import time
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from datetime import datetime, timezone
 
 from .config import MempalaceConfig, normalize_wing_name
@@ -57,22 +57,78 @@ def _normalize_wing(wing: str | None) -> str | None:
     return normalize_wing_name(wing)
 
 
-# Module-level graph cache with TTL and write-invalidation.
-# Warm cache serves build_graph() in O(1); invalidate_graph_cache() clears on writes.
+# Per-vault graph cache with TTL, write-invalidation, and a bounded size.
+# Each vault gets its own entry keyed by ``_vault_cache_key`` so one tenant's
+# warm graph can never be served to another. Warm hits serve build_graph()
+# in O(1); invalidate_graph_cache() clears on writes.
+#
+# The store is an ``OrderedDict`` used as an LRU: a warm read or a fresh build
+# moves its key to the most-recently-used end, and once the number of cached
+# vaults exceeds ``_GRAPH_CACHE_MAX_VAULTS`` the least-recently-used entry is
+# dropped. Stale (TTL-expired) entries are also pruned opportunistically on
+# every build so an idle vault cannot linger forever. The cap keeps memory
+# bounded on a host serving many teams — the TTL alone never frees a slot.
 _graph_cache_lock = threading.Lock()
-_graph_cache_nodes = None
-_graph_cache_edges = None
-_graph_cache_time = 0.0
+_graph_cache = OrderedDict()  # key -> {"nodes": dict, "edges": list, "time": float}
 _GRAPH_CACHE_TTL = 60.0  # seconds — graph changes less often than metadata
+_GRAPH_CACHE_MAX_VAULTS = 64  # LRU cap on distinct vaults cached at once
+
+# Single bucket for the local single-vault (chroma) case, where ``col`` carries
+# no schema and ``config`` carries no team — the key collapses here so chroma
+# behavior is unchanged.
+_DEFAULT_VAULT_KEY = "__default__"
 
 
-def invalidate_graph_cache():
-    """Clear the graph cache. Called from mcp_server.py on writes."""
-    global _graph_cache_nodes, _graph_cache_edges, _graph_cache_time
+def _vault_cache_key(col=None, config=None) -> str:
+    """Derive a stable per-vault cache key from ``col`` / ``config``.
+
+    On the central server each vault is a distinct Postgres schema
+    (``team_<slug>``) exposed on the collection as ``_schema``; that physical
+    isolation boundary is the authoritative team identity and is read directly
+    off the collection. When no collection is in hand we fall back to the
+    configured team, then the collection name, so two configs pointing at
+    different vaults still get different keys.
+
+    The local single-vault (chroma) collection carries neither a schema nor a
+    team, so the key collapses to ``_DEFAULT_VAULT_KEY`` — one bucket, exactly
+    the pre-existing behavior.
+    """
+    schema = getattr(col, "_schema", None)
+    if isinstance(schema, str) and schema.strip():
+        return f"schema:{schema.strip()}"
+
+    team = getattr(config, "team", None)
+    if isinstance(team, str) and team.strip():
+        return f"team:{team.strip()}"
+
+    coll = getattr(config, "collection_name", None)
+    if isinstance(coll, str) and coll.strip() and coll.strip() != "mempalace":
+        return f"collection:{coll.strip()}"
+
+    return _DEFAULT_VAULT_KEY
+
+
+def invalidate_graph_cache(col=None, config=None):
+    """Drop the cached graph for one vault, or clear every vault.
+
+    With no arguments it clears the whole cache (the single-vault default, and
+    the safe choice when a caller cannot name the vault it just mutated). Pass
+    ``col`` and/or ``config`` to evict only that vault's entry on the central
+    server, leaving other teams' warm caches intact. Graph freshness otherwise
+    relies on the cache TTL; eviction on the write path is a tracked follow-up.
+    """
     with _graph_cache_lock:
-        _graph_cache_nodes = None
-        _graph_cache_edges = None
-        _graph_cache_time = 0.0
+        if col is None and config is None:
+            _graph_cache.clear()
+            return
+        _graph_cache.pop(_vault_cache_key(col, config), None)
+
+
+def _purge_stale_locked(now: float) -> None:
+    """Drop TTL-expired entries. Caller must hold ``_graph_cache_lock``."""
+    stale = [k for k, v in _graph_cache.items() if (now - v["time"]) >= _GRAPH_CACHE_TTL]
+    for k in stale:
+        del _graph_cache[k]
 
 
 def _get_collection(config=None):
@@ -91,24 +147,24 @@ def build_graph(col=None, config=None):
     """
     Build the palace graph from ChromaDB metadata.
 
-    Returns cached result if fresh (within TTL). Cache is invalidated
-    on writes via invalidate_graph_cache(). Thread-safe via _graph_cache_lock.
-
-    Note: warm cache ignores ``col`` and ``config`` arguments — this is
-    intentional for the MCP server's single-palace use case. Callers
-    switching collections should call ``invalidate_graph_cache()`` first.
+    Returns cached result if fresh (within TTL). The cache is keyed per vault
+    (derived from ``col``/``config``) so a warm hit only ever returns the graph
+    for the SAME vault — one team can never receive another team's graph.
+    Invalidated on writes via invalidate_graph_cache(). Thread-safe via
+    _graph_cache_lock.
 
     Returns:
         nodes: dict of {room: {wings: set, halls: set, count: int}}
         edges: list of {room, wing_a, wing_b, hall} — one per tunnel crossing
     """
-    global _graph_cache_nodes, _graph_cache_edges, _graph_cache_time
     now = time.time()
-    # NOTE: warm cache ignores col/config args — intentional for the MCP server's
-    # single-palace use case. Callers switching collections must invalidate first.
+    key = _vault_cache_key(col, config)
     with _graph_cache_lock:
-        if _graph_cache_nodes is not None and (now - _graph_cache_time) < _GRAPH_CACHE_TTL:
-            return _graph_cache_nodes, _graph_cache_edges
+        _purge_stale_locked(now)
+        entry = _graph_cache.get(key)
+        if entry is not None and (now - entry["time"]) < _GRAPH_CACHE_TTL:
+            _graph_cache.move_to_end(key)
+            return entry["nodes"], entry["edges"]
 
     if col is None:
         col = _get_collection(config)
@@ -179,9 +235,12 @@ def build_graph(col=None, config=None):
     # when the palace is first populated.
     if nodes:
         with _graph_cache_lock:
-            _graph_cache_nodes = nodes
-            _graph_cache_edges = edges
-            _graph_cache_time = time.time()
+            _graph_cache[key] = {"nodes": nodes, "edges": edges, "time": time.time()}
+            _graph_cache.move_to_end(key)
+            # Evict the least-recently-used vault once the cap is exceeded so
+            # the cache cannot grow without bound on a many-team host.
+            while len(_graph_cache) > _GRAPH_CACHE_MAX_VAULTS:
+                _graph_cache.popitem(last=False)
 
     return nodes, edges
 
