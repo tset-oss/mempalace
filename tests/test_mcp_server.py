@@ -1109,7 +1109,9 @@ class TestWriteTools:
             def upsert(self, **kwargs):
                 return None
 
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False, team=None: _FakeCol())
+        monkeypatch.setattr(
+            mcp_server, "_get_collection", lambda create=False, team=None: _FakeCol()
+        )
 
         result = mcp_server.tool_add_drawer("w", "r", "content")
         assert result["success"] is False
@@ -2286,7 +2288,9 @@ class TestCacheInvalidation:
             def count(self):
                 return 7
 
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False, team=None: _FakeCol())
+        monkeypatch.setattr(
+            mcp_server, "_get_collection", lambda create=False, team=None: _FakeCol()
+        )
 
         result = mcp_server.tool_reconnect()
         assert result["success"] is True

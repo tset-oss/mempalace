@@ -475,7 +475,13 @@ def test_union_merger_max_distance_skips_postgres_candidates(backend, team):
     ]
     before = list(hits)
     _merge_bm25_union_candidates(
-        hits, "zylophonics report", "/ignored", None, None, 5,
-        max_distance=0.5, collection=col,
+        hits,
+        "zylophonics report",
+        "/ignored",
+        None,
+        None,
+        5,
+        max_distance=0.5,
+        collection=col,
     )
     assert hits == before, "max_distance>0 must inject no scoreless postgres candidates"

@@ -31,9 +31,7 @@ def get_knowledge_graph(palace_path: Optional[str] = None, team: Optional[str] =
         from .knowledge_graph import DEFAULT_KG_PATH, KnowledgeGraph
 
         db_path = (
-            os.path.join(palace_path, "knowledge_graph.sqlite3")
-            if palace_path
-            else DEFAULT_KG_PATH
+            os.path.join(palace_path, "knowledge_graph.sqlite3") if palace_path else DEFAULT_KG_PATH
         )
         return KnowledgeGraph(db_path=db_path)
 

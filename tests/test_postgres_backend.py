@@ -443,7 +443,5 @@ def test_wal_append_round_trip(backend):
     finally:
         with psycopg.connect(_dsn()) as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM mempalace_audit.write_log WHERE operation = %s", (op,)
-                )
+                cur.execute("DELETE FROM mempalace_audit.write_log WHERE operation = %s", (op,))
             conn.commit()

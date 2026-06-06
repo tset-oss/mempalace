@@ -281,7 +281,9 @@ def _basename(path: str) -> str:
     return re.split(r"[\\/]", path)[-1]
 
 
-def _where_document_clause(where_document: Optional[dict], params: list[Any], doc_col: str = "document") -> Optional[str]:
+def _where_document_clause(
+    where_document: Optional[dict], params: list[Any], doc_col: str = "document"
+) -> Optional[str]:
     """Translate a where_document ``{"$contains": "x"}`` into an ILIKE clause."""
     if not where_document:
         return None
@@ -441,9 +443,7 @@ class PostgresCollection(BaseCollection):
                     if not sets:
                         continue
                     params.append(rid)
-                    cur.execute(
-                        f"UPDATE {self._fqtn} SET {', '.join(sets)} WHERE id = %s", params
-                    )
+                    cur.execute(f"UPDATE {self._fqtn} SET {', '.join(sets)} WHERE id = %s", params)
 
     def delete(self, *, ids=None, where=None) -> None:
         _validate_where(where)
@@ -556,7 +556,9 @@ class PostgresCollection(BaseCollection):
         )
 
     @staticmethod
-    def _collect_query_rows(rows, colnames, spec, out_ids, out_docs, out_metas, out_dists, out_embs):
+    def _collect_query_rows(
+        rows, colnames, spec, out_ids, out_docs, out_metas, out_dists, out_embs
+    ):
         idx = {name: i for i, name in enumerate(colnames)}
         ids, docs, metas, dists, embs = [], [], [], [], []
         for row in rows:
@@ -812,7 +814,13 @@ class PostgresBackend(BaseBackend):
         }
     )
 
-    def __init__(self, dsn: Optional[str] = None, *, vector_dim: Optional[int] = None, embedder: Optional[Callable] = None):
+    def __init__(
+        self,
+        dsn: Optional[str] = None,
+        *,
+        vector_dim: Optional[int] = None,
+        embedder: Optional[Callable] = None,
+    ):
         self._dsn = dsn
         self._pool_obj = None
         self._closed = False
@@ -825,7 +833,9 @@ class PostgresBackend(BaseBackend):
         # a lock on purpose: the underlying DDL is ``CREATE ... IF NOT EXISTS``,
         # so the worst case under a race is a redundant (harmless) ensure call.
         self._ensured: set[tuple[str, str]] = set()
-        self._vector_dim = vector_dim or int(os.environ.get("MEMPALACE_PG_VECTOR_DIM", _DEFAULT_VECTOR_DIM))
+        self._vector_dim = vector_dim or int(
+            os.environ.get("MEMPALACE_PG_VECTOR_DIM", _DEFAULT_VECTOR_DIM)
+        )
         # Test/optional injection of an embedding function.
         self._embedder = embedder
         # One-time DDL guard for the central WAL audit table (G004).
@@ -1068,7 +1078,7 @@ class PostgresBackend(BaseBackend):
                     "SELECT schema_name FROM information_schema.schemata "
                     "WHERE schema_name LIKE 'team\\_%' ORDER BY schema_name"
                 )
-                return [r[0][len("team_"):] for r in cur.fetchall()]
+                return [r[0][len("team_") :] for r in cur.fetchall()]
 
     def close_palace(self, palace) -> None:
         ns = palace.namespace if isinstance(palace, PalaceRef) else None

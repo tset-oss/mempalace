@@ -127,7 +127,9 @@ def test_postgres_routing_uses_team_namespace(recorder, monkeypatch):
 def test_postgres_team_override_beats_config(recorder, monkeypatch):
     monkeypatch.setenv("MEMPALACE_BACKEND", "postgres")
     monkeypatch.setenv("MEMPALACE_TEAM", "frontend")
-    palace_mod.get_collection("/p", collection_name="mempalace_drawers", create=False, team="backend")
+    palace_mod.get_collection(
+        "/p", collection_name="mempalace_drawers", create=False, team="backend"
+    )
     ref = recorder.refs[0][0]
     assert ref.namespace == "backend"
 

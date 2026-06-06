@@ -25,8 +25,10 @@ def test_tool_search_entity_passes_restrict_ids(monkeypatch):
         m,
         "_get_entity_index",
         lambda team=None: _FakeIndex(
-            [{"drawer_id": "d1", "wing": "w", "room": "r"},
-             {"drawer_id": "d2", "wing": "w", "room": "r"}]
+            [
+                {"drawer_id": "d1", "wing": "w", "room": "r"},
+                {"drawer_id": "d2", "wing": "w", "room": "r"},
+            ]
         ),
     )
     captured = {}
@@ -46,9 +48,7 @@ def test_tool_search_entity_no_match_short_circuits(monkeypatch):
     monkeypatch.setattr(m, "_resolve_team", lambda v=None: "frontend")
     monkeypatch.setattr(m, "_get_entity_index", lambda team=None: _FakeIndex([]))
     called = {"search": False}
-    monkeypatch.setattr(
-        m, "search_memories", lambda *a, **k: called.__setitem__("search", True)
-    )
+    monkeypatch.setattr(m, "search_memories", lambda *a, **k: called.__setitem__("search", True))
 
     res = m.tool_search("anything", entity="Ghost")
     assert res["results"] == [] and res["count"] == 0

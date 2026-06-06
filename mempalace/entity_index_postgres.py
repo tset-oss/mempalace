@@ -119,9 +119,7 @@ class PostgresEntityIndex:
         self._ensure()
         with self._backend._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    f"DELETE FROM {self._table()} WHERE drawer_id = ANY(%s)", (ids,)
-                )
+                cur.execute(f"DELETE FROM {self._table()} WHERE drawer_id = ANY(%s)", (ids,))
         self._invalidate_known()
 
     # -- reads ------------------------------------------------------------
@@ -169,9 +167,7 @@ class PostgresEntityIndex:
                     "WHERE lower(entity) = lower(%s)",
                     (entity,),
                 )
-                return [
-                    {"drawer_id": r[0], "wing": r[1], "room": r[2]} for r in cur.fetchall()
-                ]
+                return [{"drawer_id": r[0], "wing": r[1], "room": r[2]} for r in cur.fetchall()]
 
     def top_entities(
         self, wing: Optional[str] = None, min_count: int = 1, limit: int = 100

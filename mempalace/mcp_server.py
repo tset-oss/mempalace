@@ -1703,7 +1703,11 @@ def tool_follow_tunnels(wing: str, room: str):
 
 
 def tool_add_drawer(
-    wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp",
+    wing: str,
+    room: str,
+    content: str,
+    source_file: str = None,
+    added_by: str = "mcp",
     vault: str = None,
 ):
     """File verbatim content into a wing/room. Checks for duplicates first.
@@ -2924,12 +2928,18 @@ TOOLS = {
                     "type": "string",
                     "description": "Entity to look up (person/project/service). Omit to list the vault's top entities.",
                 },
-                "wing": {"type": "string", "description": "Filter the top-entities listing to a wing (optional)"},
+                "wing": {
+                    "type": "string",
+                    "description": "Filter the top-entities listing to a wing (optional)",
+                },
                 "min_count": {
                     "type": "integer",
                     "description": "Top-entities listing only: minimum drawers an entity must appear in (default 2, filters one-off noise). Pass 1 to see everything.",
                 },
-                "limit": {"type": "integer", "description": "Max entities in the listing (default 50)"},
+                "limit": {
+                    "type": "integer",
+                    "description": "Max entities in the listing (default 50)",
+                },
                 "vault": {
                     "type": "string",
                     "description": "Team vault to inspect (omit for your primary; '<team>' for another team).",

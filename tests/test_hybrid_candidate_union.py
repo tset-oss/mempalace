@@ -96,9 +96,7 @@ class TestCandidateUnion:
         """
         palace = str(tmp_path / "palace")
         _seed_drawers(palace)
-        vector = search_memories(
-            _NARRATIVE_QUERY, palace, n_results=2, candidate_strategy="vector"
-        )
+        vector = search_memories(_NARRATIVE_QUERY, palace, n_results=2, candidate_strategy="vector")
         vec_ids = {h["source_file"] for h in vector["results"]}
         assert "brand_voice_D4.md" not in vec_ids, (
             "explicit candidate_strategy='vector' must NOT inject keyword "
@@ -106,9 +104,7 @@ class TestCandidateUnion:
         )
         # Sanity: union over the same corpus DOES reach the keyword-strong doc
         # (proving the suppression above is real, not a corpus artifact).
-        union = search_memories(
-            _NARRATIVE_QUERY, palace, n_results=5, candidate_strategy="union"
-        )
+        union = search_memories(_NARRATIVE_QUERY, palace, n_results=5, candidate_strategy="union")
         union_ids = {h["source_file"] for h in union["results"]}
         assert "brand_voice_D4.md" in union_ids, (
             f"union must surface the keyword-strong doc; got {union_ids}"
@@ -329,9 +325,7 @@ class TestCandidateStrategyEnvOverride:
         finally:
             self._restore_env(prior)
         ids = {h["source_file"] for h in result["results"]}
-        assert "brand_voice_D4.md" in ids, (
-            f"env unset must default to union; got {ids}"
-        )
+        assert "brand_voice_D4.md" in ids, f"env unset must default to union; got {ids}"
 
     def test_explicit_arg_wins_over_env(self, tmp_path):
         """Explicit ``candidate_strategy="union"`` overrides env=vector."""
@@ -347,8 +341,7 @@ class TestCandidateStrategyEnvOverride:
             self._restore_env(prior)
         ids = {h["source_file"] for h in result["results"]}
         assert "brand_voice_D4.md" in ids, (
-            "explicit candidate_strategy='union' must win over env=vector; "
-            f"got {ids}"
+            f"explicit candidate_strategy='union' must win over env=vector; got {ids}"
         )
 
     def test_invalid_env_value_raises(self, tmp_path):
@@ -394,8 +387,15 @@ class TestUnionMergerBackendDispatch:
                     }
                 ]
 
-        hits = [{"text": "vector hit", "distance": 0.2, "source_file": "v.md",
-                 "_source_file_full": "dir/v.md", "_chunk_index": 0}]
+        hits = [
+            {
+                "text": "vector hit",
+                "distance": 0.2,
+                "source_file": "v.md",
+                "_source_file_full": "dir/v.md",
+                "_chunk_index": 0,
+            }
+        ]
         _merge_bm25_union_candidates(
             hits, "zylophonics", "/ignored", None, None, 5, collection=_FakeCollection()
         )
@@ -418,8 +418,15 @@ class TestUnionMergerBackendDispatch:
             def keyword_candidates(self, **kwargs):  # pragma: no cover - must not be called
                 raise AssertionError("keyword_candidates must not be called when unsupported")
 
-        hits = [{"text": "vector hit", "distance": 0.2, "source_file": "v.md",
-                 "_source_file_full": "dir/v.md", "_chunk_index": 0}]
+        hits = [
+            {
+                "text": "vector hit",
+                "distance": 0.2,
+                "source_file": "v.md",
+                "_source_file_full": "dir/v.md",
+                "_chunk_index": 0,
+            }
+        ]
         before = list(hits)
         _merge_bm25_union_candidates(
             hits, "anything", "/ignored", None, None, 5, collection=_NoKeywordCollection()
@@ -447,8 +454,14 @@ class TestUnionMergerBackendDispatch:
         hits = [{"text": "vector hit", "distance": 0.2, "source_file": "v.md"}]
         before = list(hits)
         _merge_bm25_union_candidates(
-            hits, "anything", "/ignored", None, None, 5,
-            max_distance=0.5, collection=_FakeCollection(),
+            hits,
+            "anything",
+            "/ignored",
+            None,
+            None,
+            5,
+            max_distance=0.5,
+            collection=_FakeCollection(),
         )
         assert hits == before, "max_distance>0 must skip keyword candidates on every route"
 

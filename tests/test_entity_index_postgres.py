@@ -137,7 +137,9 @@ def test_write_path_helper_indexes_against_live_db(backend, team, monkeypatch):
     assert m._config.backend != "chroma"
 
     # "Zelda" appears twice -> caught by the frequency tier with an empty vault.
-    m._index_drawer_entities(team, ["dX", "dY"], "Zelda met Zelda about the plan.", "people", "today")
+    m._index_drawer_entities(
+        team, ["dX", "dY"], "Zelda met Zelda about the plan.", "people", "today"
+    )
 
     rows = m._get_entity_index(team).drawers_for_entity("Zelda")
     assert {r["drawer_id"] for r in rows} == {"dX", "dY"}
@@ -227,9 +229,7 @@ def test_backfill_populates_and_is_idempotent(backend, team):
 
         def get(self, limit=None, offset=0, include=None):
             page = self._rows[offset : offset + (limit or len(self._rows))]
-            return _FakeResult(
-                [r[0] for r in page], [r[1] for r in page], [r[2] for r in page]
-            )
+            return _FakeResult([r[0] for r in page], [r[1] for r in page], [r[2] for r in page])
 
     rows = [
         ("d1", "Dana owns the ingest work.", {"wing": "people", "room": "r"}),

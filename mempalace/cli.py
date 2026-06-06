@@ -1185,8 +1185,7 @@ def cmd_team(args):
         name = (args.name or "").strip().lower()
         if not name or not re.fullmatch(r"[a-z0-9_]{1,40}", name):
             print(
-                "Team name must be 1-40 lowercase letters, digits or underscores "
-                "(e.g. frontend)."
+                "Team name must be 1-40 lowercase letters, digits or underscores (e.g. frontend)."
             )
             return
         updates = {"backend": "postgres", "team": name}
@@ -1204,7 +1203,9 @@ def cmd_team(args):
 
     if action == "list":
         if cfg.backend == "chroma":
-            print("Local (chroma) backend — single 'local' vault. Run 'mempalace team set <name>' for central mode.")
+            print(
+                "Local (chroma) backend — single 'local' vault. Run 'mempalace team set <name>' for central mode."
+            )
             return
         try:
             from .palace import _resolve_backend
@@ -1262,9 +1263,7 @@ class _BearerAuthASGI:
                         ],
                     }
                 )
-                await send(
-                    {"type": "http.response.body", "body": b'{"error":"unauthorized"}'}
-                )
+                await send({"type": "http.response.body", "body": b'{"error":"unauthorized"}'})
                 return
         await self._app(scope, receive, send)
 
@@ -1819,9 +1818,7 @@ def main():
     )
     team_sub.add_parser("list", help="List team vaults on the central server")
 
-    p_serve = sub.add_parser(
-        "serve", help="Run the MCP server (stdio, or central streamable-http)"
-    )
+    p_serve = sub.add_parser("serve", help="Run the MCP server (stdio, or central streamable-http)")
     p_serve.add_argument(
         "--transport",
         choices=["stdio", "streamable-http"],
