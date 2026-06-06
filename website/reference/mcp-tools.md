@@ -190,6 +190,25 @@ Query entity relationships with time filtering.
 
 ---
 
+### `mempalace_kg_neighbors`
+
+Walk the knowledge graph multiple hops out from an entity to surface indirect connections a single-hop query misses.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `entity` | string | **Yes** | Entity to start the walk from (e.g. "Max", "MyProject") |
+| `depth` | integer | No | How many hops to follow out (default: 2, clamped to 1–4) |
+| `direction` | string | No | `outgoing`, `incoming`, or `both` (default: `outgoing`) |
+| `as_of` | string | No | Date filter — only facts valid at this point in time, applied to every hop |
+| `target` | string | No | Keep only paths that reach this entity |
+| `predicates` | array | No | Restrict every hop to these relationship types |
+
+**Returns:** `{ entity, depth, direction, as_of, neighbors: [{ hop, direction, subject, predicate, object, valid_from, valid_to }], count, truncated }`
+
+Postgres backend only; the local SQLite knowledge graph returns a structured "unsupported on local backend" result.
+
+---
+
 ### `mempalace_kg_add`
 
 Add a fact to the knowledge graph.
