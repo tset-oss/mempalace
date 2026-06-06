@@ -385,3 +385,162 @@ def test_explain_recursive_term_is_bounded(kg, backend):
     # recursive frontier is bounded rather than fully materialized.
     assert "Recursive Union" in plan
     assert "Limit" in plan
+
+
+# -- 1-hop parity gate vs query_entity -----------------------------------
+#
+# ``neighbors(depth=1, direction=...)`` must agree with ``query_entity`` on the
+# edge identity + validity tuple ``(subject, predicate, object, valid_from,
+# valid_to)`` ONLY. The fields ``direction``, ``current``, ``confidence`` and
+# ``source_closet`` are EXCLUDED from the comparison: ``neighbors`` is allowed to
+# shape them differently; only the edge + its validity window must match.
+#
+# ``query_entity`` (knowledge_graph_postgres.py:281-336) emits the OUTGOING block
+# THEN the INCOMING block, concatenated and NOT deduped, so a symmetric pair
+# X<->Y surfaces both edges from each side. The parity assertion preserves that
+# block ordering: every outgoing tuple precedes every incoming tuple in both
+# methods. Within a single block the underlying SQL is unordered (no ``ORDER
+# BY``), so each block is compared as a sorted multiset to stay deterministic
+# while still asserting the non-deduped block-concatenation order.
+
+_PARITY_TUPLE_KEYS = ("subject", "predicate", "object", "valid_from", "valid_to")
+
+
+def _project(row):
+    return tuple(row[k] for k in _PARITY_TUPLE_KEYS)
+
+
+def _split_blocks(rows):
+    """Split a list of edge dicts into (outgoing-tuples, incoming-tuples).
+
+    Preserves the original sequence so the caller can assert that the outgoing
+    block precedes the incoming block (the concatenated, non-deduped ordering
+    ``query_entity`` produces).
+    """
+    outgoing = [_project(r) for r in rows if r["direction"] == "outgoing"]
+    incoming = [_project(r) for r in rows if r["direction"] == "incoming"]
+    return outgoing, incoming
+
+
+def _assert_outgoing_precedes_incoming(rows):
+    """The outgoing block is contiguous and comes before the incoming block."""
+    dirs = [r["direction"] for r in rows]
+    if "incoming" in dirs and "outgoing" in dirs:
+        # No outgoing edge may appear after the first incoming edge.
+        first_incoming = dirs.index("incoming")
+        assert "outgoing" not in dirs[first_incoming:], (
+            "outgoing block must precede incoming block (concatenated, non-deduped)"
+        )
+
+
+@pytest.mark.parametrize("direction", ["outgoing", "incoming", "both"])
+@pytest.mark.parametrize("as_of", [None, "2025-01-01"])
+def test_neighbors_depth1_parity_with_query_entity(kg, direction, as_of):
+    # Give every edge a validity window that the fixed as-of sits inside, so
+    # both the as_of=None and as_of=fixed runs return the full edge set and the
+    # parity comparison is NON-VACUOUS for every parametrization.
+    kg.add_triple("Hub", "rel", "Out1", valid_from="2024-01-01")
+    kg.add_triple("Hub", "rel", "Out2", valid_from="2024-01-01")
+    kg.add_triple("In1", "rel", "Hub", valid_from="2024-01-01")
+    kg.add_triple("In2", "rel", "Hub", valid_from="2024-01-01")
+    kg.add_triple("Hub", "knows", "Peer", valid_from="2024-01-01")
+    kg.add_triple("Peer", "knows", "Hub", valid_from="2024-01-01")
+
+    expected = kg.query_entity("Hub", as_of=as_of, direction=direction)
+    got = kg.neighbors("Hub", depth=1, direction=direction, as_of=as_of)["neighbors"]
+
+    exp_out, exp_in = _split_blocks(expected)
+    got_out, got_in = _split_blocks(got)
+
+    # Edge identity + validity match per block (multiset; within-block SQL order
+    # is undefined so we sort each block before comparing).
+    assert sorted(got_out) == sorted(exp_out)
+    assert sorted(got_in) == sorted(exp_in)
+
+    # The concatenated NON-deduped block ordering is preserved: outgoing block
+    # first, then incoming block, in BOTH methods.
+    _assert_outgoing_precedes_incoming(expected)
+    _assert_outgoing_precedes_incoming(got)
+
+    # Non-vacuous: the relevant block(s) actually carry edges.
+    if direction in ("outgoing", "both"):
+        assert len(got_out) >= 2
+    if direction in ("incoming", "both"):
+        assert len(got_in) >= 2
+    if direction == "both":
+        # The symmetric Hub<->Peer pair survives the non-deduped concatenation:
+        # "Peer" appears as an outgoing object AND as an incoming subject.
+        assert ("Hub", "knows", "Peer", "2024-01-01", None) in got_out
+        assert ("Peer", "knows", "Hub", "2024-01-01", None) in got_in
+
+
+def test_neighbors_depth1_parity_excludes_nonidentity_fields(kg):
+    # A confidence/source_closet difference must NOT break parity: the compared
+    # tuple is edge identity + validity only.
+    kg.add_triple("Hub", "rel", "Out1", confidence=0.5, source_closet="c1")
+    kg.add_triple("In1", "rel", "Hub", confidence=0.9, source_closet="c2")
+
+    expected = kg.query_entity("Hub", direction="both")
+    got = kg.neighbors("Hub", depth=1, direction="both")["neighbors"]
+
+    exp_out, exp_in = _split_blocks(expected)
+    got_out, got_in = _split_blocks(got)
+    assert sorted(got_out) == sorted(exp_out)
+    assert sorted(got_in) == sorted(exp_in)
+    # Both methods agree on the identity tuple even though confidence differs
+    # per edge (3rd assertion is the proof the excluded fields are irrelevant).
+    assert sorted(_project(r) for r in got) == sorted(_project(r) for r in expected)
+
+
+# -- per-team isolation of the 1-hop read --------------------------------
+
+
+def test_neighbors_depth1_per_team_isolation(backend):
+    # A chain written in team A is invisible to a neighbors() call routed to a
+    # distinct team B; team A still sees its own edges.
+    a = "t" + uuid.uuid4().hex[:10]
+    b = "t" + uuid.uuid4().hex[:10]
+    kga = PostgresKnowledgeGraph(backend, team=a)
+    kgb = PostgresKnowledgeGraph(backend, team=b)
+    try:
+        kga.add_triple("Hub", "rel", "Out1")
+        kga.add_triple("In1", "rel", "Hub")
+
+        # Team B has never written "Hub": the 1-hop read is empty in every
+        # direction (the team-A chain does not leak across the schema boundary).
+        for direction in ("outgoing", "incoming", "both"):
+            view_b = kgb.neighbors("Hub", depth=1, direction=direction)
+            assert view_b["neighbors"] == []
+
+        # Team A sees its own edges, and they match query_entity within team A.
+        got_a = kga.neighbors("Hub", depth=1, direction="both")["neighbors"]
+        exp_a = kga.query_entity("Hub", direction="both")
+        assert sorted(_project(r) for r in got_a) == sorted(_project(r) for r in exp_a)
+        assert {r["object"] for r in got_a if r["direction"] == "outgoing"} == {"Out1"}
+        assert {r["subject"] for r in got_a if r["direction"] == "incoming"} == {"In1"}
+    finally:
+        for t in (a, b):
+            with psycopg.connect(_dsn()) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(f'DROP SCHEMA IF EXISTS "{team_schema(t)}" CASCADE')
+                conn.commit()
+
+
+# -- truncation at the cap for a 1-hop fan-out ---------------------------
+
+
+def test_neighbors_depth1_truncates_at_expand_cap(kg):
+    # A 1-hop fan-out exceeding expand_cap returns truncated=True (the per-node
+    # expansion cap clips the frontier even at a single hop).
+    for i in range(10):
+        kg.add_triple("Hub", "rel", f"N{i:02d}")
+
+    out = kg.neighbors("Hub", depth=1, direction="outgoing", expand_cap=3)
+    assert out["truncated"] is True
+    # The kept frontier is bounded at expand_cap + 1 (the overflow probe row).
+    assert len(out["neighbors"]) <= 4
+
+    # Within the cap there is no truncation.
+    ok = kg.neighbors("Hub", depth=1, direction="outgoing", expand_cap=50)
+    assert ok["truncated"] is False
+    assert len(ok["neighbors"]) == 10
