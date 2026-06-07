@@ -1412,6 +1412,62 @@ def cmd_reindex_entities(args):
     print("reindex-entities complete.")
 
 
+def cmd_topic_coverage(args):
+    """Per-team topic-coverage report (postgres only, read-only).
+
+    Queries each selected team vault's ``wing_topics`` table and prints:
+    - total rows in the table,
+    - distinct topic count,
+    - number of distinct wings that carry at least one topic label.
+
+    No writes, no network calls, no external services — pure DB read.
+    """
+    cfg = MempalaceConfig()
+    if cfg.backend == "chroma":
+        print(
+            "topic-coverage is for the central postgres backend only "
+            "(set MEMPALACE_BACKEND=postgres)."
+        )
+        return
+
+    from .backends.postgres import _qi, team_schema
+    from .palace import _resolve_backend
+
+    backend = _resolve_backend(cfg)
+    if getattr(args, "all_vaults", False):
+        teams = backend.list_vaults() if hasattr(backend, "list_vaults") else []
+    else:
+        teams = [args.vault or cfg.team or "default"]
+    if not teams:
+        print("No vaults found.")
+        return
+
+    for team in teams:
+        schema = team_schema(team)
+        table = f"{_qi(schema)}.{_qi('wing_topics')}"
+        try:
+            with backend._conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT to_regclass(%s)", (f"{_qi(schema)}.wing_topics",))
+                    exists = cur.fetchone()[0]
+                    if not exists:
+                        print(f"  {team}: no wing_topics table (no labels filed yet)")
+                        continue
+                    cur.execute(f"SELECT COUNT(*) FROM {table}")
+                    total_rows = cur.fetchone()[0]
+                    cur.execute(f"SELECT COUNT(DISTINCT topic) FROM {table}")
+                    distinct_topics = cur.fetchone()[0]
+                    cur.execute(f"SELECT COUNT(DISTINCT wing) FROM {table}")
+                    wings_with_topics = cur.fetchone()[0]
+            print(
+                f"  {team}: {total_rows} wing_topics rows, "
+                f"{distinct_topics} distinct topics, "
+                f"{wings_with_topics} wings with topics"
+            )
+        except Exception as e:
+            print(f"  {team}: error ({e})")
+
+
 def main():
     """CLI entry point for the ``mempalace`` console script.
 
@@ -1882,6 +1938,20 @@ def main():
         help="Reindex every team vault on the central server",
     )
 
+    p_topic = sub.add_parser(
+        "topic-coverage",
+        help="Report per-team topic-label coverage (central postgres mode, read-only)",
+    )
+    p_topic.add_argument(
+        "--vault", help="Team vault to report on (default: this machine's configured team)"
+    )
+    p_topic.add_argument(
+        "--all-vaults",
+        dest="all_vaults",
+        action="store_true",
+        help="Report for every team vault on the central server",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1925,6 +1995,7 @@ def main():
         "status": cmd_status,
         "serve": cmd_serve,
         "reindex-entities": cmd_reindex_entities,
+        "topic-coverage": cmd_topic_coverage,
     }
     dispatch[args.command](args)
 
