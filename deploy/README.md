@@ -108,6 +108,13 @@ or via env (`MEMPALACE_BACKEND=postgres`, `MEMPALACE_TEAM=frontend`,
 `MEMPALACE_DATABASE_URL=...`). Prefer the central HTTP server for distribution —
 it keeps the fork on one host.
 
+## Operator runbook
+
+After the stack is up, follow **[`RUNBOOK.md`](RUNBOOK.md)** for the six
+post-deploy steps: connection wiring + token rotation, WAL audit-sink
+configuration, entity-index backfill, embedding-model choices, entity-registry
+seeding, and the `topic-coverage` health check.
+
 ## Scaling notes
 
 - Bump `shared_buffers` / `effective_cache_size` in `postgresql.conf` for a real
