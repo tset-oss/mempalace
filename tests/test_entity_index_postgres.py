@@ -452,6 +452,92 @@ def test_backfill_populates_and_is_idempotent(backend, team):
     assert {r["drawer_id"] for r in idx.drawers_for_entity("Dana")} == {"d1", "d2"}
 
 
+def test_delete_drawer_chunked_clears_all_chunk_rows(backend, team, monkeypatch):
+    """tool_delete_drawer via _unindex_drawer_entities must clear bare id + chunk rows.
+
+    A chunked drawer writes entity rows keyed {parent}_chunk_NNNNNN.  The old
+    delete path used delete_by_drawer (bare-id only) and orphaned those rows.
+    After the fix, delete_by_parent is used, so zero rows survive.
+    """
+    import mempalace.mcp_server as m
+
+    monkeypatch.setenv("MEMPALACE_BACKEND", "postgres")
+    monkeypatch.setattr("mempalace.palace._resolve_backend", lambda cfg: backend)
+    monkeypatch.setattr(m, "_entity_index_by_team", {})
+
+    idx = m._get_entity_index(team)
+    parent = "drawer_wing_room_chunked"
+    # Simulate a chunked add: three physical chunk rows.
+    for i in range(3):
+        idx.add([f"{parent}_chunk_{i:06d}"], ["Dana"], "wing", "room")
+    assert len(idx.drawers_for_entity("Dana")) == 3
+
+    # Delete path (the function under fix).
+    m._unindex_drawer_entities(team, [parent])
+
+    assert idx.drawers_for_entity("Dana") == []
+
+
+def test_delete_drawer_non_chunked_removes_exactly_one_row(backend, team, monkeypatch):
+    """_unindex_drawer_entities on a bare (non-chunked) drawer removes its one row.
+
+    A non-chunked drawer stores a single entity row keyed on its own id.
+    delete_by_parent on a bare id with no chunk rows must remove that row only,
+    leaving an unrelated drawer's rows untouched.
+    """
+    import mempalace.mcp_server as m
+
+    monkeypatch.setenv("MEMPALACE_BACKEND", "postgres")
+    monkeypatch.setattr("mempalace.palace._resolve_backend", lambda cfg: backend)
+    monkeypatch.setattr(m, "_entity_index_by_team", {})
+
+    idx = m._get_entity_index(team)
+    idx.add(["target_drawer"], ["Dana"], "wing", "room")
+    idx.add(["other_drawer"], ["Zelda"], "wing", "room")
+
+    m._unindex_drawer_entities(team, ["target_drawer"])
+
+    assert idx.drawers_for_entity("Dana") == []
+    # Unrelated drawer untouched.
+    assert {r["drawer_id"] for r in idx.drawers_for_entity("Zelda")} == {"other_drawer"}
+
+
+def test_delete_drawer_isolation_across_teams(backend, monkeypatch):
+    """Deleting a drawer in team X does not affect team Y's entity rows."""
+    import mempalace.mcp_server as m
+
+    monkeypatch.setenv("MEMPALACE_BACKEND", "postgres")
+    monkeypatch.setattr("mempalace.palace._resolve_backend", lambda cfg: backend)
+    monkeypatch.setattr(m, "_entity_index_by_team", {})
+
+    team_x = "eidx_x_" + __import__("uuid").uuid4().hex[:8]
+    team_y = "eidx_y_" + __import__("uuid").uuid4().hex[:8]
+    shared_drawer = "drawer_wing_room_shared"
+
+    idx_x = m._get_entity_index(team_x)
+    idx_y = m._get_entity_index(team_y)
+
+    idx_x.add([shared_drawer], ["Dana"], "wing", "room")
+    for i in range(2):
+        idx_x.add([f"{shared_drawer}_chunk_{i:06d}"], ["Dana"], "wing", "room")
+    idx_y.add([shared_drawer], ["Dana"], "wing", "room")
+
+    # Delete only in team X.
+    m._unindex_drawer_entities(team_x, [shared_drawer])
+
+    assert idx_x.drawers_for_entity("Dana") == []
+    # Team Y's row is intact.
+    assert {r["drawer_id"] for r in idx_y.drawers_for_entity("Dana")} == {shared_drawer}
+
+    # Teardown schemas created outside the `team` fixture.
+    from mempalace.backends.postgres import team_schema
+
+    with backend._conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f'DROP SCHEMA IF EXISTS "{team_schema(team_x)}" CASCADE')
+            cur.execute(f'DROP SCHEMA IF EXISTS "{team_schema(team_y)}" CASCADE')
+
+
 def test_search_memories_scopes_to_restrict_ids(team, monkeypatch):
     """Regression: search_memories must thread restrict_ids into the drawer query.
 

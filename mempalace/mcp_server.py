@@ -538,11 +538,18 @@ def _index_drawer_entities(team, chunks, wing, room):
 
 
 def _unindex_drawer_entities(team, drawer_ids):
-    """Best-effort: drop a drawer's entity rows. No-op on chroma; never raises."""
+    """Best-effort: drop a drawer's entity rows. No-op on chroma; never raises.
+
+    Uses parent-based deletion so that chunked drawers (whose entity rows are
+    keyed ``{id}_chunk_NNNNNN``) are fully cleared, not just the bare-id row.
+    Mirrors the update path which also uses ``delete_by_parent``.
+    """
     if _config.backend == "chroma":
         return
     try:
-        _get_entity_index(team).delete_by_drawer(drawer_ids)
+        idx = _get_entity_index(team)
+        for drawer_id in drawer_ids:
+            idx.delete_by_parent(drawer_id)
     except Exception:
         logger.debug("entity index delete failed (best-effort)", exc_info=True)
 
