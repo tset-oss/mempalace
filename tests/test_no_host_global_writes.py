@@ -25,12 +25,18 @@ The scanner is exposed as :func:`scan_source_for_host_global_writes` so the
 self-test can feed it a synthetic leak and assert the guard actually fires —
 proving this is not a vacuous always-pass.
 
-Known blind spots (accepted limits, not present in the tree today): the scanner
-resolves ``$HOME`` taint through names, ``self``/class attributes, ``os.path``
-transforms, or-chains and intra-module helper returns, but it does NOT inspect
-f-string targets (``ast.JoinedStr``, e.g. ``open(f"{home}/.mempalace/x", "w")``)
-nor ``shutil.copy*`` destinations. A future leak using either shape would slip
-past; extend ``_WRITE_ATTR_*`` / ``_HomePathResolver`` if one ever appears.
+The scanner resolves ``$HOME`` taint through names, ``self``/class attributes,
+``os.path`` transforms, or-chains, intra-module helper returns, f-string targets
+(``ast.JoinedStr``, e.g. ``open(f"{home}/.mempalace/x", "w")`` — flagged when an
+interpolated hole resolves to a ``$HOME``-tainted expression), and ``shutil.copy*``
+destinations (``copy``/``copyfile``/``copy2``/``copytree`` — the dst arg is the
+write). Remaining accepted static limits: (1) an f-string assembled only from
+non-``$HOME`` holes whose runtime value happens to point home cannot be resolved
+without executing the code; (2) write calls that pass the destination as a
+keyword argument (e.g. ``shutil.copy2(src, dst=path)``) are not detected — the
+scanner is positional-only throughout (``open(path, mode="w")`` has the same
+limit). Extend ``_WRITE_ATTR_*`` / ``_HomePathResolver`` if a new write shape
+ever appears.
 """
 
 from __future__ import annotations
@@ -135,6 +141,12 @@ _WRITE_ATTR_RECEIVER = frozenset({"write_text", "write_bytes", "touch", "mkdir"}
 _WRITE_ATTR_FIRST_ARG = frozenset({"makedirs"})
 # Write sinks where both of the first two positional args are destinations.
 _WRITE_ATTR_TWO_ARGS = frozenset({"replace", "rename", "move"})
+# shutil.copy* sinks: the DESTINATION is the 2nd positional arg (the write).
+# copy/copyfile/copy2/copytree all take (src, dst) — we check dst only, not src.
+# Accepted static limit: keyword-only invocations (shutil.copy2(src, dst=path))
+# are NOT detected; this matches the file's positional-only convention throughout
+# (the open() mode= kwarg has the same limit).
+_WRITE_ATTR_SECOND_ARG = frozenset({"copy", "copyfile", "copy2", "copytree"})
 
 
 def _is_home_literal(value: str) -> bool:
@@ -194,8 +206,29 @@ class _HomePathResolver:
                 if isinstance(key, ast.Constant) and key.value == "HOME":
                     return True
             return self.is_home(node.value)
+        if isinstance(node, ast.JoinedStr):
+            return self._joinedstr_is_home(node)
         if isinstance(node, ast.Call):
             return self._call_is_home(node)
+        return False
+
+    def _joinedstr_is_home(self, node: ast.JoinedStr) -> bool:
+        """An f-string is $HOME-anchored when an interpolated part resolves to a
+        $HOME-tainted expression (``f"{home}/.mempalace/x"``,
+        ``f"{Path.home()}/x"``, ``f"{os.path.expanduser('~')}/.config/x"``).
+
+        The taint flows through the FormattedValue holes; a palace-relative base
+        (``f"{palace_path}/drawers/{id}.json"``) carries no home taint and is not
+        flagged. A constant literal part is checked too so a fully-literal
+        ``f"~/.mempalace/x"`` is still caught.
+        """
+        for part in node.values:
+            if isinstance(part, ast.FormattedValue):
+                if self.is_home(part.value):
+                    return True
+            elif isinstance(part, ast.Constant) and isinstance(part.value, str):
+                if _is_home_literal(part.value):
+                    return True
         return False
 
     def _call_is_home(self, node: ast.Call) -> bool:
@@ -311,6 +344,10 @@ def _write_targets(node: ast.Call) -> list[ast.expr]:
         return [node.args[0]] if (is_write and node.args) else []
     if name in _WRITE_ATTR_TWO_ARGS:
         return list(node.args[:2])
+    if name in _WRITE_ATTR_SECOND_ARG:
+        # shutil.copy*(src, dst): the destination (2nd positional) is the write;
+        # the source (1st) is a read and must NOT be flagged.
+        return [node.args[1]] if len(node.args) >= 2 else []
     if name in _WRITE_ATTR_FIRST_ARG:
         return list(node.args[:1])
     if name == "mkstemp":
@@ -583,6 +620,115 @@ def test_guard_scanner_ignores_reads_and_palace_relative_writes():
         "        fh.write('x')\n"
     )
     assert not scan_source_for_host_global_writes(palace_relative, "palace_case.py")
+
+
+def test_guard_scanner_flags_fstring_and_shutil_copy_host_global_writes():
+    """Self-test for the two newly-closed shapes: f-string targets and copies.
+
+    Feeds the scanner synthetic leaks using an ``ast.JoinedStr`` write target and
+    a ``shutil.copy2`` whose DESTINATION is a ``$HOME``-anchored path, and asserts
+    each is flagged. Proves the guard is non-vacuous for these shapes — exactly
+    the gaps the docstring used to list as blind spots.
+    """
+    # f-string write target: open(f"{home}/.mempalace/leak.json", "w").
+    fstring_leak = (
+        "from pathlib import Path\n"
+        "def leak(data):\n"
+        "    home = str(Path.home())\n"
+        '    with open(f"{home}/.mempalace/leak.json", "w") as f:\n'
+        "        f.write(data)\n"
+    )
+    fstring_findings = scan_source_for_host_global_writes(fstring_leak, "fstring_leak.py")
+    assert fstring_findings, (
+        "scanner missed an f-string host-global write target — guard is vacuous"
+    )
+    assert all((f.module, f.target) not in ALLOWLIST for f in fstring_findings)
+
+    # Direct expanduser-in-fstring hole (no local variable) — the exact shape
+    # the old docstring called out as the canonical blind-spot example.
+    fstring_direct = (
+        "import os\n"
+        "def leak(data):\n"
+        '    with open(f"{os.path.expanduser(\'~\')}/.mempalace/x", "w") as f:\n'
+        "        f.write(data)\n"
+    )
+    direct_findings = scan_source_for_host_global_writes(fstring_direct, "fstring_direct.py")
+    assert direct_findings, (
+        "scanner missed a direct expanduser-in-fstring write target — guard is vacuous"
+    )
+
+    # Fully-literal home f-string: tilde as a literal segment, not a hole.
+    # Exercises the _is_home_literal path inside _joinedstr_is_home.
+    fstring_literal = (
+        'def leak(data):\n    with open(f"~/.mempalace/x", "w") as f:\n        f.write(data)\n'
+    )
+    literal_findings = scan_source_for_host_global_writes(fstring_literal, "fstring_literal.py")
+    assert literal_findings, (
+        "scanner missed a fully-literal tilde f-string write target — _is_home_literal path untested"
+    )
+
+    # shutil.copy2(src, dst) where the DESTINATION resolves to a $HOME path.
+    shutil_leak = (
+        "import os\n"
+        "import shutil\n"
+        "def leak(src):\n"
+        "    dst = os.path.join(os.path.expanduser('~'), '.config', 'x')\n"
+        "    shutil.copy2(src, dst)\n"
+    )
+    shutil_findings = scan_source_for_host_global_writes(shutil_leak, "shutil_leak.py")
+    assert shutil_findings, (
+        "scanner missed a shutil.copy* host-global destination — guard is vacuous"
+    )
+    assert all((f.module, f.target) not in ALLOWLIST for f in shutil_findings)
+    # The flagged target is the DESTINATION (dst), never the source (src).
+    assert all(f.target == "dst" for f in shutil_findings)
+    assert all(f.target != "src" for f in shutil_findings)
+
+    # f-string with Path.home() interpolated directly into the destination.
+    home_dest_copy = (
+        "import shutil\n"
+        "from pathlib import Path\n"
+        "def leak(src):\n"
+        '    shutil.copytree(src, f"{Path.home()}/.mempalace/backup")\n'
+    )
+    home_dest_findings = scan_source_for_host_global_writes(home_dest_copy, "home_dest_copy.py")
+    assert home_dest_findings, "scanner missed a shutil.copytree f-string home destination"
+
+
+def test_guard_scanner_ignores_palace_relative_fstring_and_fstring_reads():
+    """No false positives on the new shapes: palace-relative f-strings and reads.
+
+    Writing INTO the configured palace via an f-string follows ``palace_path``
+    (the user's chosen data root), not ``$HOME`` — not the cross-tenant leak
+    class. And an f-string used only to READ a home path must not be flagged.
+    Flagging either would make the guard noisy and untrustworthy.
+    """
+    # Palace-relative f-string write: base is palace_path, not $HOME.
+    palace_fstring_write = (
+        "def f(palace_path, id):\n"
+        '    with open(f"{palace_path}/drawers/{id}.json", "w") as fh:\n'
+        "        fh.write('x')\n"
+    )
+    assert not scan_source_for_host_global_writes(palace_fstring_write, "palace_fstring.py")
+
+    # Read via an f-string home path: reads never leak.
+    fstring_read = (
+        "from pathlib import Path\n"
+        "def f():\n"
+        "    home = str(Path.home())\n"
+        '    with open(f"{home}/.mempalace/x.json", "r") as fh:\n'
+        "        return fh.read()\n"
+    )
+    assert not scan_source_for_host_global_writes(fstring_read, "fstring_read.py")
+
+    # shutil.copy whose DESTINATION is palace-relative must not be flagged.
+    palace_copy = (
+        "import os\n"
+        "import shutil\n"
+        "def f(palace_path, src):\n"
+        "    shutil.copy(src, os.path.join(palace_path, 'snapshot.json'))\n"
+    )
+    assert not scan_source_for_host_global_writes(palace_copy, "palace_copy.py")
 
 
 def test_importing_mcp_server_creates_no_host_global_wal_artifact(tmp_path, monkeypatch):
