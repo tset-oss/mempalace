@@ -1869,6 +1869,188 @@ def tool_team_facts():
     }
 
 
+# Reason returned on chroma for the per-team entity name-resolution tools. A
+# local install is single-vault and keeps its disambiguation knowledge in the
+# host-global ~/.mempalace/entity_registry.json; the per-team registry only
+# exists on the central server, so on chroma these tools report unavailable
+# rather than touching that host-global file.
+_ENTITY_REGISTRY_CHROMA_REASON = (
+    "The per-team entity name-resolution registry is a central-server feature "
+    "(one isolated registry of known names/aliases/ambiguity per team). A local "
+    "install has no team concept; its disambiguation lives in "
+    "~/.mempalace/entity_registry.json instead."
+)
+
+
+def tool_disambiguate(name: str, context: str = ""):
+    """Resolve a name against this team's entity registry (name-resolution lane).
+
+    Looks a name up in the team's registry of known people/projects and their
+    aliases — the lane that answers "is 'Max' the person Maxwell?" — distinct
+    from the knowledge graph (facts/relationships) and team critical-facts
+    (must-know lines). Resolution is local and offline: it consults only the
+    seeded registry and NEVER performs a network/Wikipedia lookup. When the name
+    is unseeded it returns a graceful not-found result rather than raising.
+    Central server only: on a local install there is no team, so this reports the
+    feature as unavailable.
+    """
+    if _config.backend == "chroma":
+        return {"available": False, "backend": "chroma", "reason": _ENTITY_REGISTRY_CHROMA_REASON}
+    from .entity_registry import get_entity_registry
+
+    team = _resolve_team_strict()
+    registry = get_entity_registry(_config, team=team)
+    # lookup() is registry-only — it never calls research()/_wikipedia_lookup and
+    # never threads allow_network. Keep it that way: do NOT add a network path.
+    result = registry.lookup(name, context=context)
+    if result.get("type") == "unknown":
+        return {
+            "backend": _config.backend,
+            "vault": team,
+            "found": False,
+            "name": name,
+            "type": "unknown",
+            "needs_disambiguation": False,
+        }
+    resolved = dict(result)
+    # Resolve to the canonical name when the matched person is an alias entry. The
+    # registry keys people by every name (canonical AND alias) and lookup() returns
+    # the matched key; the alias record carries the canonical it points to. Prefer
+    # it so an alias always resolves to its canonical, independent of which key the
+    # backend happened to iterate first (jsonb does not preserve key order).
+    if resolved.get("type") == "person":
+        record = registry.people.get(resolved.get("name"), {})
+        canonical = record.get("canonical")
+        if canonical:
+            resolved["name"] = canonical
+            resolved["alias_of"] = canonical
+    return {
+        "backend": _config.backend,
+        "vault": team,
+        "found": True,
+        "ambiguous": name.lower() in registry.ambiguous_flags,
+        **resolved,
+    }
+
+
+def _merge_seed_into_registry(
+    registry, people: list, projects: list, aliases: dict, mode: str = "personal"
+):
+    """Additively merge name-resolution data into an opened registry, then save.
+
+    EntityRegistry.seed() is REPLACE semantics (it overwrites projects wholesale
+    and clobbers a person's accumulated contexts/aliases). This helper is the
+    READ-MERGE-WRITE counterpart: it unions new projects into the existing list
+    (no dupes, prior preserved) and merges each person's ``contexts`` and
+    ``aliases`` lists additively, so re-seeding never drops previously-seeded
+    data. Identical re-seeds are idempotent (no growth, no dupes).
+    """
+    from .entity_registry import COMMON_ENGLISH_WORDS
+
+    data = registry._data
+    people_store = data.setdefault("people", {})
+    # Set mode only on first seed (empty registry: no people and no projects yet).
+    # A later seed must not overwrite a mode already committed to this vault.
+    if not data.get("people") and not data.get("projects"):
+        data["mode"] = mode or "personal"
+
+    # Projects: union, preserving order and prior entries.
+    existing_projects = data.setdefault("projects", [])
+    for proj in projects or []:
+        if proj not in existing_projects:
+            existing_projects.append(proj)
+
+    aliases = aliases or {}
+    reverse_aliases = {v: k for k, v in aliases.items()}  # canonical → alias
+
+    def _add_to(record: dict, field: str, value):
+        items = record.setdefault(field, [])
+        if value and value not in items:
+            items.append(value)
+
+    for entry in people or []:
+        name = (entry.get("name") or "").strip()
+        if not name:
+            continue
+        context = entry.get("context", "personal")
+        relationship = entry.get("relationship", "")
+        record = people_store.get(name)
+        if record is None:
+            record = {
+                "source": "onboarding",
+                "contexts": [],
+                "aliases": [],
+                "relationship": relationship,
+                "confidence": 1.0,
+            }
+            people_store[name] = record
+        elif relationship:
+            record["relationship"] = relationship
+        _add_to(record, "contexts", context)
+        if name in reverse_aliases:
+            _add_to(record, "aliases", reverse_aliases[name])
+
+    # Register the alias entries themselves (alias → canonical), additively.
+    for alias, canonical in aliases.items():
+        record = people_store.get(alias)
+        if record is None:
+            record = {
+                "source": "onboarding",
+                "contexts": [],
+                "aliases": [],
+                "relationship": people_store.get(canonical, {}).get("relationship", ""),
+                "confidence": 1.0,
+                "canonical": canonical,
+            }
+            people_store[alias] = record
+        else:
+            record.setdefault("canonical", canonical)
+        _add_to(record, "aliases", canonical)
+        for ctx in people_store.get(canonical, {}).get("contexts", ["personal"]):
+            _add_to(record, "contexts", ctx)
+
+    # Re-flag ambiguous names (also common English words), additively.
+    flags = data.setdefault("ambiguous_flags", [])
+    for name in people_store:
+        if name.lower() in COMMON_ENGLISH_WORDS and name.lower() not in flags:
+            flags.append(name.lower())
+
+    registry.save()
+
+
+def tool_entity_seed(
+    mode: str = "personal", people: list = None, projects: list = None, aliases: dict = None
+):
+    """Seed this team's entity name-resolution registry (read-merge-write).
+
+    Writes name-resolution data only — known people, projects, and aliases — into
+    the team's registry, the lane mempalace_disambiguate reads. It does NOT write
+    knowledge-graph triples (mempalace_kg_add) or team critical-facts
+    (mempalace_team_fact_add). Semantics are ADDITIVE read-merge-write: existing
+    projects, per-person contexts, and aliases are preserved and new ones added,
+    so re-seeding never clobbers previously-seeded data. RAISES with no resolvable
+    team (a team-less write must never leak into a shared vault). Central server
+    only: on a local install there is no team, so this reports the feature as
+    unavailable.
+    """
+    if _config.backend == "chroma":
+        return {"available": False, "backend": "chroma", "reason": _ENTITY_REGISTRY_CHROMA_REASON}
+    from .entity_registry import get_entity_registry
+    from .link_store import require_write_team
+
+    # Resolve the team FIRST so a team-less write fails loud (the team_fact_add
+    # pattern): no team means no vault to write to, so refuse rather than leak.
+    team = require_write_team(_resolve_team_strict())
+    registry = get_entity_registry(_config, team=team)
+    _merge_seed_into_registry(registry, people or [], projects or [], aliases or {}, mode=mode)
+    return {
+        "backend": _config.backend,
+        "vault": team,
+        "people": len(registry.people),
+        "projects": len(registry.projects),
+    }
+
+
 def tool_check_duplicate(content: str, threshold: float = 0.9):
     _refresh_vector_disabled_flag()
     if _vector_disabled:
@@ -3485,6 +3667,52 @@ TOOLS = {
             "required": [],
         },
         "handler": tool_team_facts,
+    },
+    "mempalace_disambiguate": {
+        "description": "Resolve a name against this team's entity registry (name-resolution lane): is 'Max' the person Maxwell? Consults only the team's seeded registry of known people/projects/aliases — local and offline, never a network/Wikipedia lookup — and is distinct from the knowledge graph (facts) and team critical-facts (must-know lines). Returns found: false (not an error) for an unseeded name. Central server (postgres) only; on a local install it reports available: false.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The name/word to resolve to a canonical person or project.",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Optional surrounding sentence used to disambiguate a name that is also a common word.",
+                },
+            },
+            "required": ["name"],
+        },
+        "handler": tool_disambiguate,
+    },
+    "mempalace_entity_seed": {
+        "description": "Seed this team's entity name-resolution registry (the lane mempalace_disambiguate reads): known people, projects, and aliases. Writes name-resolution data ONLY — never knowledge-graph triples or team critical-facts. Read-merge-write (non-clobbering): existing projects/contexts/aliases are preserved and new ones added, so re-seeding never drops prior data. RAISES with no resolvable team (a team-less write must not leak across teams). Central server (postgres) only; on a local install it reports available: false.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "description": "Registry mode label (default 'personal'). Only set on first seed.",
+                },
+                "people": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "People to register: list of {name, relationship, context} dicts.",
+                },
+                "projects": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Project names to register.",
+                },
+                "aliases": {
+                    "type": "object",
+                    "description": "Alias map {alias: canonical}, e.g. {'Max': 'Maxwell'}.",
+                },
+            },
+            "required": [],
+        },
+        "handler": tool_entity_seed,
     },
     "mempalace_check_duplicate": {
         "description": "Check if content already exists in the palace before filing",
