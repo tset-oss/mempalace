@@ -475,6 +475,44 @@ know about X".
 
 ---
 
+### `mempalace_disambiguate`
+
+*Central HTTP server only (`postgres` backend).* Resolve a surface form against this team's entity name-resolution registry — the lane that answers "is 'Max' the person Maxwell?" Resolution consults only the seeded registry of known people, projects, and aliases. It is local and offline: it never performs a network or Wikipedia lookup. Distinct from the knowledge graph (facts and relationships) and from team critical-facts (must-know lines).
+
+Returns `found: false` (not an error) for an unseeded name. Returns an `ambiguous` flag when the name is marked as ambiguous in the registry. On a local (`chroma`) install there is no team vault, so the tool reports `available: false`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | **Yes** | The name or word to resolve to a canonical person or project |
+| `context` | string | No | Surrounding sentence used to disambiguate a name that is also a common word |
+
+**Returns (found):** `{ backend, vault, found: true, ambiguous, name, type, ... }` where `name` is the canonical form and `type` is `"person"` or `"project"`.
+
+**Returns (not found):** `{ backend, vault, found: false, name, type: "unknown", needs_disambiguation: false }`
+
+**Returns (local install):** `{ available: false, backend: "chroma", reason }`
+
+---
+
+### `mempalace_entity_seed`
+
+*Central HTTP server only (`postgres` backend).* Populate this team's entity name-resolution registry with known people, projects, and aliases — the registry that `mempalace_disambiguate` reads. Writes name-resolution data **only**: it does not write knowledge-graph triples (`mempalace_kg_add`) or team critical-facts (`mempalace_team_fact_add`).
+
+Semantics are **read-merge-write (additive, non-clobbering)**: existing projects, per-person contexts, and aliases are preserved and new data is unioned in, so re-seeding is safe and idempotent — it never drops prior entries. RAISES with no resolvable team (a team-less write must not leak into a shared vault). On a local (`chroma`) install the tool reports `available: false`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `mode` | string | No | Registry mode label (default `"personal"`). Set only on first seed; ignored on subsequent re-seeds of an existing registry |
+| `people` | array of object | No | People to register: list of `{ name, relationship, context }` dicts |
+| `projects` | array of string | No | Project names to register |
+| `aliases` | object | No | Alias map `{ alias: canonical }`, e.g. `{ "Max": "Maxwell" }` |
+
+**Returns:** `{ backend, vault, people, projects }` where `people` and `projects` are the post-merge counts.
+
+**Returns (local install):** `{ available: false, backend: "chroma", reason }`
+
+---
+
 ### `mempalace_team_fact_add`
 
 *Central HTTP server only (`postgres` backend).* Record a critical fact every
