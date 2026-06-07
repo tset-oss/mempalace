@@ -79,6 +79,7 @@ from .palace_graph import (  # noqa: E402
     traverse,
     find_tunnels,
     graph_stats,
+    invalidate_graph_cache,
 )
 
 from .knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
@@ -2364,6 +2365,16 @@ def tool_add_drawer(
             _enqueue_closet_rebuild(add_team, source_file, wing, room)
             # Best-effort server-side derived-link rebuild (server mode); never fails the write.
             _enqueue_derived_link_rebuild(add_team, wing)
+            # Evict ONLY this vault's stale graph-cache entry so graph_stats /
+            # traverse reflect the new drawer within the same request instead of
+            # serving the pre-write graph for up to the TTL. ``col`` is the same
+            # collection just written, so its key matches the read path's; never
+            # pass col=None here (that would clear every team's warm cache).
+            # Best-effort: a cache miss must not fail an acknowledged write.
+            try:
+                invalidate_graph_cache(col=col, config=_config)
+            except Exception:
+                logger.debug("graph-cache invalidation failed (best-effort)", exc_info=True)
             logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
             return {
                 "success": True,
@@ -2409,6 +2420,12 @@ def tool_add_drawer(
         _enqueue_closet_rebuild(add_team, source_file, wing, room)
         # Best-effort server-side derived-link rebuild (server mode); never fails the write.
         _enqueue_derived_link_rebuild(add_team, wing)
+        # Evict ONLY this vault's stale graph-cache entry (see single-doc path).
+        # Best-effort: a cache miss must not fail an acknowledged write.
+        try:
+            invalidate_graph_cache(col=col, config=_config)
+        except Exception:
+            logger.debug("graph-cache invalidation failed (best-effort)", exc_info=True)
         logger.info(f"Filed drawer: {drawer_id} → {wing}/{room} ({len(chunk_ids)} chunks)")
         return {
             "success": True,
@@ -2458,6 +2475,16 @@ def tool_delete_drawer(drawer_id: str):
         del_wing = deleted_meta.get("wing") if isinstance(deleted_meta, dict) else None
         if del_team and del_wing:
             _enqueue_derived_link_rebuild(del_team, del_wing)
+        # Evict ONLY this vault's stale graph-cache entry so graph_stats /
+        # traverse drop the removed drawer's room/wing within the same request.
+        # ``col`` is the same collection just deleted from (resolved via
+        # _get_collection() for this request's team), so its key matches the
+        # read path's; never pass col=None. Best-effort: must not fail the
+        # acknowledged delete.
+        try:
+            invalidate_graph_cache(col=col, config=_config)
+        except Exception:
+            logger.debug("graph-cache invalidation failed (best-effort)", exc_info=True)
         logger.info(f"Deleted drawer: {drawer_id}")
         return {"success": True, "drawer_id": drawer_id}
     except Exception as e:
@@ -2682,6 +2709,16 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             for w in {new_wing, old_wing}:
                 if w:
                     _enqueue_derived_link_rebuild(upd_team, w)
+
+        # Evict ONLY this vault's stale graph-cache entry so graph_stats /
+        # traverse reflect a wing/room move within the same request. ``col`` is
+        # the same collection just updated (resolved via _get_collection() for
+        # this request's team), so its key matches the read path's; never pass
+        # col=None. Best-effort: must not fail the acknowledged update.
+        try:
+            invalidate_graph_cache(col=col, config=_config)
+        except Exception:
+            logger.debug("graph-cache invalidation failed (best-effort)", exc_info=True)
 
         logger.info(f"Updated drawer: {drawer_id}")
         return {
@@ -2958,6 +2995,14 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             # tag is a wing topic, so it drives cross-wing topic tunnels the same
             # way an add_drawer topics label does. Never fails the diary write.
             _index_wing_topics(diary_team, wing, [topic])
+            # Evict ONLY this vault's stale graph-cache entry so graph_stats /
+            # traverse see the new diary room/wing within the same request.
+            # ``col`` is the same collection just written; never pass col=None.
+            # Best-effort: must not fail the acknowledged diary write.
+            try:
+                invalidate_graph_cache(col=col, config=_config)
+            except Exception:
+                logger.debug("graph-cache invalidation failed (best-effort)", exc_info=True)
             logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic}")
             return {
                 "success": True,
@@ -3010,6 +3055,12 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         _index_drawer_entities(diary_team, list(zip(chunk_ids, chunk_docs)), wing, room)
         # Best-effort per-vault topic label (server mode); never fails the write.
         _index_wing_topics(diary_team, wing, [topic])
+        # Evict ONLY this vault's stale graph-cache entry (see single-doc path).
+        # Best-effort: must not fail the acknowledged diary write.
+        try:
+            invalidate_graph_cache(col=col, config=_config)
+        except Exception:
+            logger.debug("graph-cache invalidation failed (best-effort)", exc_info=True)
         logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic} ({len(chunk_ids)} chunks)")
         return {
             "success": True,
