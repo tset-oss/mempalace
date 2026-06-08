@@ -67,14 +67,16 @@ Semantic search. Returns verbatim drawer content with similarity scores.
 
 ### `mempalace_check_duplicate`
 
-Check if content already exists in the palace before filing.
+Advisory near-duplicate pre-check before filing — a best-effort similarity query, **not** a guard. Do not treat `is_duplicate: false` as proof that filing is safe; the authoritative protection against exact re-files is `mempalace_add_drawer`'s content-hash idempotency (identical wing/room/content returns `reason: "already_exists"` and creates no second row).
+
+On the central (`postgres`) backend, a team vault that has had no writes yet returns `{ is_duplicate: false, empty_vault: true, vault, reason }` — there is simply nothing to compare against — rather than a "no palace" error.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `content` | string | **Yes** | Content to check |
 | `threshold` | number | No | Similarity threshold 0–1 (default: 0.85–0.87) |
 
-**Returns:** `{ is_duplicate, matches: [{ id, wing, room, similarity, content }] }`
+**Returns:** `{ is_duplicate, matches: [{ id, wing, room, similarity, content }] }`. Situational keys may also appear: `empty_vault` / `vault` / `reason` (empty central vault) or `vector_disabled` (no usable vector index). Always read `is_duplicate` and `matches`; treat the rest as optional.
 
 ---
 
@@ -503,9 +505,11 @@ Semantics are **read-merge-write (additive, non-clobbering)**: existing projects
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `mode` | string | No | Registry mode label (default `"personal"`). Set only on first seed; ignored on subsequent re-seeds of an existing registry |
-| `people` | array of object | No | People to register: list of `{ name, relationship, context }` dicts |
-| `projects` | array of string | No | Project names to register |
-| `aliases` | object | No | Alias map `{ alias: canonical }`, e.g. `{ "Max": "Maxwell" }` |
+| `people` | array of object | No | People to register: list of `{ name, relationship, context, aliases }` dicts. The optional per-person `aliases` is a list of alias strings for that person, e.g. `{ "name": "Markus Burger", "aliases": ["MB"] }` — each is registered exactly as if it appeared in the top-level `aliases` map pointing at that person |
+| `projects` | array of string | No | Project names to register. A `{ "name": "..." }` dict is also accepted and coerced to its name |
+| `aliases` | object | No | Alias map in the single fixed direction `{ alias: canonical }` — the key is the alias, the value is the canonical name it resolves to, e.g. `{ "MB": "Markus Burger" }` means `MB` → `Markus Burger`. There is no `{ canonical: [aliases] }` form |
+
+Every alias (key, value, or embedded per-person entry) and every project entry must be a **non-empty string**; a malformed shape RAISES rather than being silently dropped.
 
 **Returns:** `{ backend, vault, people, projects }` where `people` and `projects` are the post-merge counts.
 
