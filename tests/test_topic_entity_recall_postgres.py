@@ -373,3 +373,84 @@ def test_is_topic_alter_is_idempotent(monkeypatch):
     finally:
         get_backend("postgres")._embedder = None
         _drop(team)
+
+
+def test_update_drawer_preserves_topic_recall(monkeypatch):
+    """Editing a topic-tagged drawer must NOT drop its entity= recall: update_drawer
+    re-derives extracted entities from new content but re-stamps the captured topic
+    labels, so a topics= label stays findable across a content/wing/room edit."""
+    mcp = _setup(monkeypatch, "t" + uuid.uuid4().hex[:10])
+    team = mcp._resolve_team(None)
+    try:
+        add = mcp.tool_add_drawer(
+            wing="ops", room="r1", content="Short renovate note.", topics=["infra.eden"]
+        )
+        assert add.get("success") is True
+        assert mcp._get_entity_index(team).drawers_for_entity("infra.eden"), "precondition"
+
+        # Edit the content AND move the drawer to a new wing — the label is NOT
+        # present in the new text either. The preserved topic row must follow the
+        # drawer to the new wing.
+        upd = mcp.tool_update_drawer(
+            add["drawer_id"],
+            content="Edited note about the rollout, no label in text.",
+            wing="archive",
+        )
+        assert upd.get("success") is True, upd
+
+        rows = mcp._get_entity_index(team).drawers_for_entity("infra.eden")
+        assert len(rows) >= 1, f"topic recall lost on update: {rows}"
+        new_wing = mcp.tool_get_drawer(add["drawer_id"])["wing"]
+        assert all(r["wing"] == new_wing for r in rows), (rows, new_wing)
+        found = mcp.tool_search("rollout", entity="infra.eden")
+        assert found.get("results"), found
+    finally:
+        get_backend("postgres")._embedder = None
+        _drop(team)
+
+
+def test_topic_labels_for_parent_captures_chunk_rows(monkeypatch):
+    """topic_labels_for_parent must capture topic rows keyed on a chunked drawer's
+    physical chunk ids ({id}_chunk_*), not just the bare id — this is the row set
+    update_drawer preserves. Pinned directly since update_drawer can't target a
+    chunked logical id (it reports not-found before re-indexing)."""
+    mcp = _setup(monkeypatch, "t" + uuid.uuid4().hex[:10])
+    team = mcp._resolve_team(None)
+    try:
+        big = "The renovate operator rollout note. " * 60  # > chunk_size -> chunked
+        add = mcp.tool_add_drawer(wing="ops", room="r1", content=big, topics=["infra.eden"])
+        assert add.get("chunks", 1) > 1, add
+        # Another drawer's topic must NOT bleed into this parent's capture.
+        mcp.tool_add_drawer(wing="ops", room="r2", content="unrelated", topics=["other-theme"])
+
+        labels = mcp._get_entity_index(team).topic_labels_for_parent(add["drawer_id"])
+        assert "infra.eden" in labels, labels  # captured via the {id}_chunk_* pattern
+        assert "other-theme" not in labels, labels  # scoped to this parent only
+    finally:
+        get_backend("postgres")._embedder = None
+        _drop(team)
+
+
+def test_top_entities_excludes_topic_rows(monkeypatch):
+    """The top_entities overview reflects organically-extracted entities only — a
+    recall-only topic label (stamped on every chunk) must not rank there — while it
+    stays findable via drawers_for_entity (recall is unaffected)."""
+    mcp = _setup(monkeypatch, "t" + uuid.uuid4().hex[:10])
+    team = mcp._resolve_team(None)
+    try:
+        # 'Dana' organically mentioned >=2x (extracted, is_topic=false);
+        # 'secret-theme' supplied only as a topic label (is_topic=true).
+        mcp.tool_add_drawer(
+            wing="proj",
+            room="r1",
+            content="Dana shipped it. Dana confirmed. Dana again.",
+            topics=["secret-theme"],
+        )
+        names = [e["entity"] for e in mcp._get_entity_index(team).top_entities()]
+        assert "Dana" in names, names  # organic entity present
+        assert "secret-theme" not in names, names  # topic excluded from overview
+        # ...but the topic label is still recallable.
+        assert mcp._get_entity_index(team).drawers_for_entity("secret-theme"), "recall lost"
+    finally:
+        get_backend("postgres")._embedder = None
+        _drop(team)

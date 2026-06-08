@@ -33,6 +33,19 @@ from .backends.postgres import _qi, team_schema
 _KNOWN_TTL_SECONDS = 30.0
 
 
+def _parent_match_params(parent_id: str) -> tuple[str, str]:
+    """Return ``(exact_id, chunk_like_pattern)`` matching a drawer's bare id PLUS
+    its ``{id}_chunk_NNNNNN`` rows, for ``WHERE drawer_id = %s OR drawer_id LIKE %s``.
+
+    Shared by ``delete_by_parent`` (purge) and ``topic_labels_for_parent`` (capture)
+    so the two ALWAYS target the identical row set — if the LIKE-escaping ever drifts
+    between them, topic-recall rows would be captured-but-not-purged or vice versa.
+    LIKE wildcards in the id are escaped so a literal ``%``/``_`` matches literally.
+    """
+    escaped = parent_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return parent_id, f"{escaped}\\_chunk\\_%"
+
+
 class PostgresEntityIndex:
     """Entity -> drawer occurrence index stored in a team vault's schema."""
 
@@ -155,16 +168,12 @@ class PostgresEntityIndex:
         """
         if not parent_id:
             return
-        # Escape LIKE wildcards in the id so a literal '%' / '_' in a drawer id
-        # is matched literally, then append the chunk-id suffix pattern.
-        escaped = parent_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        chunk_pattern = f"{escaped}\\_chunk\\_%"
         self._ensure()
         with self._backend._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"DELETE FROM {self._table()} WHERE drawer_id = %s OR drawer_id LIKE %s",
-                    (parent_id, chunk_pattern),
+                    _parent_match_params(parent_id),
                 )
         self._invalidate_known()
 
@@ -215,17 +224,46 @@ class PostgresEntityIndex:
                 )
                 return [{"drawer_id": r[0], "wing": r[1], "room": r[2]} for r in cur.fetchall()]
 
+    def topic_labels_for_parent(self, parent_id: str) -> list[str]:
+        """Distinct caller-topic labels (``is_topic=true`` rows) for a drawer and
+        its chunks (bare ``parent_id`` plus ``{parent_id}_chunk_*``).
+
+        ``update_drawer`` uses this to PRESERVE topic-based recall across a
+        re-index: an edit re-derives extracted entities from the new content but
+        cannot recover the caller's topic labels (they live only here and in
+        ``wing_topics``), so they would otherwise be dropped by the delete+re-index.
+        """
+        if not parent_id:
+            return []
+        self._ensure()
+        with self._backend._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT DISTINCT entity FROM {self._table()} "
+                    "WHERE is_topic = true AND (drawer_id = %s OR drawer_id LIKE %s)",
+                    _parent_match_params(parent_id),
+                )
+                return [r[0] for r in cur.fetchall() if r[0]]
+
     def top_entities(
         self, wing: Optional[str] = None, min_count: int = 1, limit: int = 100
     ) -> list[dict]:
-        """Most-mentioned entities in the vault (optionally scoped to a wing)."""
+        """Most-mentioned entities in the vault (optionally scoped to a wing).
+
+        Excludes recall-only topic-label rows (``is_topic=true``): a caller topic
+        is stamped on every chunk of a drawer, so counting it here would let a
+        single tagged drawer dominate the "most-mentioned" overview by its chunk
+        count. Topic labels remain findable via ``drawers_for_entity`` /
+        ``entity=``; this surface reflects organically-extracted entities. The
+        ``_ensure`` above guarantees the column exists (this index owns it).
+        """
         self._ensure()
-        clauses = []
+        clauses = ["is_topic = false"]
         params: list = []
         if wing:
             clauses.append("wing = %s")
             params.append(wing)
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        where = " WHERE " + " AND ".join(clauses)
         params.extend([max(1, int(min_count)), max(1, int(limit))])
         with self._backend._conn() as conn:
             with conn.cursor() as cur:

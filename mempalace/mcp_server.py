@@ -2894,8 +2894,20 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         # written, leaving no orphans regardless of the prior chunk count.
         if _config.backend != "chroma":
             upd_team = _resolve_team()
+            idx = _get_entity_index(upd_team)
+            # Capture the drawer's caller-topic labels BEFORE the purge: the
+            # re-index re-derives extracted entities from the new content but
+            # cannot recover topics (they live only in the entity index + the
+            # wing-topic substrate), so without this an edit would silently drop
+            # the drawer's entity= recall tags. Re-stamped below with the NEW
+            # wing/room. Best-effort: never fails the acknowledged update.
             try:
-                _get_entity_index(upd_team).delete_by_parent(drawer_id)
+                preserved_topics = idx.topic_labels_for_parent(drawer_id)
+            except Exception:
+                logger.debug("topic-label capture failed (best-effort)", exc_info=True)
+                preserved_topics = []
+            try:
+                idx.delete_by_parent(drawer_id)
             except Exception:
                 logger.debug("entity index parent-delete failed (best-effort)", exc_info=True)
             _index_drawer_entities(
@@ -2903,6 +2915,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 [(drawer_id, new_doc)],
                 new_meta.get("wing"),
                 new_meta.get("room"),
+                topic_labels=preserved_topics,
             )
             # Best-effort server-side derived-link rebuild for the new wing AND
             # the prior wing when the update moved the drawer (a wing change
