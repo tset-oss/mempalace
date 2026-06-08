@@ -567,6 +567,83 @@ def test_entity_metadata_matches_known_names_case_insensitively(monkeypatch):
     assert "Lumi" in matched_mixed
 
 
+def _extracted_set(content: str, known=frozenset()) -> set:
+    """Run the shared per-drawer extractor and return its entity set.
+
+    Defaults to an EMPTY known-entity set so these tests exercise the regex /
+    capitalization path in isolation — hermetic from whatever
+    ``~/.mempalace/known_entities.json`` happens to hold on the dev machine
+    (otherwise a token already in that registry would pass even if the pattern
+    were broken).
+    """
+    from mempalace.miner import _extract_entities_for_metadata
+
+    result = _extract_entities_for_metadata(content, known=known)
+    return {e for e in result.split(";") if e}
+
+
+def test_entity_metadata_captures_lowercase_dotted_identifier():
+    """Lowercase namespaced identifiers like ``infra.eden`` must be tagged.
+
+    The capitalization-gated candidate pattern only matches uppercase-initial
+    tokens, so an ``entity="infra.eden"`` lookup used to return nothing. The
+    additive dotted-identifier pattern fills that gap (≥2 occurrences, mirroring
+    the existing frequency gate).
+    """
+    content = "We deployed infra.eden today. Then infra.eden crashed overnight."
+    assert "infra.eden" in _extracted_set(content)
+
+    # Multi-segment identifiers are captured whole, not split on the dots.
+    content2 = "The foo.bar.baz module broke. Restarting foo.bar.baz fixed it."
+    assert "foo.bar.baz" in _extracted_set(content2)
+
+
+def test_entity_metadata_drops_status_noise_word():
+    """ "In Progress" must not leak the capitalized status word "Progress".
+
+    The capitalization gate captures "Progress" as a candidate; the status-noise
+    filter drops it so workflow words never masquerade as entities.
+    """
+    content = "Work is In Progress. Still In Progress, nothing else changed."
+    assert "Progress" not in _extracted_set(content)
+
+
+def test_entity_metadata_dotted_id_precision_no_false_positives():
+    """Abbreviations, versions, and titles must NOT yield dotted-id entities.
+
+    Single-letter segments (e.g./i.e./etc.), digit-initial segments (1.2.3),
+    and "Mr. Smith" (space after the dot) must never produce a dotted-id false
+    entity. Each phrase is repeated so it clears the ≥2 occurrence gate — if the
+    pattern were over-greedy, the false entity would appear.
+    """
+    for phrase in ("e.g.", "i.e.", "etc."):
+        text = f"See {phrase} the first case and {phrase} the second case."
+        got = _extracted_set(text)
+        assert not any("." in e for e in got), (
+            f"{phrase!r} produced a dotted-id false entity: {got!r}"
+        )
+
+    version_text = "Release 1.2.3 shipped. Then build 1.2.3 shipped again."
+    assert "1.2.3" not in _extracted_set(version_text)
+
+    title_text = "Hello Mr. Smith and goodbye Mr. Smith once more."
+    # "Mr. Smith" must not collapse into a dotted identifier ("Mr.Smith").
+    assert not any("." in e for e in _extracted_set(title_text))
+
+
+def test_entity_metadata_dotted_id_respects_frequency_gate():
+    """A dotted id is captured only at >=2 occurrences — the same frequency gate
+    capitalized entities already use. A single mention is intentionally not
+    tagged, so a one-off ``self.data`` in a code snippet does not pollute the
+    entity space; this is a documented, consistent limitation.
+    """
+    single = "We touched infra.eden exactly once and then moved on entirely."
+    assert "infra.eden" not in _extracted_set(single)
+
+    double = "We touched infra.eden once. Later infra.eden needed a restart."
+    assert "infra.eden" in _extracted_set(double)
+
+
 def test_file_already_mined_check_mtime():
     tmpdir = tempfile.mkdtemp()
     try:

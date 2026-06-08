@@ -576,6 +576,31 @@ _ENTITY_REGISTRY_CACHE: dict = {"mtime": None, "names": frozenset(), "raw": {}}
 _ENTITY_EXTRACT_WINDOW = 5000  # chars of content scanned for capitalized words
 _ENTITY_METADATA_LIMIT = 25  # max entities packed into the metadata field
 
+# Lowercase namespaced dotted identifier (e.g. ``infra.eden``, ``foo.bar.baz``,
+# ``config.py``). The capitalization-gated candidate pattern in the locale data
+# only matches uppercase-initial tokens, so these never get captured and an
+# ``entity="infra.eden"`` lookup returns nothing. This ADDITIVE pattern fills
+# that gap. Each dot-joined segment is a letter-initial token of length >= 2, so
+# it deliberately does NOT match ``e.g.`` / ``i.e.`` / ``etc.`` (single-letter
+# segments), ``1.2.3`` (digit-initial), or ``word. Word`` (space after the dot).
+_DOTTED_IDENTIFIER_RE = re.compile(r"\b[a-z][a-z0-9_]+(?:\.[a-z][a-z0-9_]+)+\b")
+
+# Status / workflow noise words that are NOT entities but slip past the
+# capitalization gate when they head a phrase ("In Progress" -> "Progress").
+# Kept deliberately tiny — only unambiguous workflow markers that are essentially
+# never standalone entity names. Status words that COULD be a real service/project
+# name (e.g. "Backlog", "Pending", "Blocked") are intentionally EXCLUDED to avoid
+# silently dropping a legitimately-named entity. Matched lowercased, so casing in
+# the source is irrelevant. ``done`` / ``review`` are already covered by the COCA
+# filter.
+_ENTITY_STATUS_NOISE = frozenset(
+    {
+        "progress",
+        "todo",
+        "wip",
+    }
+)
+
 
 def _refresh_known_entities_cache() -> None:
     """Reload ``~/.mempalace/known_entities.json`` into the module cache if
@@ -954,6 +979,15 @@ def _extract_entities_for_metadata(content: str, known=None) -> str:
         # metadata so they don't poison hallways/tunnels/search.
         if w.lower() in coca_filter:
             continue
+        # Status / workflow noise ("Progress" from "In Progress", "Todo",
+        # "WIP", …) is never a real entity. Drop it before it can be tagged.
+        if w.lower() in _ENTITY_STATUS_NOISE:
+            continue
+        freq[w] = freq.get(w, 0) + 1
+    # Additive lowercase namespaced identifiers ("infra.eden", "foo.bar.baz")
+    # that the capitalization-gated candidate pattern misses. Counted into the
+    # same freq dict so they inherit the ≥2 occurrence gate below.
+    for w in _DOTTED_IDENTIFIER_RE.findall(working_window):
         freq[w] = freq.get(w, 0) + 1
     for w, c in freq.items():
         if c >= 2 and len(w) > 2:
