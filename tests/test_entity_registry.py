@@ -651,3 +651,65 @@ def test_seed_dict_project_survives_save_reload(tmp_path):
     assert reloaded.projects == ["infra.eden"]
     assert all(isinstance(p, str) for p in reloaded.projects)
     assert reloaded.lookup("infra.eden")["type"] == "project"
+
+
+# ── _merge_seed_into_registry embedded-alias handling ───────────────────
+
+
+def test_merge_seed_embedded_alias_resolves_to_canonical(tmp_path):
+    # An alias embedded on a person entry must register exactly like a
+    # standalone {alias: canonical} entry: lookup(alias) resolves to a person
+    # and the alias record points to the canonical name.
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    _merge_seed_into_registry(registry, [{"name": "Markus Burger", "aliases": ["MB"]}], [], {})
+    assert registry.people["MB"].get("canonical") == "Markus Burger"
+    result = registry.lookup("MB")
+    assert result["type"] == "person"
+
+
+def test_merge_seed_embedded_alias_is_idempotent(tmp_path):
+    # Re-running the identical embedded-alias merge must not duplicate "MB" in
+    # the person's own aliases list (additive de-dup).
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    seed = [{"name": "Markus Burger", "aliases": ["MB"]}]
+    _merge_seed_into_registry(registry, seed, [], {})
+    _merge_seed_into_registry(registry, seed, [], {})
+    assert registry.people["Markus Burger"]["aliases"].count("MB") == 1
+
+
+def test_merge_seed_embedded_alias_does_not_clobber_prior(tmp_path):
+    # Seeding a second alias for the same person must keep the first one too.
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    _merge_seed_into_registry(registry, [{"name": "X", "aliases": ["A"]}], [], {})
+    _merge_seed_into_registry(registry, [{"name": "X", "aliases": ["B"]}], [], {})
+    aliases = registry.people["X"]["aliases"]
+    assert "A" in aliases
+    assert "B" in aliases
+
+
+def test_merge_seed_standalone_alias_direction_unchanged(tmp_path):
+    # The {alias: canonical} param direction is preserved: lookup("MB")
+    # resolves to Markus Burger, same as before embedded aliases existed.
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    _merge_seed_into_registry(registry, [{"name": "Markus Burger"}], [], {"MB": "Markus Burger"})
+    assert registry.people["MB"].get("canonical") == "Markus Burger"
+    assert registry.lookup("MB")["type"] == "person"
+
+
+def test_merge_seed_rejects_non_str_embedded_alias(tmp_path):
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    with pytest.raises(ValueError):
+        _merge_seed_into_registry(registry, [{"name": "X", "aliases": [{"x": 1}]}], [], {})
+
+
+def test_merge_seed_rejects_empty_embedded_alias(tmp_path):
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    with pytest.raises(ValueError):
+        _merge_seed_into_registry(registry, [{"name": "X", "aliases": [""]}], [], {})
+
+
+def test_merge_seed_rejects_non_str_standalone_alias_value(tmp_path):
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    with pytest.raises(ValueError) as exc:
+        _merge_seed_into_registry(registry, [], [], {"MB": 7})
+    assert "7" in str(exc.value)

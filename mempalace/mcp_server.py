@@ -1971,13 +1971,39 @@ def _merge_seed_into_registry(
         if name not in existing_projects:
             existing_projects.append(name)
 
-    aliases = aliases or {}
-    # NOTE: alias keys/values are not yet type-validated here, so a caller
-    # passing a non-str alias (e.g. {"Max": 7}) could persist a non-str into a
-    # person's aliases list — the same read-time .lower() hazard the project
-    # coercion above seals. Read-side hardening tolerates it; write-side
-    # validation of alias values is handled where alias semantics are revised.
-    reverse_aliases = {v: k for k, v in aliases.items()}  # canonical → alias
+    def _require_alias_str(value, label: str) -> str:
+        # Alias keys/values feed a read-time .lower(), so a non-str (or empty)
+        # alias would poison the registry the way an unrecoverable project shape
+        # would. Fail loud on write — same contract as project coercion — rather
+        # than persist a token the read path can only tolerate, never resolve.
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"entity_seed: {label} must be a non-empty str, got {value!r}")
+        return value
+
+    # Build a single {alias: canonical} map driving one registration pass. The
+    # standalone ``aliases`` param is {alias: canonical}; embedded per-person
+    # aliases ({"name": ..., "aliases": [...]}) fold into the SAME map so both
+    # produce identical alias records — no divergent second code path.
+    alias_map: dict[str, str] = {}
+    for alias, canonical in (aliases or {}).items():
+        _require_alias_str(alias, "alias key")
+        _require_alias_str(canonical, "alias value")
+        alias_map[alias] = canonical
+    for entry in people or []:
+        if not isinstance(entry, dict):
+            raise ValueError(f"entity_seed: person entry must be a dict, got {entry!r}")
+        name = (entry.get("name") or "").strip()
+        if not name:
+            continue
+        for alias in entry.get("aliases", []) or []:
+            _require_alias_str(alias, "embedded person alias")
+            alias_map[alias] = name
+
+    # canonical → [aliases]; additively records EVERY alias on the person, not
+    # just one (a plain reverse-map would collapse multiple aliases to one).
+    canonical_to_aliases: dict[str, list[str]] = {}
+    for alias, canonical in alias_map.items():
+        canonical_to_aliases.setdefault(canonical, []).append(alias)
 
     def _add_to(record: dict, field: str, value):
         items = record.setdefault(field, [])
@@ -2005,11 +2031,18 @@ def _merge_seed_into_registry(
         elif relationship:
             record["relationship"] = relationship
         _add_to(record, "contexts", context)
-        if name in reverse_aliases:
-            _add_to(record, "aliases", reverse_aliases[name])
+        for alias in canonical_to_aliases.get(name, []):
+            _add_to(record, "aliases", alias)
 
     # Register the alias entries themselves (alias → canonical), additively.
-    for alias, canonical in aliases.items():
+    # Driven by the unified alias_map, so standalone and embedded aliases yield
+    # identical alias records.
+    # KNOWN LIMITATION (pre-existing, follow-up): if an alias string equals an
+    # already-registered real person's canonical name, the get() below finds
+    # that person and stamps a foreign "canonical" onto them. Embedded aliases
+    # widen how easily this collides; a future change should skip/warn when the
+    # key already exists as a non-alias record rather than mutating it.
+    for alias, canonical in alias_map.items():
         record = people_store.get(alias)
         if record is None:
             record = {
@@ -2050,6 +2083,18 @@ def tool_entity_seed(
     team (a team-less write must never leak into a shared vault). Central server
     only: on a local install there is no team, so this reports the feature as
     unavailable.
+
+    Alias direction (single, fixed): the ``aliases`` param is {alias: canonical}
+    — the KEY is the alias and the VALUE is the canonical name it points to. So
+    ``{"MB": "Markus Burger"}`` means MB is an alias OF Markus Burger, and
+    lookup("MB") resolves to Markus Burger. There is no {canonical: [aliases]}
+    form; only this one direction is accepted.
+
+    Per-person aliases may ALSO be supplied embedded on a person entry as
+    ``{"name": "Markus Burger", "aliases": ["MB"]}`` — each embedded alias is
+    treated as {alias: that person's name} and registered identically to the
+    standalone ``aliases`` param. Every alias key and value (standalone or
+    embedded) must be a non-empty str or the write RAISES.
     """
     if _config.backend == "chroma":
         return {"available": False, "backend": "chroma", "reason": _ENTITY_REGISTRY_CHROMA_REASON}
