@@ -16,12 +16,15 @@ Usage:
 """
 
 import json
+import logging
 import os
 import re
 import urllib.request
 import urllib.parse
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -302,6 +305,52 @@ def _coerce_project_name(value) -> str:
     )
 
 
+def _coerce_read_token(value, *, field: str, team=None, seen=None) -> Optional[str]:
+    """Normalize a persisted list token to a stripped string for read paths.
+
+    Read-side counterpart to ``_coerce_project_name``. Name resolution
+    (``lookup`` / ``extract_people_from_query``) iterates the persisted
+    ``projects`` list and per-person ``aliases`` lists and calls ``.lower()`` /
+    ``re.escape()`` on each item, assuming a ``str``. A malformed token already
+    persisted (a legacy onboarding ``seed()`` doc, a future writer, or a non-str
+    alias value — which the write side does NOT yet validate) would otherwise
+    raise ``'dict' object has no attribute 'lower'`` / ``TypeError`` and crash
+    the entire name-resolution lane for that registry, not just the one bad item.
+
+    Unlike ``_coerce_project_name`` (a write boundary that RAISES), this degrades
+    fail-soft-but-LOUD so a single poisoned token never breaks recall for every
+    other name. Two recoverable shapes are coerced:
+
+      - a ``str`` → used as-is (stripped)
+      - a ``{"name": <str>}`` dict → its name extracted (stripped); recall is
+        preserved, the token still resolves
+
+    Anything unrecoverable (empty/whitespace-only, non-str/non-dict, or a dict
+    without a usable string ``name``) returns ``None`` and logs ONE WARNING (not
+    debug — debug is invisible in prod) naming the ``field`` and the offending
+    raw value, plus the ``team`` when the caller supplies one. Callers skip the
+    ``None``. This helper never raises.
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            return stripped
+    elif isinstance(value, dict) and isinstance(value.get("name"), str):
+        stripped = value["name"].strip()
+        if stripped:
+            return stripped
+    # Warn once per distinct malformed token (when a dedup set is supplied) so a
+    # permanently-poisoned entry does not re-log on every lookup() of the hot path.
+    if seen is not None:
+        key = (field, repr(value))
+        if key in seen:
+            return None
+        seen.add(key)
+    team_suffix = f" (team={team!r})" if team is not None else ""
+    logger.warning("entity registry: skipping malformed %s token %r%s", field, value, team_suffix)
+    return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Entity Registry
 # ─────────────────────────────────────────────────────────────────────────────
@@ -338,6 +387,11 @@ class EntityRegistry:
     def __init__(self, data: dict, path: Path):
         self._data = data
         self._path = path
+        # Tracks (field, value-repr) of malformed tokens already warned about, so
+        # a permanently-poisoned entry logs ONE warning per registry instead of
+        # one per lookup() on the hot read path. Per-instance (not module-level)
+        # to avoid cross-team/cross-test bleed.
+        self._warned_malformed_tokens: set = set()
 
     # ── Load / Save ──────────────────────────────────────────────────────────
 
@@ -498,10 +552,20 @@ class EntityRegistry:
              "needs_disambiguation": bool}
         """
         # 1. Exact match in people registry
+        team = getattr(self, "_team", None)
+        seen = self._warned_malformed_tokens
         for canonical, info in self.people.items():
-            if word.lower() == canonical.lower() or word.lower() in [
-                a.lower() for a in info.get("aliases", [])
-            ]:
+            alias_tokens = [
+                token.lower()
+                for raw in info.get("aliases", [])
+                if (
+                    token := _coerce_read_token(
+                        raw, field=f"alias[{canonical}]", team=team, seen=seen
+                    )
+                )
+                is not None
+            ]
+            if word.lower() == canonical.lower() or word.lower() in alias_tokens:
                 # Check if this is an ambiguous word
                 if word.lower() in self.ambiguous_flags and context:
                     resolved = self._disambiguate(word, context, info)
@@ -517,7 +581,10 @@ class EntityRegistry:
                 }
 
         # 2. Project match
-        for proj in self.projects:
+        for raw_proj in self.projects:
+            proj = _coerce_read_token(raw_proj, field="project", team=team, seen=seen)
+            if proj is None:
+                continue
             if word.lower() == proj.lower():
                 return {
                     "type": "project",
@@ -709,9 +776,24 @@ class EntityRegistry:
         Returns list of canonical names found.
         """
         found = []
+        team = getattr(self, "_team", None)
+        seen = self._warned_malformed_tokens
 
         for canonical, info in self.people.items():
-            names_to_check = [canonical] + info.get("aliases", [])
+            # ``canonical`` is a dict KEY so always a str; only the persisted
+            # alias items can be malformed (a dict/non-str would raise in
+            # re.escape / .lower below), so coerce just those and skip the Nones.
+            alias_tokens = [
+                token
+                for raw in info.get("aliases", [])
+                if (
+                    token := _coerce_read_token(
+                        raw, field=f"alias[{canonical}]", team=team, seen=seen
+                    )
+                )
+                is not None
+            ]
+            names_to_check = [canonical] + alias_tokens
             for name in names_to_check:
                 # Word boundary match
                 if re.search(rf"\b{re.escape(name)}\b", query, re.IGNORECASE):

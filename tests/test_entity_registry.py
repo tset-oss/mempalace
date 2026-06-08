@@ -1,5 +1,6 @@
 """Tests for mempalace.entity_registry."""
 
+import logging
 from unittest.mock import patch
 
 import pytest
@@ -488,6 +489,91 @@ def test_coerce_project_name_rejects_non_str_non_dict():
     with pytest.raises(ValueError) as exc:
         _coerce_project_name(42)
     assert "42" in str(exc.value)
+
+
+# ── read-side resilience against already-persisted malformed tokens ──────
+#
+# The write boundary now blocks creating a registry with a dict in projects
+# or a non-str alias, so these tests poison ``reg._data`` directly to simulate
+# a legacy / poisoned persisted doc. The read path must degrade for the one bad
+# token and keep resolving every other name.
+
+
+def test_lookup_skips_malformed_project_and_resolves_good_one(tmp_path, caplog):
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    # Malformed token first so its coercion runs before the matching "good"
+    # entry is reached (the loop returns early on a match).
+    registry._data["projects"] = [{"oops": 1}, "good"]
+    with caplog.at_level(logging.WARNING):
+        result = registry.lookup("good")
+    assert result["type"] == "project"
+    assert result["name"] == "good"
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "project" in warnings[0].getMessage()
+
+
+def test_lookup_resolves_person_with_malformed_alias(tmp_path, caplog):
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    registry._data["people"]["P"] = {
+        "aliases": [{"x": 1}, "MB"],
+        "confidence": 1.0,
+        "source": "onboarding",
+    }
+    with caplog.at_level(logging.WARNING):
+        result = registry.lookup("MB")
+    assert result["type"] == "person"
+    assert result["name"] == "P"
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "alias" in warnings[0].getMessage()
+
+
+def test_lookup_canonical_still_works_with_malformed_alias(tmp_path):
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    registry._data["people"]["P"] = {
+        "aliases": [{"x": 1}, "MB"],
+        "confidence": 1.0,
+        "source": "onboarding",
+    }
+    result = registry.lookup("P")
+    assert result["type"] == "person"
+    assert result["name"] == "P"
+
+
+def test_lookup_recoverable_dict_project_still_resolves(tmp_path):
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    registry._data["projects"] = [{"name": "infra.eden"}]
+    result = registry.lookup("infra.eden")
+    assert result["type"] == "project"
+    assert result["name"] == "infra.eden"
+
+
+def test_lookup_recoverable_dict_alias_still_resolves(tmp_path):
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    registry._data["people"]["P"] = {
+        "aliases": [{"name": "infra.eden"}],
+        "confidence": 1.0,
+        "source": "onboarding",
+    }
+    result = registry.lookup("infra.eden")
+    assert result["type"] == "person"
+    assert result["name"] == "P"
+
+
+def test_extract_people_from_query_skips_malformed_alias(tmp_path, caplog):
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    registry._data["people"]["P"] = {
+        "aliases": [{"x": 1}, "MB"],
+        "confidence": 1.0,
+        "source": "onboarding",
+    }
+    with caplog.at_level(logging.WARNING):
+        found = registry.extract_people_from_query("what did MB say today")
+    assert "P" in found
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "alias" in warnings[0].getMessage()
 
 
 # ── seed() write-boundary validation ────────────────────────────────────
