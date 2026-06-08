@@ -713,3 +713,148 @@ def test_merge_seed_rejects_non_str_standalone_alias_value(tmp_path):
     with pytest.raises(ValueError) as exc:
         _merge_seed_into_registry(registry, [], [], {"MB": 7})
     assert "7" in str(exc.value)
+
+
+# ── kind field / project-alias type resolution ──────────────────────────
+
+
+def test_merge_seed_project_alias_resolves_project(tmp_path):
+    # #9 — a project alias resolves to type=project and canonicalizes the name;
+    # the canonical project never leaks into the people dict.
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    _merge_seed_into_registry(registry, [], ["mempalace"], {"mempalace-poc": "mempalace"})
+    assert registry.lookup("mempalace-poc")["type"] == "project"
+    assert registry.lookup("mempalace-poc")["name"] == "mempalace"
+    assert registry.lookup("mempalace")["type"] == "project"
+    assert "mempalace" not in registry.people  # canonical stays in projects[] only
+    assert registry.people["mempalace-poc"]["kind"] == "project"
+    assert registry.people["mempalace-poc"]["canonical"] == "mempalace"
+
+
+def test_common_word_project_alias_resolves_project_even_with_context(tmp_path):
+    # #9b — a project alias that is a common English word must NOT be flagged
+    # ambiguous and must NOT be re-typed by _disambiguate when a context is given.
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    _merge_seed_into_registry(registry, [], ["graceful-svc"], {"grace": "graceful-svc"})
+    assert "grace" not in registry.ambiguous_flags
+    result = registry.lookup("grace", context="I had grace yesterday")
+    assert result["type"] == "project"
+    assert result["name"] == "graceful-svc"
+
+
+def test_lookup_project_alias_via_alias_token_resolves_project(tmp_path):
+    # #12 sibling — mirror of test_lookup_recoverable_dict_alias_still_resolves,
+    # but the record is a PROJECT alias (kind=project) and the target IS in
+    # projects[], so it resolves project (the original stays person — see below).
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    registry._data["projects"] = ["infra.eden"]
+    registry._data["people"]["infra.eden-alias"] = {
+        "aliases": ["infra.eden"],
+        "canonical": "infra.eden",
+        "kind": "project",
+        "confidence": 1.0,
+        "source": "onboarding",
+    }
+    result = registry.lookup("infra.eden")
+    assert result["type"] == "project"
+    assert result["name"] == "infra.eden"
+
+
+def test_lookup_kindless_record_defaults_person(tmp_path):
+    # #13 — a record with no `kind` key (legacy / forward-compat shape) reads as
+    # person, preserving historical behavior.
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    registry._data["people"]["Dana"] = {
+        "aliases": [],
+        "confidence": 1.0,
+        "source": "onboarding",
+    }
+    result = registry.lookup("Dana")
+    assert result["type"] == "person"
+    assert result["name"] == "Dana"
+
+
+def test_merge_seed_person_and_alias_have_kind_person(tmp_path):
+    # #11 — a person and their alias both carry kind=person and resolve person.
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    _merge_seed_into_registry(registry, [{"name": "Markus Burger"}], [], {"MB": "Markus Burger"})
+    assert registry.people["Markus Burger"]["kind"] == "person"
+    assert registry.people["MB"]["kind"] == "person"
+    assert registry.lookup("MB")["type"] == "person"
+
+
+def test_seed_path_flag_collision_keeps_person_flag(tmp_path):
+    # #14 — a project alias that is a common word AND a real person sharing the
+    # lowercase: the person keeps its ambiguous flag (the project alias must not
+    # suppress it), the alias is kind=project, the person is kind=person.
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    _merge_seed_into_registry(
+        registry,
+        [{"name": "Grace"}],
+        ["graceful-svc"],
+        {"grace": "graceful-svc"},
+    )
+    assert "grace" in registry.ambiguous_flags
+    assert registry.people["grace"]["kind"] == "project"
+    assert registry.people["Grace"]["kind"] == "person"
+
+
+def test_merge_seed_idempotent_reseed_not_skipped_by_guard(tmp_path):
+    # #14b — an idempotent re-seed of an existing alias must NOT be skipped by the
+    # collision guard: the 2nd seed adds a new context that the else-branch merges.
+    # An over-broad "skip on any key-existence" guard would leave contexts at
+    # ["personal"] and fail this test.
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    _merge_seed_into_registry(
+        registry, [{"name": "Markus Burger", "context": "personal"}], [], {"MB": "Markus Burger"}
+    )
+    _merge_seed_into_registry(
+        registry, [{"name": "Markus Burger", "context": "work"}], [], {"MB": "Markus Burger"}
+    )
+    rec = registry.people["MB"]
+    assert set(rec["contexts"]) >= {"personal", "work"}
+    assert rec["canonical"] == "Markus Burger"
+    assert rec["aliases"].count("Markus Burger") == 1
+    assert registry.lookup("MB")["type"] == "person"
+
+
+def test_merge_seed_guard_fires_on_real_person_collision(tmp_path, caplog):
+    # #14c — guard fires when an alias key equals an existing real person's
+    # canonical with a different incoming canonical: the person is left untouched.
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    _merge_seed_into_registry(registry, [{"name": "Riley"}], [], {})
+    with caplog.at_level(logging.WARNING):
+        _merge_seed_into_registry(registry, [], [], {"Riley": "SomeOther"})
+    assert "canonical" not in registry.people["Riley"]
+    assert registry.lookup("Riley")["type"] == "person"
+    assert any("skipping alias" in r.getMessage() for r in caplog.records)
+
+
+def test_seed_stamps_kind_and_sorts_flags(tmp_path):
+    # seed() (onboarding REPLACE path) stamps kind and emits a sorted flag list.
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    registry.seed(
+        mode="personal",
+        people=[{"name": "Markus Burger"}],
+        projects=["mempalace"],
+        aliases={"MB": "Markus Burger"},
+    )
+    assert registry.people["Markus Burger"]["kind"] == "person"
+    assert registry.people["MB"]["kind"] == "person"
+    assert registry.lookup("MB")["type"] == "person"
+    assert registry.lookup("mempalace")["type"] == "project"
+    assert registry.ambiguous_flags == sorted(registry.ambiguous_flags)
+
+
+def test_check_kind_invariant_clean_and_detects_violation(tmp_path):
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    _merge_seed_into_registry(registry, [], ["mempalace"], {"mempalace-poc": "mempalace"})
+    assert registry.check_kind_invariant() == []
+    # Inject a violation: a project name as a NON-alias people record.
+    registry._data["people"]["mempalace"] = {
+        "aliases": [],
+        "confidence": 1.0,
+        "source": "x",
+        "kind": "person",
+    }
+    assert registry.check_kind_invariant() == ["mempalace"]

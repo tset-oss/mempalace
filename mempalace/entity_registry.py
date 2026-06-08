@@ -513,9 +513,15 @@ class EntityRegistry:
                 "aliases": [reverse_aliases[name]] if name in reverse_aliases else [],
                 "relationship": relationship,
                 "confidence": 1.0,
+                "kind": "person",
             }
 
-            # Also register aliases
+            # Also register aliases. An alias whose canonical is a known project
+            # is a project alias (kind=project); the canonical project itself
+            # lives in projects[] only, never as a record here. NOTE: this
+            # onboarding REPLACE path only registers aliases for seeded *people*;
+            # standalone project aliases arrive via _merge_seed_into_registry (the
+            # central tool_entity_seed path), which handles them directly.
             if name in reverse_aliases:
                 alias = reverse_aliases[name]
                 self._data["people"][alias] = {
@@ -525,14 +531,19 @@ class EntityRegistry:
                     "relationship": relationship,
                     "confidence": 1.0,
                     "canonical": name,
+                    "kind": "project" if name in self._data["projects"] else "person",
                 }
 
-        # Flag ambiguous names (also common English words)
-        ambiguous = []
-        for name in self._data["people"]:
-            if name.lower() in COMMON_ENGLISH_WORDS:
-                ambiguous.append(name.lower())
-        self._data["ambiguous_flags"] = ambiguous
+        # Flag ambiguous names (also common English words). Skip project records
+        # (a project alias is never subject to person/concept context
+        # disambiguation); emit a sorted list for deterministic JSON byte-parity.
+        self._data["ambiguous_flags"] = sorted(
+            {
+                name.lower()
+                for name, rec in self._data["people"].items()
+                if rec.get("kind", "person") != "project" and name.lower() in COMMON_ENGLISH_WORDS
+            }
+        )
 
         self.save()
 
@@ -566,15 +577,29 @@ class EntityRegistry:
                 is not None
             ]
             if word.lower() == canonical.lower() or word.lower() in alias_tokens:
-                # Check if this is an ambiguous word
-                if word.lower() in self.ambiguous_flags and context:
+                kind = info.get("kind", "person")
+                # Only genuine people participate in common-word context
+                # disambiguation; a project record must never be re-typed as
+                # person/concept by _disambiguate.
+                if kind == "person" and word.lower() in self.ambiguous_flags and context:
                     resolved = self._disambiguate(word, context, info)
                     if resolved is not None:
                         return resolved
+                if kind == "project":
+                    # Canonical project identity lives in projects[]; resolve a
+                    # project alias to its canonical so the result matches a
+                    # direct projects hit.
+                    return {
+                        "type": "project",
+                        "confidence": info.get("confidence", 1.0),
+                        "source": info.get("source", "onboarding"),
+                        "name": info.get("canonical", canonical),
+                        "needs_disambiguation": False,
+                    }
                 return {
                     "type": "person",
-                    "confidence": info["confidence"],
-                    "source": info["source"],
+                    "confidence": info.get("confidence", 1.0),
+                    "source": info.get("source", "onboarding"),
                     "name": canonical,
                     "context": info.get("contexts", ["personal"]),
                     "needs_disambiguation": False,
@@ -780,6 +805,10 @@ class EntityRegistry:
         seen = self._warned_malformed_tokens
 
         for canonical, info in self.people.items():
+            if info.get("kind", "person") == "project":
+                # Project aliases live in the people dict but are not people;
+                # never surface them as a person name in a query.
+                continue
             # ``canonical`` is a dict KEY so always a str; only the persisted
             # alias items can be malformed (a dict/non-str would raise in
             # re.escape / .lower below), so coerce just those and skip the Nones.
@@ -824,6 +853,30 @@ class EntityRegistry:
             if result["type"] == "unknown":
                 unknown.append(word)
         return unknown
+
+    # ── Integrity ────────────────────────────────────────────────────────────
+
+    def check_kind_invariant(self) -> list:
+        """Return integrity violations of the kind/project model (empty == clean).
+
+        Invariant: a canonical project name lives in ``projects[]`` ONLY — it must
+        never also exist as a non-alias record in ``people``. A project *alias*
+        (a ``people`` record carrying a ``canonical`` pointer) is allowed. Defined
+        here on the base class so ``PostgresEntityRegistry`` inherits it verbatim
+        and the check runs identically on both backends.
+        """
+        team = getattr(self, "_team", None)
+        seen = self._warned_malformed_tokens
+        project_names = set()
+        for raw_proj in self.projects:
+            proj = _coerce_read_token(raw_proj, field="project", team=team, seen=seen)
+            if proj is not None:
+                project_names.add(proj.lower())
+        violations = []
+        for name, info in self.people.items():
+            if "canonical" not in info and name.lower() in project_names:
+                violations.append(name)
+        return violations
 
     # ── Summary ──────────────────────────────────────────────────────────────
 

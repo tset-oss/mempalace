@@ -421,3 +421,62 @@ def test_malformed_people_item_missing_name_is_skipped(pg_env, backend):
     finally:
         m._active_team_var.set(None)
         _drop(backend, team_x)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# kind field: project alias resolves type=project (postgres parity)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@_needs_pg
+def test_project_alias_resolves_project_postgres(pg_env, backend):
+    # #15/#9 parity — disambiguate opens the registry fresh from Postgres each
+    # call, so a passing assertion also proves the kind round-trips through jsonb.
+    team_x = _new_team()
+    try:
+        m._active_team_var.set(team_x)
+        m.tool_entity_seed(projects=["mempalace"], aliases={"mempalace-poc": "mempalace"})
+
+        res_alias = m.tool_disambiguate("mempalace-poc")
+        assert res_alias["found"] is True
+        assert res_alias["type"] == "project"
+        assert res_alias["name"] == "mempalace"
+        assert res_alias["alias_of"] == "mempalace"
+
+        res_canon = m.tool_disambiguate("mempalace")
+        assert res_canon["type"] == "project"
+
+        # The canonical project must not have leaked into the people dict.
+        from mempalace.entity_registry import get_entity_registry
+
+        reg = get_entity_registry(m._config, team=team_x)
+        assert "mempalace" not in reg.people
+        assert reg.people["mempalace-poc"]["kind"] == "project"
+        assert reg.check_kind_invariant() == []
+    finally:
+        m._active_team_var.set(None)
+        _drop(backend, team_x)
+
+
+@_needs_pg
+def test_person_and_project_aliases_coexist_postgres(pg_env, backend):
+    # A person alias stays person and a project alias is project, in one vault.
+    team_x = _new_team()
+    try:
+        m._active_team_var.set(team_x)
+        m.tool_entity_seed(
+            people=[{"name": "Markus Burger"}],
+            projects=["mempalace"],
+            aliases={"MB": "Markus Burger", "mempalace-poc": "mempalace"},
+        )
+        person = m.tool_disambiguate("MB")
+        assert person["type"] == "person"
+        assert person["name"] == "Markus Burger"
+        assert person["alias_of"] == "Markus Burger"
+
+        project = m.tool_disambiguate("mempalace-poc")
+        assert project["type"] == "project"
+        assert project["name"] == "mempalace"
+    finally:
+        m._active_team_var.set(None)
+        _drop(backend, team_x)

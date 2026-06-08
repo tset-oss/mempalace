@@ -1932,17 +1932,17 @@ def tool_disambiguate(name: str, context: str = ""):
             "needs_disambiguation": False,
         }
     resolved = dict(result)
-    # Resolve to the canonical name when the matched person is an alias entry. The
-    # registry keys people by every name (canonical AND alias) and lookup() returns
-    # the matched key; the alias record carries the canonical it points to. Prefer
-    # it so an alias always resolves to its canonical, independent of which key the
-    # backend happened to iterate first (jsonb does not preserve key order).
-    if resolved.get("type") == "person":
-        record = registry.people.get(resolved.get("name"), {})
-        canonical = record.get("canonical")
-        if canonical:
-            resolved["name"] = canonical
-            resolved["alias_of"] = canonical
+    # Surface the alias -> canonical relationship for ANY resolved entity (person
+    # OR project) the input reached via an alias record. The record carrying the
+    # canonical pointer is the one keyed by the INPUT name (the alias string is
+    # itself the key); lookup() already rewrites resolved["name"] to the canonical
+    # for a project alias, so resolve against the input name here. The registry
+    # keys people by every name (canonical AND alias).
+    alias_record = registry.people.get(name, {})
+    canonical = alias_record.get("canonical")
+    if canonical:
+        resolved["name"] = canonical
+        resolved["alias_of"] = canonical
     return {
         "backend": _config.backend,
         "vault": team,
@@ -1950,6 +1950,57 @@ def tool_disambiguate(name: str, context: str = ""):
         "ambiguous": name.lower() in registry.ambiguous_flags,
         **resolved,
     }
+
+
+def _add_to(record: dict, field: str, value) -> None:
+    """Append ``value`` to ``record[field]`` (a list), de-duping and dropping falsy."""
+    items = record.setdefault(field, [])
+    if value and value not in items:
+        items.append(value)
+
+
+def _register_alias_records(people_store: dict, alias_map: dict, existing_projects: list) -> None:
+    """Register alias→canonical records additively, with the collision guard.
+
+    An alias whose canonical is a known project is a project alias (kind=project);
+    the canonical project itself stays in ``projects[]`` only, never as a record
+    here. Collision guard: NEVER stamp a foreign canonical/kind onto a record that
+    is a real (non-alias) person, nor onto a project name — that mutation is exactly
+    what previously leaked a project into ``people`` as a self-referential alias. An
+    idempotent re-seed (the alias already points at this canonical) is NOT a
+    collision and still flows through the merge below.
+    """
+    for alias, canonical in alias_map.items():
+        record = people_store.get(alias)
+        is_collision = (
+            record is not None and "canonical" not in record and canonical != alias
+        ) or (alias in existing_projects)
+        if is_collision:
+            logger.warning(
+                "entity_seed: skipping alias %r -> %r (collides with an existing "
+                "non-alias record or a project name)",
+                alias,
+                canonical,
+            )
+            continue
+        kind = "project" if canonical in existing_projects else "person"
+        if record is None:
+            record = {
+                "source": "onboarding",
+                "contexts": [],
+                "aliases": [],
+                "relationship": people_store.get(canonical, {}).get("relationship", ""),
+                "confidence": 1.0,
+                "canonical": canonical,
+                "kind": kind,
+            }
+            people_store[alias] = record
+        else:
+            record.setdefault("canonical", canonical)
+            record.setdefault("kind", kind)
+        _add_to(record, "aliases", canonical)
+        for ctx in people_store.get(canonical, {}).get("contexts", ["personal"]):
+            _add_to(record, "contexts", ctx)
 
 
 def _merge_seed_into_registry(
@@ -2016,11 +2067,6 @@ def _merge_seed_into_registry(
     for alias, canonical in alias_map.items():
         canonical_to_aliases.setdefault(canonical, []).append(alias)
 
-    def _add_to(record: dict, field: str, value):
-        items = record.setdefault(field, [])
-        if value and value not in items:
-            items.append(value)
-
     for entry in people or []:
         if not isinstance(entry, dict):
             raise ValueError(f"entity_seed: person entry must be a dict, got {entry!r}")
@@ -2037,43 +2083,29 @@ def _merge_seed_into_registry(
                 "aliases": [],
                 "relationship": relationship,
                 "confidence": 1.0,
+                "kind": "person",
             }
             people_store[name] = record
-        elif relationship:
-            record["relationship"] = relationship
+        else:
+            record.setdefault("kind", "person")
+            if relationship:
+                record["relationship"] = relationship
         _add_to(record, "contexts", context)
         for alias in canonical_to_aliases.get(name, []):
             _add_to(record, "aliases", alias)
 
-    # Register the alias entries themselves (alias → canonical), additively.
-    # Driven by the unified alias_map, so standalone and embedded aliases yield
-    # identical alias records.
-    # KNOWN LIMITATION (pre-existing, follow-up): if an alias string equals an
-    # already-registered real person's canonical name, the get() below finds
-    # that person and stamps a foreign "canonical" onto them. Embedded aliases
-    # widen how easily this collides; a future change should skip/warn when the
-    # key already exists as a non-alias record rather than mutating it.
-    for alias, canonical in alias_map.items():
-        record = people_store.get(alias)
-        if record is None:
-            record = {
-                "source": "onboarding",
-                "contexts": [],
-                "aliases": [],
-                "relationship": people_store.get(canonical, {}).get("relationship", ""),
-                "confidence": 1.0,
-                "canonical": canonical,
-            }
-            people_store[alias] = record
-        else:
-            record.setdefault("canonical", canonical)
-        _add_to(record, "aliases", canonical)
-        for ctx in people_store.get(canonical, {}).get("contexts", ["personal"]):
-            _add_to(record, "contexts", ctx)
+    # Register the alias entries themselves (alias → canonical), additively via the
+    # unified alias_map (standalone and embedded aliases yield identical records),
+    # with the project-alias kind stamp and the collision guard.
+    _register_alias_records(people_store, alias_map, existing_projects)
 
-    # Re-flag ambiguous names (also common English words), additively.
+    # Re-flag ambiguous names (also common English words), additively. A project
+    # alias is never flagged ambiguous (it does not undergo person/concept context
+    # disambiguation), so skip kind=="project" records.
     flags = data.setdefault("ambiguous_flags", [])
-    for name in people_store:
+    for name, rec in people_store.items():
+        if rec.get("kind", "person") == "project":
+            continue
         if name.lower() in COMMON_ENGLISH_WORDS and name.lower() not in flags:
             flags.append(name.lower())
 
