@@ -2115,6 +2115,26 @@ def tool_entity_seed(
 
 
 def tool_check_duplicate(content: str, threshold: float = 0.9):
+    """ADVISORY near-duplicate pre-check — best-effort similarity, not a guard.
+
+    Runs a cosine-similarity query against the active vault and reports whether
+    content close to ``threshold`` already exists. It is advisory only: callers
+    must not treat ``is_duplicate: False`` as proof that filing is safe.
+
+    On the central (postgres) backend, an empty vault that has had no writes yet
+    returns ``is_duplicate: False`` with a ``reason`` (and the resolved ``vault``
+    name) rather than the misleading "No palace found" error — there is simply
+    nothing to compare against. The AUTHORITATIVE guard against exact re-files is
+    ``tool_add_drawer``'s content-hash idempotency probe (``drawer_id`` =
+    sha256(wing+room+content)): a re-file of identical content returns
+    ``reason: "already_exists"`` and never creates a second row, so a false
+    negative here cannot produce a duplicate.
+
+    The ``vault``, ``reason``, ``empty_vault``, ``vector_disabled`` and
+    ``vector_disabled_reason`` keys are optional and situational; every success
+    shape always carries ``is_duplicate`` and ``matches``, so callers should
+    read only those two unless they explicitly branch on a situational key.
+    """
     _refresh_vector_disabled_flag()
     if _vector_disabled:
         # Without a usable HNSW we can't compute cosine similarity for
@@ -2130,8 +2150,28 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
                 "duplicate detection requires vector search; run `mempalace repair` to restore"
             ),
         }
-    col = _get_collection()
+    # Resolve the team ONCE and reuse it, so the vault we probe for emptiness and
+    # the vault we report can never disagree under a concurrent team switch.
+    resolved_team = _resolve_team(None) if _config.backend != "chroma" else None
+    col = _get_collection(team=resolved_team)
     if not col:
+        if _config.backend != "chroma":
+            # Central (postgres) read path: _get_collection() returns None ONLY
+            # after catching (PalaceNotFoundError, CollectionNotInitializedError)
+            # — a transient DB/connection error RAISES instead. So None here
+            # reliably means "this team vault is genuinely empty", not a read
+            # failure. Return a clear, dup-safe empty-vault result instead of
+            # the chroma-shaped "No palace found" error. is_duplicate: False is
+            # safe because add_drawer's content-hash idempotency probe is the
+            # authoritative guard against exact re-files.
+            return {
+                "is_duplicate": False,
+                "matches": [],
+                "vault": resolved_team,
+                "empty_vault": True,
+                "reason": "vault is empty (no entries filed yet) — nothing to compare against",
+            }
+        # chroma: a missing local palace is a real error state.
         return _no_palace()
     try:
         content = strip_lone_surrogates(content)

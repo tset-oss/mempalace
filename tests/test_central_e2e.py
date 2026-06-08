@@ -118,3 +118,136 @@ def test_central_team_vault_e2e(monkeypatch):
         get_backend("postgres")._embedder = None
         mcp._kg_by_path.clear()
         _drop(fe, be)
+
+
+def test_check_duplicate_on_empty_central_vault_is_dup_safe(monkeypatch):
+    """An empty central vault returns is_duplicate:False WITH a reason — not the
+    misleading chroma-shaped "No palace found" error. The vault has had no
+    writes, so _get_collection() returns None and we report "nothing to compare
+    against" instead of an error that reads like a missing local palace."""
+    import mempalace.mcp_server as mcp
+
+    team = "t" + uuid.uuid4().hex[:10]
+
+    monkeypatch.setenv("MEMPALACE_BACKEND", "postgres")
+    monkeypatch.setenv("MEMPALACE_DATABASE_URL", _dsn())
+    get_backend("postgres")._embedder = _fake_embed
+    try:
+        _use_team(mcp, monkeypatch, team)
+
+        res = mcp.tool_check_duplicate("anything at all", threshold=0.9)
+
+        assert res["is_duplicate"] is False
+        assert res["matches"] == []
+        assert res["vault"] == team
+        assert res.get("empty_vault") is True
+        # A reason that names the empty/no-entries state...
+        reason = res["reason"].lower()
+        assert "empty" in reason or "no entries" in reason
+        # ...and explicitly NOT the _no_palace() error shape.
+        assert "error" not in res
+        assert res.get("error") != "No palace found"
+    finally:
+        get_backend("postgres")._embedder = None
+        mcp._kg_by_path.clear()
+        _drop(team)
+
+
+def test_empty_vault_dup_false_is_safe_idempotent_refile(monkeypatch):
+    """Dup-integrity: even though check_duplicate returns False on the empty
+    vault, an exact re-file is caught by add_drawer's content-hash idempotency
+    probe — the second identical add returns reason 'already_exists' and does
+    NOT create a second row. This is what makes the empty-vault False safe."""
+    import mempalace.mcp_server as mcp
+
+    team = "t" + uuid.uuid4().hex[:10]
+    content = "verbatim note that we will try to file twice"
+
+    monkeypatch.setenv("MEMPALACE_BACKEND", "postgres")
+    monkeypatch.setenv("MEMPALACE_DATABASE_URL", _dsn())
+    get_backend("postgres")._embedder = _fake_embed
+    try:
+        _use_team(mcp, monkeypatch, team)
+
+        # The vault is empty -> check_duplicate is False with no error.
+        pre = mcp.tool_check_duplicate(content, threshold=0.9)
+        assert pre["is_duplicate"] is False
+        assert "error" not in pre
+
+        first = mcp.tool_add_drawer(wing="project", room="api", content=content)
+        assert first.get("success") is True, first
+        assert first.get("reason") != "already_exists"
+
+        # Identical wing/room/content -> idempotency probe short-circuits.
+        second = mcp.tool_add_drawer(wing="project", room="api", content=content)
+        assert second.get("success") is True, second
+        assert second.get("reason") == "already_exists", second
+
+        # No duplicate row was created — exactly one drawer in the vault.
+        with psycopg.connect(_dsn()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(f'SELECT count(*) FROM "{team_schema(team)}"."mempalace_drawers"')
+                assert cur.fetchone()[0] == 1
+    finally:
+        get_backend("postgres")._embedder = None
+        mcp._kg_by_path.clear()
+        _drop(team)
+
+
+def test_check_duplicate_flags_near_identical_in_populated_vault(monkeypatch):
+    """Once the vault HAS content, the normal similarity path still works: a
+    near-identical re-check of filed content is flagged is_duplicate:True with a
+    match. The empty-vault branch must not have regressed real detection."""
+    import mempalace.mcp_server as mcp
+
+    team = "t" + uuid.uuid4().hex[:10]
+    content = "the deployment pipeline runs on gitlab ci with road runner stages"
+
+    monkeypatch.setenv("MEMPALACE_BACKEND", "postgres")
+    monkeypatch.setenv("MEMPALACE_DATABASE_URL", _dsn())
+    get_backend("postgres")._embedder = _fake_embed
+    try:
+        _use_team(mcp, monkeypatch, team)
+
+        add = mcp.tool_add_drawer(wing="project", room="ci", content=content)
+        assert add.get("success") is True, add
+
+        # The deterministic embedder maps identical text to an identical vector,
+        # so an exact re-check is a perfect (similarity == 1.0) match.
+        res = mcp.tool_check_duplicate(content, threshold=0.9)
+        assert res["is_duplicate"] is True, res
+        assert len(res["matches"]) >= 1
+        assert res["matches"][0]["similarity"] >= 0.9
+    finally:
+        get_backend("postgres")._embedder = None
+        mcp._kg_by_path.clear()
+        _drop(team)
+
+
+def test_check_duplicate_propagates_backend_error_not_empty_false(monkeypatch):
+    """Load-bearing invariant: _get_collection() returns None ONLY for a
+    genuinely-empty vault; a transient/backend error RAISES. check_duplicate must
+    therefore NOT convert an error into the dup-safe is_duplicate:False empty-vault
+    shape — doing so would mask a near-dupe in a populated-but-unreadable vault. If
+    a future change broadened _get_collection's except clause to swallow errors
+    into None, this test fails."""
+    import mempalace.mcp_server as mcp
+
+    team = "t" + uuid.uuid4().hex[:10]
+    monkeypatch.setenv("MEMPALACE_BACKEND", "postgres")
+    monkeypatch.setenv("MEMPALACE_DATABASE_URL", _dsn())
+    get_backend("postgres")._embedder = _fake_embed
+    try:
+        _use_team(mcp, monkeypatch, team)
+
+        def _raise_transient(*args, **kwargs):
+            raise RuntimeError("simulated backend/connection failure")
+
+        monkeypatch.setattr(mcp, "_get_collection", _raise_transient)
+        # The error must propagate, NOT be reported as an empty, dup-safe vault.
+        with pytest.raises(RuntimeError):
+            mcp.tool_check_duplicate("anything", threshold=0.9)
+    finally:
+        get_backend("postgres")._embedder = None
+        mcp._kg_by_path.clear()
+        _drop(team)
