@@ -103,9 +103,9 @@ File verbatim content into the palace. Identical content (same deterministic dra
 | `content` | string | **Yes** | Verbatim content to store |
 | `source_file` | string | No | Where this came from |
 | `added_by` | string | No | Who is filing (default: "mcp") |
-| `topics` | array of string | No | Topic labels for this drawer's wing (e.g. `["Angular", "OpenAPI"]`). Wings sharing a label are auto-linked by a cross-wing topic tunnel (central/postgres only). Ignored on local installs. |
+| `topics` | array of string | No | Topic labels for this drawer's wing (e.g. `["Angular", "OpenAPI"]`). Wings sharing a label are auto-linked by a cross-wing topic tunnel (central/postgres only). On the central/postgres backend a topic also makes this drawer findable via `mempalace_search(entity=...)` / `mempalace_entities(entity=...)` — even when the label never appears in the content — as a recall-only tag (it does not affect entity hallways/tunnels). Ignored on local installs. |
 
-**Returns:** `{ success, drawer_id, wing, room }`
+**Returns:** `{ success, drawer_id, wing, room, chunks }`. Content larger than the chunk size is split into physical `{drawer_id}_chunk_NNNNNN` rows; in that case the response also carries `chunk_ids` and the returned `drawer_id` is the LOGICAL group handle (pass it straight to `mempalace_get_drawer`, which reassembles the whole memory).
 
 ---
 
@@ -137,13 +137,13 @@ Prune drawers whose source files are gitignored, deleted, or moved. Returns a dr
 
 ### `mempalace_get_drawer`
 
-Fetch a single drawer by ID — returns full content and metadata.
+Fetch a single drawer by ID — returns full content and metadata. Accepts either a physical drawer/chunk ID **or** the LOGICAL group handle of a chunked drawer (the `drawer_id` that `mempalace_add_drawer` returns for oversized content): when no row exists under the ID, the chunks carrying that `parent_drawer_id` are reassembled, in order, into the whole verbatim memory. Reassembly is byte-exact and refuses (with an error, never silently) if a chunk is missing.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `drawer_id` | string | **Yes** | ID of the drawer to fetch |
+| `drawer_id` | string | **Yes** | Physical drawer/chunk ID, or the logical handle of a chunked drawer |
 
-**Returns:** `{ drawer_id, content, wing, room, metadata }` where `metadata.source_file`, when present, is the basename only — the absolute path written by the miners is reduced before the dict is returned to MCP clients.
+**Returns:** `{ drawer_id, content, wing, room, metadata }`. When the ID resolved via chunk reassembly, the response also carries `chunks` and `chunk_ids`. `metadata.source_file`, when present, is the basename only — the absolute path written by the miners is reduced before the dict is returned to MCP clients.
 
 ---
 
