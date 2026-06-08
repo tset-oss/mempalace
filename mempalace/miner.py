@@ -585,6 +585,27 @@ _ENTITY_METADATA_LIMIT = 25  # max entities packed into the metadata field
 # segments), ``1.2.3`` (digit-initial), or ``word. Word`` (space after the dot).
 _DOTTED_IDENTIFIER_RE = re.compile(r"\b[a-z][a-z0-9_]+(?:\.[a-z][a-z0-9_]+)+\b")
 
+# A dotted identifier is a strong single-mention entity signal (``infra.eden``)
+# EXCEPT when its last segment is a source-file extension (``config.py``,
+# ``mcp_server.py``): those are incidental filename mentions that would flood the
+# index — and, since entity_occurrences is also the co-occurrence substrate, the
+# derived hallway/tunnel graph — on code-heavy content. File-suffixed dotted ids
+# therefore keep the existing >=2 frequency gate (no behaviour change from HEAD);
+# only non-file dotted ids get tagged on a single occurrence. Known recall gap
+# (accepted): a real entity NAMED like a file (e.g. a service ``something.go``)
+# keeps the >=2 gate until it enters the known set. Single-letter extensions
+# (``c``/``h``) are intentionally absent — the regex requires >=2-char segments,
+# so a dotted id can never END in a single-letter segment. Lowercased on compare.
+# Non-exhaustive by design: a new code-file extension not listed here falls through
+# to single-occurrence tagging (extend the set if that proves noisy in practice).
+_FILE_EXTENSION_DENYLIST = frozenset(
+    {
+        "py", "js", "ts", "tsx", "jsx", "md", "txt", "json", "yaml", "yml",
+        "toml", "sh", "go", "rs", "rb", "java", "cpp", "cc", "css", "scss",
+        "html", "xml", "cfg", "ini", "lock", "sql", "csv", "log", "env",
+    }
+)  # fmt: skip
+
 # Status / workflow noise words that are NOT entities but slip past the
 # capitalization gate when they head a phrase ("In Progress" -> "Progress").
 # Kept deliberately tiny — only unambiguous workflow markers that are essentially
@@ -984,11 +1005,17 @@ def _extract_entities_for_metadata(content: str, known=None) -> str:
         if w.lower() in _ENTITY_STATUS_NOISE:
             continue
         freq[w] = freq.get(w, 0) + 1
-    # Additive lowercase namespaced identifiers ("infra.eden", "foo.bar.baz")
-    # that the capitalization-gated candidate pattern misses. Counted into the
-    # same freq dict so they inherit the ≥2 occurrence gate below.
+    # Lowercase namespaced identifiers ("infra.eden", "foo.bar.baz") that the
+    # capitalization-gated candidate pattern misses. A non-file-suffixed dotted
+    # id is a high-precision entity signal, so tag it on a SINGLE occurrence; a
+    # file-suffixed one ("config.py", "mcp_server.py") keeps counting into the
+    # shared freq dict so it inherits the ≥2 gate below (unchanged from HEAD).
     for w in _DOTTED_IDENTIFIER_RE.findall(working_window):
-        freq[w] = freq.get(w, 0) + 1
+        if w.rsplit(".", 1)[-1].lower() in _FILE_EXTENSION_DENYLIST:
+            freq[w] = freq.get(w, 0) + 1
+        else:
+            # No len guard needed: the regex floor is 5 chars (``xx.xx``).
+            matched.add(w)
     for w, c in freq.items():
         if c >= 2 and len(w) > 2:
             matched.add(w)

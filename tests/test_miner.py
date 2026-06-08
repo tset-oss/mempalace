@@ -587,8 +587,7 @@ def test_entity_metadata_captures_lowercase_dotted_identifier():
 
     The capitalization-gated candidate pattern only matches uppercase-initial
     tokens, so an ``entity="infra.eden"`` lookup used to return nothing. The
-    additive dotted-identifier pattern fills that gap (≥2 occurrences, mirroring
-    the existing frequency gate).
+    additive dotted-identifier pattern fills that gap.
     """
     content = "We deployed infra.eden today. Then infra.eden crashed overnight."
     assert "infra.eden" in _extracted_set(content)
@@ -631,17 +630,38 @@ def test_entity_metadata_dotted_id_precision_no_false_positives():
     assert not any("." in e for e in _extracted_set(title_text))
 
 
-def test_entity_metadata_dotted_id_respects_frequency_gate():
-    """A dotted id is captured only at >=2 occurrences — the same frequency gate
-    capitalized entities already use. A single mention is intentionally not
-    tagged, so a one-off ``self.data`` in a code snippet does not pollute the
-    entity space; this is a documented, consistent limitation.
+def test_entity_metadata_dotted_id_single_occurrence_tagged():
+    """A NON-file namespaced id is a high-precision signal, tagged on a SINGLE
+    mention (``infra.eden``), so an ``entity=`` lookup is deterministic instead of
+    silently requiring two mentions.
     """
     single = "We touched infra.eden exactly once and then moved on entirely."
-    assert "infra.eden" not in _extracted_set(single)
+    assert "infra.eden" in _extracted_set(single)
 
-    double = "We touched infra.eden once. Later infra.eden needed a restart."
-    assert "infra.eden" in _extracted_set(double)
+    single_multi = "The obj.method.chain helper was called from one place only."
+    assert "obj.method.chain" in _extracted_set(single_multi)
+
+
+def test_entity_metadata_filename_keeps_frequency_gate():
+    """A dotted id whose LAST segment is a source-file extension (``config.py``,
+    ``mcp_server.py``) keeps the >=2 frequency gate (unchanged from HEAD), so a
+    single incidental filename mention does not flood the entity / co-occurrence
+    space on code-heavy content.
+    """
+    single = "Open config.py and read the setting near the top."
+    assert "config.py" not in _extracted_set(single)
+    # Underscore-bearing filename (the example the code comment names) behaves the same.
+    assert "mcp_server.py" not in _extracted_set("Edit mcp_server.py once here.")
+
+    double = "Open config.py first. Then re-open config.py to confirm the change."
+    assert "config.py" in _extracted_set(double)
+
+    # Accepted recall gap: a real entity NAMED like a file (last segment is an
+    # extension) also keeps the >=2 gate until it enters the known set.
+    one_off = "The something.go service restarted at noon and recovered."
+    assert "something.go" not in _extracted_set(one_off)
+    # ...but a known entity is always tagged, even a single file-suffixed mention.
+    assert "something.go" in _extracted_set(one_off, known=frozenset({"something.go"}))
 
 
 def test_file_already_mined_check_mtime():
