@@ -8,7 +8,9 @@ from mempalace.entity_registry import (
     COMMON_ENGLISH_WORDS,
     PERSON_CONTEXT_PATTERNS,
     EntityRegistry,
+    _coerce_project_name,
 )
+from mempalace.mcp_server import _merge_seed_into_registry
 
 # Shared mock result for Wikipedia person lookup tests
 _MOCK_SAOIRSE_PERSON = {
@@ -463,3 +465,103 @@ def test_summary(tmp_path):
     assert "personal" in s
     assert "Riley" in s
     assert "MemPalace" in s
+
+
+# ── write-boundary project normalization ────────────────────────────────
+
+
+def test_coerce_project_name_accepts_str():
+    assert _coerce_project_name("  infra.eden  ") == "infra.eden"
+
+
+def test_coerce_project_name_extracts_dict_name():
+    assert _coerce_project_name({"name": "infra.eden"}) == "infra.eden"
+
+
+def test_coerce_project_name_rejects_dict_without_name():
+    with pytest.raises(ValueError) as exc:
+        _coerce_project_name({"id": 7})
+    assert "{'id': 7}" in str(exc.value)
+
+
+def test_coerce_project_name_rejects_non_str_non_dict():
+    with pytest.raises(ValueError) as exc:
+        _coerce_project_name(42)
+    assert "42" in str(exc.value)
+
+
+# ── seed() write-boundary validation ────────────────────────────────────
+
+
+def test_seed_coerces_dict_project_to_string(tmp_path):
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    registry.seed(mode="personal", people=[], projects=[{"name": "x"}], aliases={})
+    assert registry.projects == ["x"]
+    assert all(isinstance(p, str) for p in registry.projects)
+
+
+def test_seed_raises_on_unrecoverable_project(tmp_path):
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    with pytest.raises(ValueError) as exc:
+        registry.seed(mode="personal", people=[], projects=[{"id": 7}], aliases={})
+    assert "{'id': 7}" in str(exc.value)
+
+
+# ── _merge_seed_into_registry write-boundary validation ─────────────────
+
+
+def test_merge_seed_coerces_dict_project_to_string(tmp_path):
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    _merge_seed_into_registry(registry, [], [{"name": "infra.eden"}], {})
+    # The dict must be normalized to a plain string in the projects list...
+    assert "infra.eden" in registry.projects
+    assert all(isinstance(p, str) for p in registry.projects)
+    # ...so the read side resolves it without crashing on '.lower()'.
+    result = registry.lookup("infra.eden")
+    assert result["type"] == "project"
+
+
+def test_merge_seed_raises_on_unrecoverable_project(tmp_path):
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    with pytest.raises(ValueError) as exc:
+        _merge_seed_into_registry(registry, [], [{"id": 7}], {})
+    assert "{'id': 7}" in str(exc.value)
+
+
+def test_merge_seed_plain_string_project_unchanged(tmp_path):
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    _merge_seed_into_registry(registry, [], ["infra.eden"], {})
+    assert "infra.eden" in registry.projects
+    assert registry.lookup("infra.eden")["type"] == "project"
+
+
+def test_coerce_project_name_rejects_empty_and_whitespace():
+    # An empty/whitespace project must be rejected, not kept as "" — otherwise
+    # lookup("") would resolve an empty token as a real project. This keeps the
+    # string branch consistent with the dict-name branch (both reject empty).
+    for bad in ("", "   ", "\t\n"):
+        with pytest.raises(ValueError):
+            _coerce_project_name(bad)
+    with pytest.raises(ValueError):
+        _coerce_project_name({"name": "   "})
+
+
+def test_merge_seed_dict_then_string_project_is_idempotent(tmp_path):
+    # Re-seeding the same project via the dict shape and then the bare string
+    # must not create a duplicate: both coerce to the same canonical string.
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    _merge_seed_into_registry(registry, [], [{"name": "infra.eden"}], {})
+    _merge_seed_into_registry(registry, [], ["infra.eden"], {})
+    assert registry.projects.count("infra.eden") == 1
+    assert registry.projects == ["infra.eden"]
+
+
+def test_seed_dict_project_survives_save_reload(tmp_path):
+    # The bug was about a dict reaching persisted storage; assert the coerced
+    # string round-trips through save()/load(), not just the in-memory list.
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    _merge_seed_into_registry(registry, [], [{"name": "infra.eden"}], {})
+    reloaded = EntityRegistry.load(config_dir=tmp_path)
+    assert reloaded.projects == ["infra.eden"]
+    assert all(isinstance(p, str) for p in reloaded.projects)
+    assert reloaded.lookup("infra.eden")["type"] == "project"

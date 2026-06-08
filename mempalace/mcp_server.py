@@ -1953,7 +1953,7 @@ def _merge_seed_into_registry(
     ``aliases`` lists additively, so re-seeding never drops previously-seeded
     data. Identical re-seeds are idempotent (no growth, no dupes).
     """
-    from .entity_registry import COMMON_ENGLISH_WORDS
+    from .entity_registry import COMMON_ENGLISH_WORDS, _coerce_project_name
 
     data = registry._data
     people_store = data.setdefault("people", {})
@@ -1962,13 +1962,21 @@ def _merge_seed_into_registry(
     if not data.get("people") and not data.get("projects"):
         data["mode"] = mode or "personal"
 
-    # Projects: union, preserving order and prior entries.
+    # Projects: union, preserving order and prior entries. Normalize each entry
+    # to a plain string at this write boundary (str or {"name": str}); an
+    # unrecoverable shape raises so a dict can never poison the projects list.
     existing_projects = data.setdefault("projects", [])
     for proj in projects or []:
-        if proj not in existing_projects:
-            existing_projects.append(proj)
+        name = _coerce_project_name(proj)
+        if name not in existing_projects:
+            existing_projects.append(name)
 
     aliases = aliases or {}
+    # NOTE: alias keys/values are not yet type-validated here, so a caller
+    # passing a non-str alias (e.g. {"Max": 7}) could persist a non-str into a
+    # person's aliases list — the same read-time .lower() hazard the project
+    # coercion above seals. Read-side hardening tolerates it; write-side
+    # validation of alias values is handled where alias semantics are revised.
     reverse_aliases = {v: k for k, v in aliases.items()}  # canonical → alias
 
     def _add_to(record: dict, field: str, value):
@@ -1977,6 +1985,8 @@ def _merge_seed_into_registry(
             items.append(value)
 
     for entry in people or []:
+        if not isinstance(entry, dict):
+            raise ValueError(f"entity_seed: person entry must be a dict, got {entry!r}")
         name = (entry.get("name") or "").strip()
         if not name:
             continue

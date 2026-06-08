@@ -266,6 +266,43 @@ def _wikipedia_lookup(word: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Write-boundary normalization
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _coerce_project_name(value) -> str:
+    """Normalize a project entry to a stripped string for the projects list.
+
+    The projects list must hold plain strings — lookup() and other readers call
+    ``.lower()`` on each entry, so a dict slipping in raises
+    ``'dict' object has no attribute 'lower'`` at read time. Normalize the two
+    recoverable shapes here at the write boundary and reject everything else:
+
+      - a ``str`` is used as-is (stripped)
+      - a ``{"name": <str>}`` dict has its name extracted (stripped)
+
+    Any other shape (a dict without a usable string ``name``, a non-str /
+    non-dict value, or an empty/whitespace-only name) is unrecoverable and
+    raises ``ValueError`` naming the offending raw value. No silent skip, no
+    repr-coercion-to-garbage, and no empty-string entry (an empty token would
+    otherwise resolve as a junk "project" at read time). The message is
+    tool-neutral because this helper is shared by ``_merge_seed_into_registry``
+    and the onboarding ``seed()`` path.
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+    elif isinstance(value, dict) and isinstance(value.get("name"), str):
+        stripped = value["name"].strip()
+    else:
+        stripped = ""
+    if stripped:
+        return stripped
+    raise ValueError(
+        f"entity registry: project entry must be a non-empty str or {{'name': str}}, got {value!r}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entity Registry
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -402,13 +439,15 @@ class EntityRegistry:
         aliases: dict {"Max": "Maxwell", ...}
         """
         self._data["mode"] = mode
-        self._data["projects"] = list(projects)
+        self._data["projects"] = [_coerce_project_name(proj) for proj in (projects or [])]
 
         aliases = aliases or {}
         reverse_aliases = {v: k for k, v in aliases.items()}  # Maxwell → Max
 
         for entry in people:
-            name = entry["name"].strip()
+            if not isinstance(entry, dict):
+                raise ValueError(f"entity_seed: person entry must be a dict, got {entry!r}")
+            name = (entry.get("name") or "").strip()
             if not name:
                 continue
             context = entry.get("context", "personal")
