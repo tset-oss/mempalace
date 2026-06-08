@@ -1176,7 +1176,7 @@ class TestWriteTools:
             "metadatas": [[{"wing": "w", "room": "r"}, None]],
             "documents": [["first doc", None]],
         }
-        monkeypatch.setattr(mcp_server, "_get_collection", lambda: mock_col)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False, team=None: mock_col)
 
         result = mcp_server.tool_check_duplicate("any content", threshold=0.5)
 
