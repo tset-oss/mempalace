@@ -506,7 +506,7 @@ def _get_team_facts(team=None):
     return store
 
 
-def _index_drawer_entities(team, chunks, wing, room):
+def _index_drawer_entities(team, chunks, wing, room, topic_labels=None):
     """Best-effort: extract entities per chunk and index them per vault.
 
     No-op on chroma (the miner stamps entities there). NEVER raises — an
@@ -521,6 +521,14 @@ def _index_drawer_entities(team, chunks, wing, room):
     ``chunks`` is an iterable of ``(drawer_id, text)`` pairs — one per physical
     row written. The single-doc add path passes one pair; the chunked path
     passes one pair per chunk slice.
+
+    ``topic_labels`` are caller-supplied topic labels stamped on EVERY chunk as
+    recall-only ``is_topic=True`` rows: explicit signal, no frequency gate, so a
+    drawer is findable via ``entity=``/``mempalace_entities`` even when the label
+    never appears in the text — but excluded from the co-occurrence/tunnel derive
+    so a topic never manufactures spurious entity hallways. Extracted entities are
+    written FIRST (``is_topic=False``); a label that is also extracted is kept in
+    co-occurrence by the monotone ON CONFLICT in ``PostgresEntityIndex.add``.
     """
     if _config.backend == "chroma":
         return
@@ -529,11 +537,14 @@ def _index_drawer_entities(team, chunks, wing, room):
 
         idx = _get_entity_index(team)
         known = idx.known_entities()
+        labels = [t for t in (topic_labels or []) if isinstance(t, str) and t.strip()]
         for drawer_id, text in chunks:
             entities_str = _extract_entities_for_metadata(text, known=known)
             entities = [e for e in entities_str.split(";") if e]
             if entities:
-                idx.add([drawer_id], entities, wing, room)
+                idx.add([drawer_id], entities, wing, room, is_topic=False)
+            if labels:
+                idx.add([drawer_id], labels, wing, room, is_topic=True)
     except Exception:
         logger.debug("entity index update failed (best-effort)", exc_info=True)
 
@@ -2451,8 +2462,12 @@ def tool_add_drawer(
                 )
             _metadata_cache = None
             # Best-effort per-vault entity index (server mode); never fails the
-            # write. Single physical row -> one (id, text) chunk pair.
-            _index_drawer_entities(add_team, [(drawer_id, content)], wing, room)
+            # write. Single physical row -> one (id, text) chunk pair. Caller
+            # topics are stamped as recall-only entity rows so the drawer is
+            # findable via entity= even when the label isn't in the text.
+            _index_drawer_entities(
+                add_team, [(drawer_id, content)], wing, room, topic_labels=topics
+            )
             # Best-effort per-vault topic labels (server mode); never fails the
             # write. Drives cross-wing topic tunnels via the rebuild below.
             _index_wing_topics(add_team, wing, topics)
@@ -2508,7 +2523,10 @@ def tool_add_drawer(
         # chunk ids actually written so delete/update stay consistent, and each
         # chunk is tagged with the entities in its OWN text slice (per-chunk,
         # matching the chroma miner) — not the whole-drawer set on every id.
-        _index_drawer_entities(add_team, list(zip(chunk_ids, chunk_docs)), wing, room)
+        # Caller topics are stamped (recall-only) on every chunk.
+        _index_drawer_entities(
+            add_team, list(zip(chunk_ids, chunk_docs)), wing, room, topic_labels=topics
+        )
         # Best-effort per-vault topic labels (server mode); never fails the write.
         _index_wing_topics(add_team, wing, topics)
         # Best-effort server-side closet rebuild (server mode); never fails the write.
@@ -3084,8 +3102,11 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             )
             # Best-effort per-vault entity index (server mode) — same per-chunk
             # wiring as tool_add_drawer/tool_update_drawer, so diary entities are
-            # queryable via the entity index. Never fails the diary write.
-            _index_drawer_entities(diary_team, [(entry_id, entry)], wing, room)
+            # queryable via the entity index. The diary topic is stamped as a
+            # recall-only entity row too. Never fails the diary write.
+            _index_drawer_entities(
+                diary_team, [(entry_id, entry)], wing, room, topic_labels=[topic]
+            )
             # Best-effort per-vault topic label (server mode): the diary's topic
             # tag is a wing topic, so it drives cross-wing topic tunnels the same
             # way an add_drawer topics label does. Never fails the diary write.
@@ -3147,7 +3168,10 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             )
         col.add(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
         # Best-effort per-vault entity index (server mode); per-chunk, never fails.
-        _index_drawer_entities(diary_team, list(zip(chunk_ids, chunk_docs)), wing, room)
+        # The diary topic is stamped (recall-only) on every chunk.
+        _index_drawer_entities(
+            diary_team, list(zip(chunk_ids, chunk_docs)), wing, room, topic_labels=[topic]
+        )
         # Best-effort per-vault topic label (server mode); never fails the write.
         _index_wing_topics(diary_team, wing, [topic])
         # Evict ONLY this vault's stale graph-cache entry (see single-doc path).

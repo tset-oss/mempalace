@@ -64,8 +64,17 @@ class PostgresEntityIndex:
                         "  drawer_id text NOT NULL,"
                         "  wing text,"
                         "  room text,"
+                        "  is_topic boolean NOT NULL DEFAULT false,"
                         "  PRIMARY KEY (entity, drawer_id)"
                         ")"
+                    )
+                    # Migrate vaults whose entity_occurrences predates is_topic.
+                    # Forward-only (no down-migration); a topic-only row can only
+                    # be written by add(is_topic=True), which runs this _ensure
+                    # first, so a column-less table provably has zero topic rows.
+                    cur.execute(
+                        f"ALTER TABLE {self._table()} "
+                        "ADD COLUMN IF NOT EXISTS is_topic boolean NOT NULL DEFAULT false"
                     )
                     cur.execute(
                         f"CREATE INDEX IF NOT EXISTS {_qi('entity_occurrences_entity')} "
@@ -87,25 +96,37 @@ class PostgresEntityIndex:
         entities: Iterable[str],
         wing: Optional[str],
         room: Optional[str],
+        is_topic: bool = False,
     ) -> int:
         """Insert (entity, drawer_id, wing, room) rows. Idempotent per pair.
 
         The same entity set is written for every physical drawer id (each chunk
         of a chunked drawer), so an ``entity=`` lookup hits whatever physical row
         the search returns. Returns the number of (entity, drawer) pairs offered
-        (pre-dedup); ``ON CONFLICT DO NOTHING`` makes re-adds harmless.
+        (pre-dedup).
+
+        ``is_topic`` marks RECALL-ONLY rows from caller-supplied topic labels:
+        they are findable via ``drawers_for_entity`` but excluded from the
+        co-occurrence derive (see ``link_store_postgres._co_occurrence_for_wing``)
+        so a topic label never manufactures spurious entity hallways/tunnels.
+        The conflict clause makes ``is_topic`` a MONOTONE meet (logical AND of
+        every offer for a pair): any organically-extracted offer (``is_topic=
+        False``) permanently demotes the row so it (re)joins co-occurrence,
+        regardless of write order. A pure topic label stays ``is_topic=True``.
         """
         ids = [d for d in drawer_ids if d]
         ents = [e for e in entities if e]
         if not ids or not ents:
             return 0
-        rows = [(e, d, wing, room) for d in ids for e in ents]
+        rows = [(e, d, wing, room, is_topic) for d in ids for e in ents]
         self._ensure()
         with self._backend._conn() as conn:
             with conn.cursor() as cur:
                 cur.executemany(
-                    f"INSERT INTO {self._table()} (entity, drawer_id, wing, room) "
-                    "VALUES (%s, %s, %s, %s) ON CONFLICT (entity, drawer_id) DO NOTHING",
+                    f"INSERT INTO {self._table()} (entity, drawer_id, wing, room, is_topic) "
+                    "VALUES (%s, %s, %s, %s, %s) "
+                    "ON CONFLICT (entity, drawer_id) DO UPDATE "
+                    "SET is_topic = entity_occurrences.is_topic AND EXCLUDED.is_topic",
                     rows,
                 )
         self._invalidate_known()

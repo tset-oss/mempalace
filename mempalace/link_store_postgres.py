@@ -212,6 +212,13 @@ class PostgresLinkStore(LinkStore):
         self._schema = team_schema(team)
         self._lock = threading.Lock()
         self._ensured = False
+        # Cache-on-present-only flag for the entity_occurrences.is_topic column
+        # (owned by PostgresEntityIndex, not this store). Once observed present
+        # it never reverts (the column is forward-only), so caching True is safe;
+        # we deliberately never cache False — a stale False, pinned after a later
+        # write adds the column, would silently let topic-only rows back into the
+        # co-occurrence derive. So while absent we re-probe every rebuild.
+        self._entity_has_is_topic = False
 
     # -- schema -----------------------------------------------------------
     def _table(self) -> str:
@@ -537,9 +544,34 @@ class PostgresLinkStore(LinkStore):
                 cur.execute("SELECT to_regclass(%s)", (f"{self._schema}.entity_occurrences",))
                 if cur.fetchone()[0] is None:
                     return {}, {}, False
+                # Exclude recall-only topic-label rows (is_topic=true) so caller
+                # topics never inflate co-occurrence. The column is owned by
+                # PostgresEntityIndex; this store never runs that _ensure, so a
+                # pre-is_topic vault can reach this read before the column exists.
+                # Probe it (cache-on-present-only): omitting the predicate while
+                # absent is correct, not a fallback — a column-less table cannot
+                # hold any topic-only rows.
+                if not self._entity_has_is_topic:
+                    cur.execute(
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_schema = %s AND table_name = 'entity_occurrences' "
+                        "AND column_name = 'is_topic'",
+                        (self._schema,),
+                    )
+                    if cur.fetchone() is not None:
+                        # Lock-free on purpose: the only transition is the
+                        # monotone, idempotent False->True flip, so a concurrent
+                        # rebuild racing this set costs at most one extra harmless
+                        # re-probe — never a correctness loss.
+                        self._entity_has_is_topic = True
+                # Qualify the column (single-table FROM today, but future-proof
+                # against a JOIN ever being added to this SELECT).
+                topic_filter = (
+                    " AND entity_occurrences.is_topic = false" if self._entity_has_is_topic else ""
+                )
                 cur.execute(
                     f"SELECT drawer_id, entity, room FROM {self._table_entities()} "
-                    "WHERE wing = %s ORDER BY drawer_id LIMIT %s",
+                    f"WHERE wing = %s{topic_filter} ORDER BY drawer_id LIMIT %s",
                     (wing, WING_SCAN_CAP + 1),
                 )
                 rows = cur.fetchall()
