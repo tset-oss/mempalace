@@ -2366,11 +2366,11 @@ def tool_add_drawer(
     via a single batched upsert. Each chunk carries ``parent_drawer_id``
     linkage and ``chunk_index`` metadata so search can rejoin them. The
     returned ``drawer_id`` is the LOGICAL group handle on the chunked
-    path; physical drawer ids are in ``chunk_ids`` (#1539). To delete
-    or fetch the underlying drawers, iterate ``chunk_ids`` or query by
-    ``parent_drawer_id`` — ``tool_get_drawer(drawer_id)`` and
-    ``tool_delete_drawer(drawer_id)`` report "not found" on the chunked
-    path because no row is stored under the logical group id.
+    path; physical drawer ids are in ``chunk_ids`` (#1539).
+    ``tool_get_drawer(drawer_id)`` accepts this logical id and transparently
+    reassembles the chunks into the whole verbatim memory. ``tool_delete_drawer``
+    still operates per physical id — iterate ``chunk_ids`` (or query by
+    ``parent_drawer_id``) to delete the underlying rows.
 
     ``topics`` is an optional list of TOPIC labels for this drawer's wing
     (e.g. ``["Angular", "OpenAPI"]``). On the central postgres backend they
@@ -2642,14 +2642,104 @@ def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
             _metadata_cache = None
 
 
+def _reassemble_chunked_drawer(col, drawer_id):
+    """Reassemble a chunked drawer from its physical chunks, or None if not chunked.
+
+    A chunked drawer stores no row under its LOGICAL ``drawer_id`` (only
+    ``{drawer_id}_chunk_NNNNNN`` rows carrying ``parent_drawer_id=drawer_id``), so
+    a literal ``get(ids=[drawer_id])`` misses it. This fetches every chunk by
+    ``parent_drawer_id`` and rejoins them so the logical id add_drawer returned is
+    dereferenceable and returns the WHOLE verbatim memory.
+
+    Verbatim-exact: the chunked write slices ``content[i:i+chunk_size]`` with step
+    == chunk_size (no overlap), so concatenating the chunks in ``chunk_index``
+    order restores the original byte-for-byte. The ``get`` passes NO ``limit`` so
+    every chunk is returned — a page cap would silently truncate and break
+    verbatim. Order is taken from the ``chunk_index`` metadata (falling back to the
+    ``_chunk_NNNNNN`` id suffix); a chunk with no resolvable index, or duplicate
+    indices, returns an explicit error rather than a silently-scrambled concat.
+    """
+    grouped = col.get(where={"parent_drawer_id": drawer_id}, include=["documents", "metadatas"])
+    ids = grouped.get("ids") or []
+    if not ids:
+        return None
+    items = []
+    for cid, doc, raw_meta in zip(ids, grouped["documents"], grouped["metadatas"]):
+        meta = _safe_meta(raw_meta)
+        idx = meta.get("chunk_index")
+        if idx is None:
+            m = re.search(r"_chunk_(\d+)$", cid)
+            idx = int(m.group(1)) if m else None
+        else:
+            try:
+                idx = int(idx)
+            except (TypeError, ValueError):
+                idx = None
+        if idx is None:
+            return {
+                "error": (
+                    f"Cannot reassemble chunked drawer {drawer_id}: chunk {cid} has no "
+                    "resolvable chunk_index (refusing to return possibly-misordered content)."
+                )
+            }
+        items.append((idx, cid, doc, meta))
+    indices = [it[0] for it in items]
+    if len(set(indices)) != len(indices):
+        return {
+            "error": (
+                f"Cannot reassemble chunked drawer {drawer_id}: duplicate chunk_index values "
+                f"{sorted(indices)} (possible corruption; refusing to concatenate)."
+            )
+        }
+    items.sort(key=lambda it: (it[0], it[1]))
+    # The chunk indices must be exactly 0..N-1: a gap means a chunk is MISSING
+    # (e.g. a partial delete), and silently concatenating the survivors would
+    # return non-verbatim content — a violation of the verbatim-always promise.
+    # Refuse with an explicit error instead. This also guarantees items[0] is
+    # chunk 0, so the whole-drawer metadata below is taken from the first chunk.
+    ordered_indices = [it[0] for it in items]
+    if ordered_indices != list(range(len(ordered_indices))):
+        return {
+            "error": (
+                f"Cannot reassemble chunked drawer {drawer_id}: chunk_index sequence "
+                f"{ordered_indices} is not contiguous from 0 (a chunk is missing); "
+                "refusing to return incomplete content."
+            )
+        }
+    content = "".join(it[2] for it in items)
+    safe_meta = dict(items[0][3])
+    if safe_meta.get("source_file"):
+        safe_meta["source_file"] = Path(safe_meta["source_file"]).name
+    # Drop chunk-local keys so the reassembled view reads as one logical drawer.
+    safe_meta.pop("chunk_index", None)
+    return {
+        "drawer_id": drawer_id,
+        "content": content,
+        "wing": safe_meta.get("wing", ""),
+        "room": safe_meta.get("room", ""),
+        "chunks": len(items),
+        "chunk_ids": [it[1] for it in items],
+        "metadata": safe_meta,
+    }
+
+
 def tool_get_drawer(drawer_id: str):
-    """Fetch a single drawer by ID. Returns full content and metadata."""
+    """Fetch a single drawer by ID. Returns full content and metadata.
+
+    Accepts either a physical drawer/chunk id OR the LOGICAL group handle of a
+    chunked drawer (the ``drawer_id`` add_drawer returns for oversized content):
+    when no row exists under the id, it transparently reassembles the chunks that
+    carry ``parent_drawer_id=drawer_id`` into the whole verbatim memory.
+    """
     col = _get_collection()
     if not col:
         return _no_palace()
     try:
         result = col.get(ids=[drawer_id], include=["documents", "metadatas"])
         if not result["ids"]:
+            reassembled = _reassemble_chunked_drawer(col, drawer_id)
+            if reassembled is not None:
+                return reassembled
             return {"error": f"Drawer not found: {drawer_id}"}
         meta = _safe_meta(result["metadatas"][0])
         doc = result["documents"][0]
