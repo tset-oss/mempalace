@@ -1543,14 +1543,14 @@ class TestWriteTools:
         assert result["chunks"] == 1
         assert "chunk_ids" not in result
 
-    def test_add_drawer_chunked_logical_id_not_fetchable_directly(
+    def test_add_drawer_chunked_logical_id_reassembles_via_get_drawer(
         self, monkeypatch, config, palace_path, kg
     ):
-        """Documented contract on the chunked path: ``tool_get_drawer``
-        and ``tool_delete_drawer`` against the returned logical
-        ``drawer_id`` report ``not found`` because no row is stored
-        under that id. Callers must iterate ``chunk_ids`` or query by
-        ``parent_drawer_id`` metadata."""
+        """Chunked-path contract: ``tool_get_drawer`` against the returned logical
+        ``drawer_id`` reassembles the chunks into the whole verbatim memory (the
+        id add_drawer hands back is dereferenceable). A physical chunk id still
+        fetches just that chunk. ``tool_delete_drawer`` is UNCHANGED — it operates
+        per physical id, so the logical id still reports ``not found`` there."""
         _patch_mcp_server(monkeypatch, config, kg)
         _client, _col = _get_collection(palace_path, create=True)
         del _client
@@ -1559,16 +1559,19 @@ class TestWriteTools:
         result = tool_add_drawer(wing="w", room="r", content="P" * 4000)
         assert result["success"] is True and result["chunks"] > 1
 
-        # tool_get_drawer against logical id: not found.
+        # tool_get_drawer against the logical id: reassembled, byte-exact.
         got_logical = tool_get_drawer(result["drawer_id"])
-        assert "error" in got_logical and "not found" in got_logical["error"].lower()
+        assert got_logical.get("error") is None, got_logical
+        assert got_logical["content"] == "P" * 4000
+        assert got_logical["chunks"] == result["chunks"]
+        assert got_logical["chunk_ids"] == result["chunk_ids"]
 
         # tool_get_drawer against the first chunk id: found, full content slice.
         got_chunk = tool_get_drawer(result["chunk_ids"][0])
         assert got_chunk["content"] == "P" * config.chunk_size
         assert got_chunk["metadata"]["parent_drawer_id"] == result["drawer_id"]
 
-        # tool_delete_drawer against logical id: also not found.
+        # tool_delete_drawer against logical id: still not found (per-physical-id).
         deleted_logical = tool_delete_drawer(result["drawer_id"])
         assert deleted_logical["success"] is False
         assert "not found" in deleted_logical["error"].lower()
