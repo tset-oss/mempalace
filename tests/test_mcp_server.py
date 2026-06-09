@@ -854,11 +854,19 @@ class TestNoneMetadataSafety:
         from mempalace import mcp_server
 
         stub_col = MagicMock()
-        stub_col.get.return_value = {
-            "ids": ["drawer_none_meta"],
-            "documents": ["old body"],
-            "metadatas": [None],
-        }
+
+        # Single-chunk drawer with a None metadata cell: the literal ids= lookup
+        # hits the row; the where={parent_drawer_id} chunk-fetch returns nothing.
+        def _get(*, ids=None, where=None, include=None, limit=None, offset=None):
+            if ids is not None:
+                return {
+                    "ids": ["drawer_none_meta"],
+                    "documents": ["old body"],
+                    "metadatas": [None],
+                }
+            return {"ids": [], "documents": [], "metadatas": []}
+
+        stub_col.get.side_effect = _get
         monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: stub_col)
 
         result = mcp_server.tool_update_drawer("drawer_none_meta", wing="recovered")
@@ -879,11 +887,21 @@ class TestNoneMetadataSafety:
         from mempalace import mcp_server
 
         stub_col = MagicMock()
-        stub_col.get.return_value = {
-            "ids": ["drawer_none_meta"],
-            "documents": ["doomed body"],
-            "metadatas": [None],
-        }
+
+        # A single-chunk drawer: the literal ids= lookup hits one row with a None
+        # metadata cell; the where={parent_drawer_id} chunk-fetch returns nothing
+        # (no sibling chunks), mirroring a real backend. Without the distinction
+        # the stub would double-count the row into the physical-id set.
+        def _get(*, ids=None, where=None, include=None, limit=None, offset=None):
+            if ids is not None:
+                return {
+                    "ids": ["drawer_none_meta"],
+                    "documents": ["doomed body"],
+                    "metadatas": [None],
+                }
+            return {"ids": [], "documents": [], "metadatas": []}
+
+        stub_col.get.side_effect = _get
         monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: stub_col)
 
         # Should reach the delete call without AttributeError on the audit-log path.
@@ -1099,12 +1117,9 @@ class TestWriteTools:
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
 
-        class _FakeGetResult:
-            ids = []
-
         class _FakeCol:
             def get(self, **kwargs):
-                return _FakeGetResult()
+                return {"ids": []}
 
             def upsert(self, **kwargs):
                 return None
@@ -1546,11 +1561,12 @@ class TestWriteTools:
     def test_add_drawer_chunked_logical_id_reassembles_via_get_drawer(
         self, monkeypatch, config, palace_path, kg
     ):
-        """Chunked-path contract: ``tool_get_drawer`` against the returned logical
-        ``drawer_id`` reassembles the chunks into the whole verbatim memory (the
-        id add_drawer hands back is dereferenceable). A physical chunk id still
-        fetches just that chunk. ``tool_delete_drawer`` is UNCHANGED — it operates
-        per physical id, so the logical id still reports ``not found`` there."""
+        """Chunked-path contract (#1539, Option A: logical-id everywhere):
+        ``tool_get_drawer`` against the returned logical ``drawer_id`` reassembles
+        the chunks into the whole verbatim memory (the id add_drawer hands back is
+        dereferenceable). A physical chunk id now CLIMBS to the whole drawer.
+        ``tool_delete_drawer`` against the logical id removes the WHOLE drawer
+        (previously per-physical-id, leaving the logical handle "not found")."""
         _patch_mcp_server(monkeypatch, config, kg)
         _client, _col = _get_collection(palace_path, create=True)
         del _client
@@ -1566,15 +1582,236 @@ class TestWriteTools:
         assert got_logical["chunks"] == result["chunks"]
         assert got_logical["chunk_ids"] == result["chunk_ids"]
 
-        # tool_get_drawer against the first chunk id: found, full content slice.
+        # tool_get_drawer against a chunk id now climbs to the WHOLE drawer.
         got_chunk = tool_get_drawer(result["chunk_ids"][0])
-        assert got_chunk["content"] == "P" * config.chunk_size
-        assert got_chunk["metadata"]["parent_drawer_id"] == result["drawer_id"]
+        assert got_chunk["content"] == "P" * 4000
+        assert got_chunk["chunks"] == result["chunks"]
 
-        # tool_delete_drawer against logical id: still not found (per-physical-id).
+        # tool_delete_drawer against the logical id removes the whole drawer.
         deleted_logical = tool_delete_drawer(result["drawer_id"])
-        assert deleted_logical["success"] is False
-        assert "not found" in deleted_logical["error"].lower()
+        assert deleted_logical["success"] is True, deleted_logical
+        # Every physical chunk row is gone — no orphans left behind.
+        _client2, col2 = _get_collection(palace_path)
+        remaining = col2.get(where={"parent_drawer_id": result["drawer_id"]})
+        assert remaining["ids"] == [], remaining
+        assert tool_get_drawer(result["drawer_id"]).get("error"), "logical id still resolves"
+        del _client2
+
+
+# ── Drawer logical-id consolidation (#1539 Option A) ─────────────────────
+
+
+class TestDrawerLogicalIdConsolidation:
+    """delete/update/get all operate on the WHOLE logical drawer regardless of
+    the handle (single-chunk base, logical handle, or physical chunk id).
+
+    Chroma-path coverage: the verbatim row mechanics (full-set delete, re-chunk,
+    no-stale-rows, metadata-only move, chunk-id climb). Entity-row consequences
+    are covered by the postgres tests in test_drawer_logical_id_postgres.py.
+    """
+
+    @staticmethod
+    def _chunk_rows(col, logical_id):
+        return col.get(where={"parent_drawer_id": logical_id})
+
+    def test_delete_multi_chunk_base_id_removes_all_chunks(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """G002: delete_drawer(base_id) of a multi-chunk drawer removes ALL rows."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer, tool_delete_drawer
+
+        add = tool_add_drawer(wing="w", room="r", content="Q" * 4000)
+        assert add["chunks"] > 1, add
+
+        deleted = tool_delete_drawer(add["drawer_id"])
+        assert deleted["success"] is True, deleted
+
+        _c2, col2 = _get_collection(palace_path)
+        assert self._chunk_rows(col2, add["drawer_id"])["ids"] == []
+        # Spot-check a specific physical chunk id is gone too.
+        assert col2.get(ids=[add["chunk_ids"][0]])["ids"] == []
+        del _c2
+
+    def test_delete_chunk_id_removes_whole_drawer(self, monkeypatch, config, palace_path, kg):
+        """G004: delete_drawer(chunk_id) resolves to the whole drawer."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer, tool_delete_drawer
+
+        add = tool_add_drawer(wing="w", room="r", content="R" * 4000)
+        assert add["chunks"] > 1, add
+
+        deleted = tool_delete_drawer(add["chunk_ids"][1])
+        assert deleted["success"] is True, deleted
+        _c2, col2 = _get_collection(palace_path)
+        assert self._chunk_rows(col2, add["drawer_id"])["ids"] == []
+        del _c2
+
+    def test_delete_single_chunk_unchanged(self, monkeypatch, config, palace_path, kg):
+        """G002: single-chunk delete behaves exactly as before."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer, tool_delete_drawer, tool_get_drawer
+
+        add = tool_add_drawer(wing="w", room="r", content="a small note")
+        assert "chunk_ids" not in add  # single-chunk
+        deleted = tool_delete_drawer(add["drawer_id"])
+        assert deleted["success"] is True
+        assert tool_get_drawer(add["drawer_id"]).get("error")
+        # Deleting a non-existent id still reports not found.
+        assert tool_delete_drawer("nope_does_not_exist")["success"] is False
+
+    def test_update_multi_chunk_content_rechunks_byte_exact(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """G003: update_drawer(base_id, content=...) of a multi-chunk drawer
+        succeeds, re-chunks (no chunk exceeds chunk_size), and get_drawer returns
+        the new content byte-exact."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer, tool_get_drawer, tool_update_drawer
+
+        add = tool_add_drawer(wing="w", room="r", content="S" * 4000)
+        assert add["chunks"] > 1, add
+
+        new_content = "T" * 5000  # still multi-chunk, different size
+        upd = tool_update_drawer(add["drawer_id"], content=new_content)
+        assert upd["success"] is True, upd
+        assert upd["drawer_id"] == add["drawer_id"]
+        assert upd["chunks"] > 1
+
+        got = tool_get_drawer(add["drawer_id"])
+        assert got.get("error") is None, got
+        assert got["content"] == new_content  # byte-exact
+
+        # No stored chunk exceeds chunk_size.
+        _c2, col2 = _get_collection(palace_path)
+        rows = self._chunk_rows(col2, add["drawer_id"])
+        max_doc = max(len(d) for d in rows["documents"])
+        assert max_doc <= config.chunk_size, (max_doc, config.chunk_size)
+        del _c2
+
+    def test_update_multi_chunk_shrink_leaves_no_stale_chunks(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """G003: shrinking content to fewer chunks leaves NO stale _chunk_* rows."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer, tool_get_drawer, tool_update_drawer
+
+        add = tool_add_drawer(wing="w", room="r", content="U" * 8000)
+        big_count = add["chunks"]
+        assert big_count > 2, add
+
+        upd = tool_update_drawer(add["drawer_id"], content="V" * 1200)  # 2 chunks
+        assert upd["success"] is True, upd
+        assert upd["chunks"] < big_count
+
+        _c2, col2 = _get_collection(palace_path)
+        rows = self._chunk_rows(col2, add["drawer_id"])
+        # Exactly the new chunk count remains — no stranded high-index rows.
+        assert len(rows["ids"]) == upd["chunks"], rows["ids"]
+        indices = sorted(m["chunk_index"] for m in rows["metadatas"])
+        assert indices == list(range(upd["chunks"])), indices
+        del _c2
+
+        assert tool_get_drawer(add["drawer_id"])["content"] == "V" * 1200
+
+    def test_update_write_failure_leaves_prior_drawer_intact(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """HIGH: write-first, delete-stale-only. If _write_drawer_chunks raises
+        the prior drawer must still be fully readable (verbatim-always /
+        incremental-only). The old delete-before-write order violated this."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from unittest.mock import patch
+
+        from mempalace.mcp_server import tool_add_drawer, tool_get_drawer, tool_update_drawer
+
+        original = "original content of the multi-chunk drawer " * 5
+        add = tool_add_drawer(wing="w", room="r", content=original * 20)
+        assert add["chunks"] > 1, add
+
+        # Monkeypatch _write_drawer_chunks to raise after being called,
+        # simulating an embedder failure mid-update.
+        with patch(
+            "mempalace.mcp_server._write_drawer_chunks",
+            side_effect=RuntimeError("simulated embedder failure"),
+        ):
+            result = tool_update_drawer(add["drawer_id"], content="new content that never lands")
+        assert result["success"] is False, result
+
+        # The prior drawer must still be fully readable — no data loss.
+        got = tool_get_drawer(add["drawer_id"])
+        assert got.get("error") is None, got
+        assert got["content"] == original * 20, "prior content was destroyed by failed update"
+
+    def test_update_chunk_id_resolves_to_whole_drawer(self, monkeypatch, config, palace_path, kg):
+        """G004: update_drawer(chunk_id) edits the whole drawer."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer, tool_get_drawer, tool_update_drawer
+
+        add = tool_add_drawer(wing="w", room="r", content="W" * 4000)
+        assert add["chunks"] > 1, add
+
+        upd = tool_update_drawer(add["chunk_ids"][0], content="X" * 3000)
+        assert upd["success"] is True, upd
+        assert upd["drawer_id"] == add["drawer_id"]  # climbed to the logical id
+        assert tool_get_drawer(add["drawer_id"])["content"] == "X" * 3000
+
+    def test_update_metadata_only_move_updates_all_chunk_wings(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """G003: a content=None wing move updates ALL chunks' wing without re-chunk."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer, tool_update_drawer
+
+        add = tool_add_drawer(wing="oldwing", room="r", content="Y" * 4000)
+        assert add["chunks"] > 1, add
+
+        _c0, col0 = _get_collection(palace_path)
+        before = self._chunk_rows(col0, add["drawer_id"])
+        before_docs = {i: d for i, d in zip(before["ids"], before["documents"])}
+        del _c0
+
+        upd = tool_update_drawer(add["drawer_id"], wing="newwing")
+        assert upd["success"] is True and upd["wing"] == "newwing", upd
+
+        _c2, col2 = _get_collection(palace_path)
+        rows = self._chunk_rows(col2, add["drawer_id"])
+        assert rows["ids"], "chunks vanished on a metadata-only move"
+        assert all(m["wing"] == "newwing" for m in rows["metadatas"]), rows["metadatas"]
+        # Content untouched (no re-embed/re-chunk): same ids, same docs.
+        assert {i: d for i, d in zip(rows["ids"], rows["documents"])} == before_docs
+        del _c2
+
+    def test_update_single_chunk_unchanged(self, monkeypatch, config, palace_path, kg):
+        """G003: single-chunk update still works (content + metadata)."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer, tool_get_drawer, tool_update_drawer
+
+        add = tool_add_drawer(wing="w", room="r", content="tiny note")
+        assert "chunk_ids" not in add
+        upd = tool_update_drawer(add["drawer_id"], content="tinier", wing="moved")
+        assert upd["success"] is True and upd["wing"] == "moved", upd
+        got = tool_get_drawer(add["drawer_id"])
+        assert got["content"] == "tinier"
+        assert got["wing"] == "moved"
 
 
 # ── KG Tools ────────────────────────────────────────────────────────────

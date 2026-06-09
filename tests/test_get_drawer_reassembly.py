@@ -25,7 +25,7 @@ import uuid
 import pytest
 
 import mempalace.mcp_server as mcp
-from mempalace.mcp_server import _reassemble_chunked_drawer
+from mempalace.mcp_server import _reassemble_chunked_drawer, _resolve_drawer_physical_ids
 
 # ── Hermetic: _reassemble_chunked_drawer over a fake collection ──────────────
 
@@ -113,6 +113,76 @@ def test_no_chunks_returns_none():
     assert _reassemble_chunked_drawer(_FakeCol([]), "nope") is None
 
 
+# ── Hermetic: _resolve_drawer_physical_ids (the addressing authority) ─────────
+
+
+class _IdCol:
+    """Collection stub serving BOTH get(ids=[...]) and get(where={parent}).
+
+    ``_FakeCol`` only models the parent-fetch path; ``_resolve_drawer_physical_ids``
+    also does a literal id lookup first, so it needs an ids= path too.
+    """
+
+    def __init__(self, rows):
+        # rows: list of (id, document, metadata)
+        self._rows = rows
+
+    def get(self, where=None, include=None, ids=None, limit=None):
+        if ids is not None:
+            sel = [r for r in self._rows if r[0] in ids]
+        else:
+            pid = (where or {}).get("parent_drawer_id")
+            sel = [r for r in self._rows if (r[2] or {}).get("parent_drawer_id") == pid]
+        return {
+            "ids": [r[0] for r in sel],
+            "documents": [r[1] for r in sel],
+            "metadatas": [r[2] for r in sel],
+        }
+
+
+def test_resolve_single_chunk_base_id_returns_base_only():
+    """A single-chunk drawer: one row under the base id -> (base_id, [base_id])."""
+    base = "drawer_ops_r1_singledeadbeef"
+    rows = [(base, "small note", {"wing": "ops", "room": "r1", "chunk_index": 0})]
+    parent, ids = _resolve_drawer_physical_ids(_IdCol(rows), base)
+    assert parent == base
+    assert ids == [base]
+
+
+def test_resolve_multi_chunk_base_id_returns_all_chunk_ids():
+    """A logical (chunked) handle: no base row -> (base_id, [all chunk ids sorted])."""
+    base = "drawer_ops_r1_chunkydeadbeef"
+    rows = [_chunk(base, 0, "aaa"), _chunk(base, 1, "bbb"), _chunk(base, 2, "ccc")]
+    parent, ids = _resolve_drawer_physical_ids(_IdCol(rows), base)
+    assert parent == base
+    assert ids == [f"{base}_chunk_{i:06d}" for i in range(3)]
+
+
+def test_resolve_chunk_id_climbs_to_full_parent_set():
+    """Passing a physical CHUNK id climbs to its parent and returns the whole set."""
+    base = "drawer_ops_r1_chunkydeadbeef"
+    rows = [_chunk(base, 0, "aaa"), _chunk(base, 1, "bbb"), _chunk(base, 2, "ccc")]
+    parent, ids = _resolve_drawer_physical_ids(_IdCol(rows), f"{base}_chunk_000001")
+    assert parent == base
+    assert ids == [f"{base}_chunk_{i:06d}" for i in range(3)]
+
+
+def test_resolve_unknown_id_returns_empty():
+    """An id that is neither a row nor a parent -> ('drawer_nope', [])."""
+    parent, ids = _resolve_drawer_physical_ids(_IdCol([]), "drawer_nope")
+    assert parent == "drawer_nope"
+    assert ids == []
+
+
+def test_resolve_tolerates_none_metadata_cell():
+    """A None metadata cell on the literal row must not crash (defensive _safe_meta)."""
+    base = "drawer_ops_r1_nullmetadeadbeef"
+    rows = [(base, "note", None)]  # single-row base with no metadata
+    parent, ids = _resolve_drawer_physical_ids(_IdCol(rows), base)
+    assert parent == base
+    assert ids == [base]
+
+
 # ── Postgres integration: real add -> get round-trip ─────────────────────────
 
 psycopg = pytest.importorskip("psycopg")
@@ -185,9 +255,12 @@ def test_get_logical_id_reassembles_chunked_drawer(monkeypatch):
         assert got.get("error") is None, got
         assert got["content"] == content  # byte-exact
         assert got["chunks"] == add["chunks"]
-        # Each physical chunk id still fetches just that chunk.
+        # A physical chunk id now CLIMBS to the whole drawer (#1539 Option A:
+        # logical-id everywhere), not just that chunk's slice.
         one = mcp.tool_get_drawer(add["chunk_ids"][1])
-        assert one["content"] == content[800:1600]
+        assert one.get("error") is None, one
+        assert one["content"] == content  # whole drawer, byte-exact
+        assert one["chunks"] == add["chunks"]
     finally:
         get_backend("postgres")._embedder = None
         _drop(team)

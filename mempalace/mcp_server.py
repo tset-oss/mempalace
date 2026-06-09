@@ -554,7 +554,8 @@ def _unindex_drawer_entities(team, drawer_ids):
 
     Uses parent-based deletion so that chunked drawers (whose entity rows are
     keyed ``{id}_chunk_NNNNNN``) are fully cleared, not just the bare-id row.
-    Mirrors the update path which also uses ``delete_by_parent``.
+    Called by the delete path; the update path uses ``_reindex_drawer_entities``
+    which wraps the same ``delete_by_parent`` call together with re-indexing.
     """
     if _config.backend == "chroma":
         return
@@ -564,6 +565,34 @@ def _unindex_drawer_entities(team, drawer_ids):
             idx.delete_by_parent(drawer_id)
     except Exception:
         logger.debug("entity index delete failed (best-effort)", exc_info=True)
+
+
+def _reindex_drawer_entities(team, parent, pairs, wing, room):
+    """Best-effort: purge a drawer's entity rows and re-index ``pairs`` (server mode).
+
+    Shared by ``tool_update_drawer``'s content-replace and metadata-only paths.
+    Captures the caller-topic labels BEFORE the purge (the re-index re-derives
+    extracted entities from the new text but cannot recover topics — they live
+    only in the entity index + wing-topic substrate, so they would otherwise be
+    dropped), drops EVERY prior physical row via ``delete_by_parent`` (bare id +
+    all ``{parent}_chunk_*``), then re-indexes ``pairs`` keyed on their physical
+    ids and re-stamps the preserved topics with the NEW wing/room. ``pairs`` is an
+    iterable of ``(drawer_id, text)``. NEVER raises — an entity-index failure must
+    not fail or undo the acknowledged verbatim write.
+    """
+    if _config.backend == "chroma":
+        return
+    idx = _get_entity_index(team)
+    try:
+        preserved_topics = idx.topic_labels_for_parent(parent)
+    except Exception:
+        logger.debug("topic-label capture failed (best-effort)", exc_info=True)
+        preserved_topics = []
+    try:
+        idx.delete_by_parent(parent)
+    except Exception:
+        logger.debug("entity index parent-delete failed (best-effort)", exc_info=True)
+    _index_drawer_entities(team, pairs, wing, room, topic_labels=preserved_topics)
 
 
 def _index_wing_topics(team, wing, topics):
@@ -2383,6 +2412,122 @@ def tool_follow_tunnels(wing: str, room: str):
 # ==================== WRITE TOOLS ====================
 
 
+def _resolve_drawer_physical_ids(col, drawer_id):
+    """Resolve any drawer handle to ``(parent, physical_ids)``.
+
+    The single addressing authority shared by the delete/update/get paths.
+    ``drawer_id`` may be (a) the LOGICAL group handle of a chunked drawer
+    (no row exists under it — only ``{id}_chunk_NNNNNN`` rows carrying
+    ``parent_drawer_id=id``), (b) a single-chunk BASE id (one row under the
+    id itself, ``chunk_index=0``, no ``parent_drawer_id``), or (c) a physical
+    CHUNK id (a row whose metadata carries ``parent_drawer_id`` pointing at
+    the logical group it belongs to).
+
+    Resolution: look up the literal row; if it exists and carries
+    ``parent_drawer_id`` it is a chunk id, so climb to that parent; if it
+    exists without a parent it is a single-chunk base id (parent = itself);
+    if no literal row exists, treat ``drawer_id`` as a logical handle
+    (parent = itself). Then fetch every chunk row by ``parent_drawer_id`` and
+    return the UNION of the base row id (only if a literal row exists under
+    the resolved parent) plus all chunk-row ids — base id first, then chunk
+    ids ascending.
+
+    Returns ``(parent, physical_ids)`` where ``parent`` is the resolved
+    logical group id (useful for entity-index and WAL operations) and
+    ``physical_ids`` is the full list of row ids to operate on. A single-chunk
+    drawer returns ``(base_id, [base_id])``; a multi-chunk drawer returns
+    ``(base_id, [chunk_id_0, …])``;  an unknown id returns ``("", [])``.
+
+    Defensive: a missing/None ``metadatas`` cell never crashes (``_safe_meta``).
+    """
+    literal = col.get(ids=[drawer_id], include=["metadatas"])
+    literal_ids = literal.get("ids") or []
+    literal_metas = literal.get("metadatas") or []
+    literal_exists = bool(literal_ids)
+    if literal_exists:
+        literal_meta = _safe_meta(literal_metas[0] if literal_metas else None)
+        parent = literal_meta.get("parent_drawer_id") or drawer_id
+    else:
+        parent = drawer_id
+
+    physical_ids = []
+    # The base row exists under ``parent`` when the literal lookup hit AND it
+    # was not a chunk id (chunk ids resolve parent to a DIFFERENT logical id,
+    # under which no base row is stored on the chunked write path).
+    if literal_exists and parent == drawer_id:
+        physical_ids.append(parent)
+
+    chunks = col.get(where={"parent_drawer_id": parent}, include=[])
+    # The chunk ids are zero-padded to six digits (_chunk_%06d), so lexical
+    # sort is identical to numeric order — sorted() is correct here.
+    chunk_ids = sorted(chunks.get("ids") or [])
+    physical_ids.extend(chunk_ids)
+    return parent, physical_ids
+
+
+def _write_drawer_chunks(col, base_id, content, base_meta):
+    """Verbatim chunk write + readback probe for a drawer (no side-effects).
+
+    The write core extracted verbatim from ``tool_add_drawer``: decides the
+    single-doc vs chunked shape, builds ids/docs/metas, does ONE batched
+    ``col.upsert``, and probes the write back. Returns ``(chunk_ids,
+    chunk_docs)`` — the physical ids and the doc slice written under each, so
+    the caller can ``zip`` them for per-chunk entity indexing.
+
+    * ``content`` <= ``chunk_size``: one row under ``base_id`` itself,
+      ``chunk_index=0``, NO ``parent_drawer_id``; readback ``base_id``;
+      returns ``([base_id], [content])``.
+    * ``content``  > ``chunk_size``: N rows under ``{base_id}_chunk_NNNNNN``,
+      each ``chunk_index`` + ``parent_drawer_id=base_id``; single batched
+      upsert; readback the LAST chunk id (its presence implies the all-or-
+      nothing batch landed whole).
+
+    Verbatim-exact: chunk slicing is ``content[i:i+chunk_size]`` with step ==
+    chunk_size (no overlap) so concatenation restores the bytes. Raises
+    ``RuntimeError`` on a readback miss. Idempotency probing, entity/topic/
+    closet/derived-link/graph-cache side-effects and WAL logging stay in the
+    orchestrating tool — this helper is ONLY the verbatim write + readback.
+    """
+    chunk_size = _config.chunk_size
+    if len(content) <= chunk_size:
+        col.upsert(
+            ids=[base_id],
+            documents=[content],
+            metadatas=[{**base_meta, "chunk_index": 0}],
+        )
+        inserted = col.get(ids=[base_id], include=[])
+        if not inserted.get("ids"):
+            raise RuntimeError(
+                f"Drawer write was acknowledged but {base_id!r} is not readable. "
+                "The palace index may be stale; run reconnect or repair."
+            )
+        return [base_id], [content]
+
+    # Oversized content: split into bounded per-chunk drawers so the
+    # embedding model never sees a document above ``chunk_size``.
+    # Single batched ``upsert`` so the embedding pass either commits
+    # every chunk or none — no half-written palace if the embedding
+    # model fails mid-loop (#1539).
+    chunk_ids: list[str] = []
+    chunk_docs: list[str] = []
+    chunk_metas: list[dict] = []
+    for i in range(0, len(content), chunk_size):
+        chunk_idx = i // chunk_size
+        chunk_ids.append(f"{base_id}_chunk_{chunk_idx:06d}")
+        chunk_docs.append(content[i : i + chunk_size])
+        chunk_metas.append({**base_meta, "chunk_index": chunk_idx, "parent_drawer_id": base_id})
+    col.upsert(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
+    # Probe the LAST chunk id, not the first — its presence confirms
+    # the whole batch landed, not just the leading row.
+    inserted = col.get(ids=[chunk_ids[-1]], include=[])
+    if not inserted.get("ids"):
+        raise RuntimeError(
+            f"Drawer write was acknowledged but {chunk_ids[-1]!r} is not readable. "
+            "The palace index may be stale; run reconnect or repair."
+        )
+    return chunk_ids, chunk_docs
+
+
 def tool_add_drawer(
     wing: str,
     room: str,
@@ -2399,10 +2544,10 @@ def tool_add_drawer(
     linkage and ``chunk_index`` metadata so search can rejoin them. The
     returned ``drawer_id`` is the LOGICAL group handle on the chunked
     path; physical drawer ids are in ``chunk_ids`` (#1539).
-    ``tool_get_drawer(drawer_id)`` accepts this logical id and transparently
-    reassembles the chunks into the whole verbatim memory. ``tool_delete_drawer``
-    still operates per physical id — iterate ``chunk_ids`` (or query by
-    ``parent_drawer_id``) to delete the underlying rows.
+    ``tool_get_drawer``, ``tool_update_drawer``, and ``tool_delete_drawer`` all
+    accept the returned logical ``drawer_id`` (or any physical chunk id) and
+    operate on the WHOLE logical drawer — reassembling, re-chunking, or removing
+    all physical rows respectively (#1539, Option A: logical-id everywhere).
 
     ``topics`` is an optional list of TOPIC labels for this drawer's wing
     (e.g. ``["Angular", "OpenAPI"]``). On the central postgres backend they
@@ -2474,131 +2619,94 @@ def tool_add_drawer(
         idempotency_probe_ids = [drawer_id, f"{drawer_id}_chunk_{last_chunk_idx:06d}"]
     try:
         existing = col.get(ids=idempotency_probe_ids, include=[])
-        if existing.ids:
+        if existing.get("ids"):
             return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
     except Exception:
         logger.debug("Idempotency pre-check failed for %s", idempotency_probe_ids, exc_info=True)
 
     try:
-        if len(content) <= chunk_size:
-            col.upsert(
-                ids=[drawer_id],
-                documents=[content],
-                metadatas=[{**base_meta, "chunk_index": 0}],
-            )
-            inserted = col.get(ids=[drawer_id], include=[])
-            if not inserted.ids:
-                raise RuntimeError(
-                    "Drawer write was acknowledged but the new ID is not readable. "
-                    "The palace index may be stale; run reconnect or repair."
-                )
-            _metadata_cache = None
-            # Best-effort per-vault entity index (server mode); never fails the
-            # write. Single physical row -> one (id, text) chunk pair. Caller
-            # topics are stamped as recall-only entity rows so the drawer is
-            # findable via entity= even when the label isn't in the text.
-            _index_drawer_entities(
-                add_team, [(drawer_id, content)], wing, room, topic_labels=topics
-            )
-            # Best-effort per-vault topic labels (server mode); never fails the
-            # write. Drives cross-wing topic tunnels via the rebuild below.
-            _index_wing_topics(add_team, wing, topics)
-            # Best-effort server-side closet rebuild (server mode); never fails the write.
-            _enqueue_closet_rebuild(add_team, source_file, wing, room)
-            # Best-effort server-side derived-link rebuild (server mode); never fails the write.
-            _enqueue_derived_link_rebuild(add_team, wing)
-            # Evict ONLY this vault's stale graph-cache entry so graph_stats /
-            # traverse reflect the new drawer within the same request instead of
-            # serving the pre-write graph for up to the TTL. ``col`` is the same
-            # collection just written, so its key matches the read path's; never
-            # pass col=None here (that would clear every team's warm cache).
-            # Best-effort: a cache miss must not fail an acknowledged write.
-            try:
-                invalidate_graph_cache(col=col, config=_config)
-            except Exception:
-                logger.debug("graph-cache invalidation failed (best-effort)", exc_info=True)
-            logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
-            return {
-                "success": True,
-                "drawer_id": drawer_id,
-                "wing": wing,
-                "room": room,
-                "chunks": 1,
-            }
-
-        # Oversized content: split into bounded per-chunk drawers so the
-        # embedding model never sees a document above ``chunk_size``.
-        # Single batched ``upsert`` so the embedding pass either commits
-        # every chunk or none — no half-written palace if the embedding
-        # model fails mid-loop (#1539).
-        chunk_ids: list[str] = []
-        chunk_docs: list[str] = []
-        chunk_metas: list[dict] = []
-        for i in range(0, len(content), chunk_size):
-            chunk_idx = i // chunk_size
-            chunk_ids.append(f"{drawer_id}_chunk_{chunk_idx:06d}")
-            chunk_docs.append(content[i : i + chunk_size])
-            chunk_metas.append(
-                {**base_meta, "chunk_index": chunk_idx, "parent_drawer_id": drawer_id}
-            )
-        col.upsert(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
-        # Probe the LAST chunk id, not the first — its presence confirms
-        # the whole batch landed, not just the leading row.
-        inserted = col.get(ids=[chunk_ids[-1]], include=[])
-        if not inserted.ids:
-            raise RuntimeError(
-                "Drawer write was acknowledged but the new ID is not readable. "
-                "The palace index may be stale; run reconnect or repair."
-            )
+        # Verbatim write core (single-doc vs chunked shape + readback probe).
+        # ``chunk_ids``/``chunk_docs`` are the physical ids and the doc slice
+        # written under each — the addressing surface the side-effects key on.
+        chunk_ids, chunk_docs = _write_drawer_chunks(col, drawer_id, content, base_meta)
+        multi_chunk = len(chunk_ids) > 1
         _metadata_cache = None
-        # Best-effort per-vault entity index (server mode). Keyed on the physical
-        # chunk ids actually written so delete/update stay consistent, and each
-        # chunk is tagged with the entities in its OWN text slice (per-chunk,
-        # matching the chroma miner) — not the whole-drawer set on every id.
-        # Caller topics are stamped (recall-only) on every chunk.
+        # Best-effort per-vault entity index (server mode); never fails the
+        # write. Keyed on the physical chunk ids actually written so
+        # delete/update stay consistent, and each chunk is tagged with the
+        # entities in its OWN text slice (per-chunk, matching the chroma miner)
+        # — not the whole-drawer set on every id. Caller topics are stamped as
+        # recall-only entity rows so the drawer is findable via entity= even
+        # when the label isn't in the text.
         _index_drawer_entities(
             add_team, list(zip(chunk_ids, chunk_docs)), wing, room, topic_labels=topics
         )
-        # Best-effort per-vault topic labels (server mode); never fails the write.
+        # Best-effort per-vault topic labels (server mode); never fails the
+        # write. Drives cross-wing topic tunnels via the rebuild below.
         _index_wing_topics(add_team, wing, topics)
         # Best-effort server-side closet rebuild (server mode); never fails the write.
         _enqueue_closet_rebuild(add_team, source_file, wing, room)
         # Best-effort server-side derived-link rebuild (server mode); never fails the write.
         _enqueue_derived_link_rebuild(add_team, wing)
-        # Evict ONLY this vault's stale graph-cache entry (see single-doc path).
+        # Evict ONLY this vault's stale graph-cache entry so graph_stats /
+        # traverse reflect the new drawer within the same request instead of
+        # serving the pre-write graph for up to the TTL. ``col`` is the same
+        # collection just written, so its key matches the read path's; never
+        # pass col=None here (that would clear every team's warm cache).
         # Best-effort: a cache miss must not fail an acknowledged write.
         try:
             invalidate_graph_cache(col=col, config=_config)
         except Exception:
             logger.debug("graph-cache invalidation failed (best-effort)", exc_info=True)
-        logger.info(f"Filed drawer: {drawer_id} → {wing}/{room} ({len(chunk_ids)} chunks)")
+        if multi_chunk:
+            logger.info(f"Filed drawer: {drawer_id} → {wing}/{room} ({len(chunk_ids)} chunks)")
+            return {
+                "success": True,
+                "drawer_id": drawer_id,
+                "wing": wing,
+                "room": room,
+                "chunks": len(chunk_ids),
+                "chunk_ids": chunk_ids,
+            }
+        logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
         return {
             "success": True,
             "drawer_id": drawer_id,
             "wing": wing,
             "room": room,
-            "chunks": len(chunk_ids),
-            "chunk_ids": chunk_ids,
+            "chunks": 1,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 def tool_delete_drawer(drawer_id: str):
-    """Delete a single drawer by ID."""
+    """Delete a drawer by any handle, whole-logical-drawer (#1539, Option A).
+
+    ``drawer_id`` may be a single-chunk base id, the LOGICAL handle of a chunked
+    drawer, or a physical chunk id; every form resolves to the SAME logical
+    drawer and ALL its physical rows are removed. Deleting a single chunk id
+    used to orphan its siblings (a half-deleted, non-verbatim drawer); the
+    resolver's full row-id set is the fix.
+    """
     global _metadata_cache
     col = _get_collection()
     if not col:
         return _no_palace()
-    existing = col.get(ids=[drawer_id])
-    if not existing["ids"]:
+    # resolved_parent is the logical group id used for entity-index operations;
+    # physical_ids is the full set of rows to delete.
+    resolved_parent, physical_ids = _resolve_drawer_physical_ids(col, drawer_id)
+    if not physical_ids:
         return {"success": False, "error": f"Drawer not found: {drawer_id}"}
 
-    # Log the deletion with the content being removed for audit trail
-    deleted_content = existing.get("documents", [""])[0] if existing.get("documents") else ""
-    deleted_meta = _safe_meta(
-        existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
-    )
+    # The audit row uses the FIRST resolved physical row for the deleted-meta +
+    # content preview, as before. Fetch docs+metas for the whole set in one get.
+    existing = col.get(ids=physical_ids, include=["documents", "metadatas"])
+    docs = existing.get("documents") or []
+    metas = existing.get("metadatas") or []
+    deleted_content = docs[0] if docs else ""
+    deleted_meta = _safe_meta(metas[0] if metas else {})
+
     _wal_log(
         "delete_drawer",
         {
@@ -2609,12 +2717,13 @@ def tool_delete_drawer(drawer_id: str):
     )
 
     try:
-        col.delete(ids=[drawer_id])
+        col.delete(ids=physical_ids)
         _metadata_cache = None
         # Best-effort: drop the drawer's entity rows (server mode). Same team
-        # _get_collection() resolved (implicit session/default).
+        # _get_collection() resolved (implicit session/default). delete_by_parent
+        # clears the bare parent row + all ``{parent}_chunk_*`` rows in one shot.
         del_team = _resolve_team() if _config.backend != "chroma" else None
-        _unindex_drawer_entities(del_team, [drawer_id])
+        _unindex_drawer_entities(del_team, [resolved_parent])
         # Best-effort server-side derived-link rebuild for the deleted drawer's
         # wing (a delete removes co-occurrence rows). Never fails the delete.
         del_wing = deleted_meta.get("wing") if isinstance(deleted_meta, dict) else None
@@ -2756,12 +2865,14 @@ def _reassemble_chunked_drawer(col, drawer_id):
 
 
 def tool_get_drawer(drawer_id: str):
-    """Fetch a single drawer by ID. Returns full content and metadata.
+    """Fetch a drawer by any handle, whole-logical-drawer (#1539, Option A).
 
-    Accepts either a physical drawer/chunk id OR the LOGICAL group handle of a
-    chunked drawer (the ``drawer_id`` add_drawer returns for oversized content):
-    when no row exists under the id, it transparently reassembles the chunks that
-    carry ``parent_drawer_id=drawer_id`` into the whole verbatim memory.
+    Accepts a single-chunk base id, the LOGICAL group handle of a chunked drawer
+    (the ``drawer_id`` add_drawer returns for oversized content), OR a physical
+    chunk id. A chunk id used to return just that chunk; it now climbs to its
+    ``parent_drawer_id`` and reassembles the WHOLE verbatim memory. When no row
+    exists under the id it is treated as a logical handle and the chunks carrying
+    ``parent_drawer_id=drawer_id`` are rejoined.
     """
     col = _get_collection()
     if not col:
@@ -2774,6 +2885,10 @@ def tool_get_drawer(drawer_id: str):
                 return reassembled
             return {"error": f"Drawer not found: {drawer_id}"}
         meta = _safe_meta(result["metadatas"][0])
+        # A chunk id carries ``parent_drawer_id`` -> climb to the whole drawer.
+        parent = meta.get("parent_drawer_id")
+        if parent:
+            return _reassemble_chunked_drawer(col, parent)
         doc = result["documents"][0]
         # source_file is the absolute filesystem path written by the
         # miners. Reduce to its basename before handing it to the MCP
@@ -2855,7 +2970,20 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
 
 
 def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, room: str = None):
-    """Update an existing drawer's content and/or metadata."""
+    """Update a drawer by any handle, whole-logical-drawer (#1539, Option A).
+
+    A base id of a MULTI-CHUNK drawer is now editable (it used to report "not
+    found" because no row exists under the logical handle). ``drawer_id`` may be
+    a single-chunk base id, a logical handle, or a physical chunk id; all resolve
+    to the same logical drawer.
+
+    A content change REPLACES via re-chunk: the old physical rows are dropped and
+    ``_write_drawer_chunks`` re-splits the new content so every chunk stays within
+    ``chunk_size`` (overwriting chunk 0 with the full text would breach the
+    embedder bound and strand sibling chunks). Entities are re-indexed on the NEW
+    chunk-id set. A metadata-only move patches wing/room across ALL physical rows
+    in place (no needless re-embed) and refreshes the entity rows' wing/room.
+    """
     global _metadata_cache
 
     if content is None and wing is None and room is None:
@@ -2865,95 +2993,105 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
     if not col:
         return _no_palace()
     try:
-        existing = col.get(ids=[drawer_id], include=["documents", "metadatas"])
-        if not existing["ids"]:
+        # parent is the logical group id (used for WAL, entity-index, return value);
+        # physical_ids is the full row set the old content occupies.
+        parent, physical_ids = _resolve_drawer_physical_ids(col, drawer_id)
+        if not physical_ids:
             return {"success": False, "error": f"Drawer not found: {drawer_id}"}
 
-        old_meta = _safe_meta(existing["metadatas"][0])
-        old_doc = existing["documents"][0]
+        # Old logical meta/content from the FIRST physical row.
+        existing = col.get(ids=physical_ids, include=["documents", "metadatas"])
+        ex_metas = existing.get("metadatas") or []
+        old_meta = _safe_meta(ex_metas[0] if ex_metas else {})
 
-        new_doc = old_doc
+        # Build the new base meta from the old logical meta: the writer re-adds
+        # ``chunk_index``/``parent_drawer_id`` per row, so drop them here.
+        new_base_meta = dict(old_meta)
+        new_base_meta.pop("chunk_index", None)
+        new_base_meta.pop("parent_drawer_id", None)
+
+        new_doc = None
         if content is not None:
             try:
                 new_doc = sanitize_content(content)
             except ValueError as e:
                 return {"success": False, "error": str(e)}
 
-        new_meta = dict(old_meta)
         if wing is not None:
             try:
-                new_meta["wing"] = sanitize_name(wing, "wing")
+                new_base_meta["wing"] = sanitize_name(wing, "wing")
             except ValueError as e:
                 return {"success": False, "error": str(e)}
         if room is not None:
             try:
-                new_meta["room"] = sanitize_name(room, "room")
+                new_base_meta["room"] = sanitize_name(room, "room")
             except ValueError as e:
                 return {"success": False, "error": str(e)}
+
+        new_wing = new_base_meta.get("wing")
+        new_room = new_base_meta.get("room")
+        old_wing = old_meta.get("wing")
 
         _wal_log(
             "update_drawer",
             {
-                "drawer_id": drawer_id,
-                "old_wing": old_meta.get("wing", ""),
+                "drawer_id": parent,
+                "old_wing": old_wing or "",
                 "old_room": old_meta.get("room", ""),
-                "new_wing": new_meta.get("wing", ""),
-                "new_room": new_meta.get("room", ""),
+                "new_wing": new_wing or "",
+                "new_room": new_room or "",
                 "content_changed": content is not None,
                 "content_preview": new_doc[:200] if content is not None else None,
             },
         )
 
-        update_kwargs = {"ids": [drawer_id]}
+        server_mode = _config.backend != "chroma"
+        upd_team = _resolve_team() if server_mode else None
+
         if content is not None:
-            update_kwargs["documents"] = [new_doc]
-        update_kwargs["metadatas"] = [new_meta]
-        col.update(**update_kwargs)
-
-        _metadata_cache = None
-
-        # Best-effort: re-index entities (server mode). An update can change the
-        # content, wing, or room, any of which alters the entity rows, so drop
-        # and re-extract from the new state rather than leaving stale rows.
-        #
-        # The add path keys a chunked drawer's entity rows on its physical chunk
-        # ids (``{drawer_id}_chunk_NNNNNN``), but this single-row update writes
-        # only ``drawer_id``. Unindexing the bare id alone would ORPHAN any
-        # ``{drawer_id}_chunk_*`` rows a prior chunked add left behind (and a
-        # re-chunk that shrinks the count would strand stale high-index rows).
-        # So drop by the parent prefix — the bare id plus every chunk-id row —
-        # then re-index the new content keyed on the single physical id actually
-        # written, leaving no orphans regardless of the prior chunk count.
-        if _config.backend != "chroma":
-            upd_team = _resolve_team()
-            idx = _get_entity_index(upd_team)
-            # Capture the drawer's caller-topic labels BEFORE the purge: the
-            # re-index re-derives extracted entities from the new content but
-            # cannot recover topics (they live only in the entity index + the
-            # wing-topic substrate), so without this an edit would silently drop
-            # the drawer's entity= recall tags. Re-stamped below with the NEW
-            # wing/room. Best-effort: never fails the acknowledged update.
-            try:
-                preserved_topics = idx.topic_labels_for_parent(drawer_id)
-            except Exception:
-                logger.debug("topic-label capture failed (best-effort)", exc_info=True)
-                preserved_topics = []
-            try:
-                idx.delete_by_parent(drawer_id)
-            except Exception:
-                logger.debug("entity index parent-delete failed (best-effort)", exc_info=True)
-            _index_drawer_entities(
-                upd_team,
-                [(drawer_id, new_doc)],
-                new_meta.get("wing"),
-                new_meta.get("room"),
-                topic_labels=preserved_topics,
+            # Write-first, delete-stale-only: upsert the new content BEFORE
+            # removing any old rows. This way a write failure (e.g. an embedder
+            # error inside _write_drawer_chunks) leaves the prior drawer fully
+            # intact — verbatim-always / incremental-only guarantee preserved.
+            # Overlapping chunk ids (same count or smaller new content) are
+            # overwritten in place by the upsert; only ids that belong to the
+            # old set but not the new set are removed afterwards.
+            new_chunk_ids, new_chunk_docs = _write_drawer_chunks(
+                col, parent, new_doc, new_base_meta
             )
-            # Best-effort server-side derived-link rebuild for the new wing AND
-            # the prior wing when the update moved the drawer (a wing change
-            # alters co-occurrence on BOTH wings). Never fails the write.
-            new_wing = new_meta.get("wing")
-            old_wing = (old_meta or {}).get("wing")
+            stale = [pid for pid in physical_ids if pid not in set(new_chunk_ids)]
+            if stale:
+                col.delete(ids=stale)
+            _metadata_cache = None
+            # Re-index entities keyed on the NEW chunk ids — not just the bare
+            # parent. Indexing only ``[(parent, new_doc)]`` would strand every
+            # sibling chunk's entity rows (the original bug this fix targets).
+            _reindex_drawer_entities(
+                upd_team, parent, list(zip(new_chunk_ids, new_chunk_docs)), new_wing, new_room
+            )
+        else:
+            # Metadata-only move (content is None, wing and/or room changed): do
+            # NOT re-chunk (avoid a needless re-embed). Patch wing/room across ALL
+            # physical rows in place, preserving each row's chunk_index/parent.
+            ex_docs = existing.get("documents") or []
+            for i, pid in enumerate(physical_ids):
+                row_meta = _safe_meta(ex_metas[i] if i < len(ex_metas) else {})
+                if wing is not None:
+                    row_meta["wing"] = new_wing
+                if room is not None:
+                    row_meta["room"] = new_room
+                col.update(ids=[pid], metadatas=[row_meta])
+            _metadata_cache = None
+            # Refresh the entity rows for the new wing/room: re-index every
+            # physical row's doc under its OWN id so no sibling is stranded.
+            _reindex_drawer_entities(
+                upd_team, parent, list(zip(physical_ids, ex_docs)), new_wing, new_room
+            )
+
+        # Best-effort server-side derived-link rebuild for the new wing AND the
+        # prior wing when the update moved the drawer (a wing change alters
+        # co-occurrence on BOTH wings). Never fails the write.
+        if server_mode:
             for w in {new_wing, old_wing}:
                 if w:
                     _enqueue_derived_link_rebuild(upd_team, w)
@@ -2968,13 +3106,18 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         except Exception:
             logger.debug("graph-cache invalidation failed (best-effort)", exc_info=True)
 
-        logger.info(f"Updated drawer: {drawer_id}")
-        return {
+        logger.info(f"Updated drawer: {parent}")
+        result = {
             "success": True,
-            "drawer_id": drawer_id,
-            "wing": new_meta.get("wing", ""),
-            "room": new_meta.get("room", ""),
+            "drawer_id": parent,
+            "wing": new_wing or "",
+            "room": new_room or "",
         }
+        if content is not None:
+            result["chunks"] = len(new_chunk_ids)
+            if len(new_chunk_ids) > 1:
+                result["chunk_ids"] = new_chunk_ids
+        return result
     except Exception as e:
         return {"success": False, "error": str(e)}
 
