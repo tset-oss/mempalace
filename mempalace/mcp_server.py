@@ -2578,6 +2578,12 @@ def tool_add_drawer(
     string overlap — no LLM at tunnel time. Best-effort: a topic-index failure
     never fails the verbatim write. Ignored on local (chroma) installs, which
     keep their own host-global topics path.
+
+    On the central (postgres) backend a team-less call RAISES
+    ``ValueError("no team resolved …")`` rather than silently writing into a
+    shared default vault. An explicit ``vault=`` argument is honored: it is
+    passed to the strict resolver so a header-less caller can still target a
+    known vault directly.
     """
     global _metadata_cache
     try:
@@ -2590,11 +2596,18 @@ def tool_add_drawer(
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
-    # Server-mode write routing: an explicit ``vault=`` targets that team, else
-    # the per-session active team (header / switch_team). Resolve ONCE so the
-    # collection write and the WAL audit row agree on the target vault. Chroma
-    # is single-vault, so team stays None.
-    add_team = _resolve_team(vault) if _config.backend != "chroma" else None
+    # Server-mode write routing: resolve FIRST so a team-less write fails loud
+    # BEFORE _get_collection(create=True) and BEFORE _wal_log (the
+    # diary_write / kg_add strict-writer pattern). An explicit ``vault=``
+    # argument is honored via _resolve_team_strict(vault) so a headerless
+    # caller with a known vault target still succeeds. Chroma is single-vault
+    # (team stays None) and skips the strict check.
+    if _config.backend != "chroma":
+        from .link_store import require_write_team
+
+        add_team = require_write_team(_resolve_team_strict(vault))
+    else:
+        add_team = None
     col = _get_collection(create=True, team=add_team)
     if not col:
         return _no_palace()
@@ -2710,8 +2723,17 @@ def tool_delete_drawer(drawer_id: str):
     drawer and ALL its physical rows are removed. Deleting a single chunk id
     used to orphan its siblings (a half-deleted, non-verbatim drawer); the
     resolver's full row-id set is the fix.
+
+    Hardening (central postgres backend): a team-less call RAISES
+    ``ValueError("no team resolved …")`` rather than routing silently to the
+    default vault. This tool is ``create=False`` and cannot materialize a new
+    schema, so this is purely a routing-safety hardening, not a leak fix.
     """
     global _metadata_cache
+    if _config.backend != "chroma":
+        from .link_store import require_write_team
+
+        require_write_team(_resolve_team_strict())
     col = _get_collection()
     if not col:
         return _no_palace()
@@ -2744,7 +2766,7 @@ def tool_delete_drawer(drawer_id: str):
         # Best-effort: drop the drawer's entity rows (server mode). Same team
         # _get_collection() resolved (implicit session/default). delete_by_parent
         # clears the bare parent row + all ``{parent}_chunk_*`` rows in one shot.
-        del_team = _resolve_team() if _config.backend != "chroma" else None
+        del_team = _resolve_team_strict() if _config.backend != "chroma" else None
         _unindex_drawer_entities(del_team, [resolved_parent])
         # Best-effort server-side derived-link rebuild for the deleted drawer's
         # wing (a delete removes co-occurrence rows). Never fails the delete.
@@ -3005,12 +3027,21 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
     embedder bound and strand sibling chunks). Entities are re-indexed on the NEW
     chunk-id set. A metadata-only move patches wing/room across ALL physical rows
     in place (no needless re-embed) and refreshes the entity rows' wing/room.
+
+    Hardening (central postgres backend): a team-less call RAISES
+    ``ValueError("no team resolved …")`` rather than routing silently to the
+    default vault. This tool is ``create=False`` and cannot materialize a new
+    schema, so this is purely a routing-safety hardening, not a leak fix.
     """
     global _metadata_cache
 
     if content is None and wing is None and room is None:
         return {"success": True, "drawer_id": drawer_id, "noop": True}
 
+    if _config.backend != "chroma":
+        from .link_store import require_write_team
+
+        require_write_team(_resolve_team_strict())
     col = _get_collection()
     if not col:
         return _no_palace()
@@ -3068,7 +3099,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         )
 
         server_mode = _config.backend != "chroma"
-        upd_team = _resolve_team() if server_mode else None
+        upd_team = _resolve_team_strict() if server_mode else None
 
         if content is not None:
             # Write-first, delete-stale-only: upsert the new content BEFORE

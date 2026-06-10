@@ -72,6 +72,20 @@ def _use_team(mcp, monkeypatch, team):
     monkeypatch.setenv("MEMPALACE_TEAM", team)
     monkeypatch.setattr(mcp, "_config", MempalaceConfig())
     mcp._kg_by_path.clear()
+    # Set the per-request contextvar so strict resolvers see the team.
+    # Use monkeypatch.setattr on _active_team_var so monkeypatch teardown
+    # restores the original ContextVar object (and thus its original value).
+    # On the first call per test we swap in a fresh ContextVar pre-seeded with
+    # team; subsequent calls (e.g. switching fe -> be) just set the current var.
+    if not getattr(monkeypatch, "_team_var_replaced", False):
+        import contextvars
+
+        new_var = contextvars.ContextVar("_active_team_var_test", default=None)
+        new_var.set(team)
+        monkeypatch.setattr(mcp, "_active_team_var", new_var)
+        monkeypatch._team_var_replaced = True
+    else:
+        mcp._active_team_var.set(team)
 
 
 def test_central_team_vault_e2e(monkeypatch):

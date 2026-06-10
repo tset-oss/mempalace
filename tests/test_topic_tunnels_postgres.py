@@ -293,7 +293,8 @@ def pg_mcp(monkeypatch, backend):
     monkeypatch.setattr(mcp, "_config", MempalaceConfig())
     # Deterministic embedder so add_drawer does not download ONNX weights.
     get_backend("postgres")._embedder = _embed_384
-    token = mcp._active_team_var.set(None)
+    # Set the per-request contextvar so strict resolvers see the team.
+    token = mcp._active_team_var.set(t)
     mcp._link_store_by_team.clear()
     mcp._entity_index_by_team.clear()
     mcp._kg_by_path.clear()

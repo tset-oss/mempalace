@@ -80,6 +80,14 @@ def _use_team(mcp, monkeypatch, team):
     monkeypatch.setenv("MEMPALACE_TEAM", team)
     monkeypatch.setattr(mcp, "_config", MempalaceConfig())
     mcp._kg_by_path.clear()
+    # Set the per-request contextvar so strict resolvers see the team.
+    # Swap the module-level ContextVar with a fresh one pre-seeded with team;
+    # monkeypatch restores the original on teardown (no cross-test leak).
+    import contextvars
+
+    new_var = contextvars.ContextVar("_active_team_var_test", default=None)
+    new_var.set(team)
+    monkeypatch.setattr(mcp, "_active_team_var", new_var)
 
 
 def _hallway_pairs(mcp, team):

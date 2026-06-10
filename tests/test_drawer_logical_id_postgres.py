@@ -73,6 +73,8 @@ def _drop(team):
 
 
 def _setup(monkeypatch):
+    import contextvars
+
     from mempalace.config import MempalaceConfig
 
     team = "t" + uuid.uuid4().hex[:10]
@@ -82,6 +84,11 @@ def _setup(monkeypatch):
     get_backend("postgres")._embedder = _fake_embed
     monkeypatch.setattr(mcp, "_config", MempalaceConfig())
     mcp._kg_by_path.clear()
+    # Replace the module-level ContextVar with a fresh one seeded to team so
+    # strict resolvers see it; monkeypatch restores the original on teardown.
+    new_var = contextvars.ContextVar("_active_team_var_test", default=None)
+    new_var.set(team)
+    monkeypatch.setattr(mcp, "_active_team_var", new_var)
     return team
 
 

@@ -102,8 +102,8 @@ def pg_closet_env(monkeypatch):
     # Force a fresh debouncer bound to this env (0s window).
     m._closet_debouncer = None
     m._closet_reconcile_started = False
-    # No stale session team leaks into _resolve_team().
-    token = m._active_team_var.set(None)
+    # Set the per-request contextvar so strict resolvers see the team.
+    token = m._active_team_var.set(team)
 
     ef = embedding.get_embedding_function()
     assert type(ef).__name__ == "EmbeddinggemmaONNX", (

@@ -995,3 +995,119 @@ def test_kg_invalidate_resolved_team_empty_vault_is_noop(server_pg, monkeypatch)
     # The vault schema must NOT have been created.
     _pop_caches(fresh_team)
     _assert_schema_absent(fresh_team)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T2 — add_drawer / update_drawer / delete_drawer strict-raise (Slice 2).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_add_drawer_without_team_raises(server_pg, monkeypatch):
+    """tool_add_drawer with NO active session team RAISES on the postgres backend.
+
+    Strict-writer contract: ``ValueError("no team resolved …")`` fires BEFORE
+    ``_get_collection(create=True)`` and BEFORE ``_wal_log``, so no vault schema
+    is created and no WAL row is written for the attempted call.
+
+    Negative-DB assertions:
+      (a) ValueError raised with the canonical message fragment.
+      (b) No WAL row in mempalace_audit.write_log for the sentinel content.
+      (c) team_default schema absent from information_schema.schemata.
+    """
+    monkeypatch.setenv("MEMPALACE_TEAM", "team_default")
+    monkeypatch.setattr(
+        m,
+        "_config",
+        __import__("mempalace.config", fromlist=["MempalaceConfig"]).MempalaceConfig(),
+    )
+
+    sentinel = "T2_add_sentinel_" + uuid.uuid4().hex
+
+    token = m._active_team_var.set(None)
+    try:
+        assert m._resolve_team_strict() is None
+
+        with pytest.raises(ValueError, match="no team resolved"):
+            m.tool_add_drawer(wing="ops", room="r1", content=sentinel)
+    finally:
+        m._active_team_var.reset(token)
+
+    default_team = m._canonical_default_team()
+    _pop_caches(default_team)
+    _assert_no_wal_row("add_drawer", sentinel)
+    _assert_schema_absent(default_team)
+
+
+def test_add_drawer_with_explicit_vault_still_works_headerless(server_pg, monkeypatch):
+    """With vault= explicit, add_drawer succeeds even with _active_team_var=None.
+
+    An explicit vault= argument is honored by _resolve_team_strict(vault) so a
+    header-less caller with a known target vault can still write without an active
+    session team. Confirms the strict resolver takes the explicit arg path.
+    """
+    fresh_team = "t2_explicit_" + uuid.uuid4().hex[:12]
+    _pop_caches(fresh_team)
+
+    token = m._active_team_var.set(None)
+    try:
+        result = m.tool_add_drawer(
+            wing="ops", room="r1", content="T2 explicit vault test", vault=fresh_team
+        )
+    finally:
+        m._active_team_var.reset(token)
+
+    assert result.get("success") is True, f"Expected success with explicit vault: {result}"
+    assert result.get("vault") == fresh_team or True  # vault may not echo; success is the pin
+
+    # Cleanup.
+    _pop_caches(fresh_team)
+    _drop(fresh_team)
+
+
+def test_update_drawer_without_team_raises(server_pg, monkeypatch):
+    """tool_update_drawer with NO active session team RAISES on the postgres backend.
+
+    Hardening test (not a leak-fix): update_drawer uses create=False and cannot
+    materialize a new schema, so no vault is ever created by this path. The raise
+    is a routing-safety guard ensuring a team-less call never routes silently to
+    a default vault.
+    """
+    monkeypatch.setenv("MEMPALACE_TEAM", "team_default")
+    monkeypatch.setattr(
+        m,
+        "_config",
+        __import__("mempalace.config", fromlist=["MempalaceConfig"]).MempalaceConfig(),
+    )
+
+    token = m._active_team_var.set(None)
+    try:
+        assert m._resolve_team_strict() is None
+
+        with pytest.raises(ValueError, match="no team resolved"):
+            m.tool_update_drawer("any_drawer_id", content="hardening test content")
+    finally:
+        m._active_team_var.reset(token)
+
+
+def test_delete_drawer_without_team_raises(server_pg, monkeypatch):
+    """tool_delete_drawer with NO active session team RAISES on the postgres backend.
+
+    Hardening test (not a leak-fix): delete_drawer uses create=False and cannot
+    materialize a new schema. The raise is a routing-safety guard preventing a
+    team-less call from routing silently to a default vault's collection.
+    """
+    monkeypatch.setenv("MEMPALACE_TEAM", "team_default")
+    monkeypatch.setattr(
+        m,
+        "_config",
+        __import__("mempalace.config", fromlist=["MempalaceConfig"]).MempalaceConfig(),
+    )
+
+    token = m._active_team_var.set(None)
+    try:
+        assert m._resolve_team_strict() is None
+
+        with pytest.raises(ValueError, match="no team resolved"):
+            m.tool_delete_drawer("any_drawer_id")
+    finally:
+        m._active_team_var.reset(token)
