@@ -299,3 +299,73 @@ def test_kg_query_works_after_materialization(server_pg, monkeypatch):
     finally:
         _pop_caches(team)
         _drop(team)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-RD-6: tool_entities — divergent state (schema present, table absent)
+#          returns empty_vault shape, NOT an error
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _table_absent(team: str, table: str = "entity_occurrences") -> bool:
+    """Return True iff team_<slug>.<table> does NOT exist (to_regclass IS NULL)."""
+    schema = team_schema(team)
+    with psycopg.connect(_dsn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass(%s)", (f"{schema}.{table}",))
+            return cur.fetchone()[0] is None
+
+
+def test_entities_divergent_state_schema_present_table_absent(server_pg, monkeypatch):
+    """tool_entities on a vault whose schema exists but entity_occurrences does not
+    returns the empty_vault shape — not {"error": "relation ... does not exist"}.
+
+    Reproduces the divergent-state: the collection seam (or link-store, WAL,
+    entity-registry, etc.) may create the team schema without going through the
+    entity-index path, so entity_occurrences can be absent while the schema
+    exists.  The old create=False branch probed only information_schema.schemata,
+    set _ensured=True on schema presence, then the subsequent SELECT on
+    entity_occurrences raised psycopg.errors.UndefinedTable, which bubbled out
+    as {"error": "relation ... does not exist"} instead of the canonical
+    empty_vault shape.
+
+    The divergent state is constructed directly via SQL (CREATE SCHEMA only,
+    no entity_occurrences DDL) to avoid any write-path side-effect that might
+    incidentally materialise the table.
+    """
+    team = _fresh_team()
+    _pop_caches(team)
+    schema = team_schema(team)
+    try:
+        # Construct the divergent state: schema present, entity_occurrences absent.
+        # This mirrors what any non-entity-index sub-system (e.g. _ensure_collection,
+        # link-store, WAL table) does when it creates the team schema without
+        # going through PostgresEntityIndex._ensure(create=True).
+        with psycopg.connect(_dsn()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+            conn.commit()
+
+        # Confirm the divergent state before testing.
+        assert not _schema_absent(team), "schema must exist (pre-condition)"
+        assert _table_absent(team, "entity_occurrences"), (
+            "entity_occurrences must be absent (pre-condition for divergent-state test)"
+        )
+
+        # Now read via tool_entities — both forms must return empty_vault shape.
+        token = m._active_team_var.set(team)
+        try:
+            overview = m.tool_entities()
+            lookup = m.tool_entities(entity="SomeEntity")
+        finally:
+            m._active_team_var.reset(token)
+
+        assert "error" not in overview, f"Overview returned error: {overview}"
+        assert overview.get("empty_vault") is True, (
+            f"Expected empty_vault=True in overview: {overview}"
+        )
+        assert "error" not in lookup, f"Lookup returned error: {lookup}"
+        assert lookup.get("empty_vault") is True, f"Expected empty_vault=True in lookup: {lookup}"
+    finally:
+        _pop_caches(team)
+        _drop(team)

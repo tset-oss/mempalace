@@ -90,18 +90,26 @@ class PostgresEntityIndex:
             if not create:
                 with self._backend._conn() as conn:
                     with conn.cursor() as cur:
+                        # Probe the table itself (not just the schema): the
+                        # collection seam, link-store, or another sub-system
+                        # may have created the team schema without ever
+                        # materialising entity_occurrences (e.g. a drawer
+                        # written with no extracted entities and no topics=).
+                        # Schema-only presence is NOT sufficient — we must
+                        # confirm this surface exists before setting _ensured.
                         cur.execute(
-                            "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
-                            (self._schema,),
+                            "SELECT to_regclass(%s)",
+                            (f"{self._schema}.entity_occurrences",),
                         )
-                        schema_exists = cur.fetchone() is not None
-                if not schema_exists:
-                    # Never create, never set _ensured: an unmaterialized schema
-                    # under create=False must raise on EVERY call.
-                    raise PalaceNotFoundError(f"team vault {self._schema!r} does not exist")
-                # Schema present -> its table was created by whoever materialized
-                # it (this class's create=True branch always creates the table
-                # atomically below). Mark ensured and return without any DDL.
+                        table_exists = cur.fetchone()[0] is not None
+                if not table_exists:
+                    # Never create, never set _ensured: an unmaterialized
+                    # entity-index under create=False must raise on EVERY call.
+                    raise PalaceNotFoundError(
+                        f"team vault {self._schema!r} has no entity-index table yet"
+                    )
+                # Table present -> schema and table are fully initialized.
+                # Mark ensured and return without issuing any DDL.
                 self._ensured = True
                 return
             # Backstop (PM#7): never CREATE SCHEMA off a None-derived/empty team.
