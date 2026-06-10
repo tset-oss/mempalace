@@ -458,6 +458,28 @@ def test_two_team_isolation_across_every_surface(server_pg):
         # ── Positive (ii): the per-team tunnels table holds ONLY that team's ──
         # tunnels — query both teams' team_<slug>.tunnels directly. No cross rows.
         _assert_tunnels_table_has_no_cross_team_rows(backend, team_a, team_b, tok_a, tok_b)
+
+        # ── T5: Diary — distinct entries per team, zero cross-read ───────────
+        diary_a = f"T5 diary entry Aria {tok_a}"
+        diary_b = f"T5 diary entry Bruno {tok_b}"
+        with _ActiveTeam(team_a):
+            wr = m.tool_diary_write(agent_name="aria", entry=diary_a)
+            assert "error" not in wr, wr
+        with _ActiveTeam(team_b):
+            wr = m.tool_diary_write(agent_name="bruno", entry=diary_b)
+            assert "error" not in wr, wr
+
+        # Each team reads its own diary entry; the other team's entry is absent.
+        with _ActiveTeam(team_a):
+            read_a = m.tool_diary_read(agent_name="aria")
+            entries_a = " ".join(e.get("content", "") for e in read_a.get("entries", []))
+            assert tok_a in entries_a, "team A diary missing own entry"
+            assert tok_b not in entries_a, "team A diary leaks team B entry"
+        with _ActiveTeam(team_b):
+            read_b = m.tool_diary_read(agent_name="bruno")
+            entries_b = " ".join(e.get("content", "") for e in read_b.get("entries", []))
+            assert tok_b in entries_b, "team B diary missing own entry"
+            assert tok_a not in entries_b, "team B diary leaks team A entry"
     finally:
         _pop_caches(team_a, team_b)
         _drop(team_a, team_b)

@@ -331,3 +331,72 @@ def test_fresh_vault_search_transient_error_surfaces_as_error(monkeypatch):
         get_backend("postgres")._embedder = None
         mcp._kg_by_path.clear()
         _drop(team)
+
+
+# ---------------------------------------------------------------------------
+# T-E2E — fresh-team lifecycle: reads never create schema; first write does
+# ---------------------------------------------------------------------------
+
+
+def _schema_exists(team: str) -> bool:
+    """Return True if the postgres vault schema for *team* exists."""
+    from mempalace.backends.postgres import team_schema as _ts
+
+    schema = _ts(team)
+    with psycopg.connect(_dsn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = %s",
+                (schema,),
+            )
+            return cur.fetchone()[0] > 0
+
+
+def test_fresh_team_lifecycle(monkeypatch):
+    """T-E2E: read-path calls on a never-written team return empty shapes and
+    must NOT create the schema as a side-effect.  The first write (add_drawer)
+    DOES create the schema, list_vaults then includes the team, and search
+    finds the drawer — the full first-use lifecycle in one test."""
+    import mempalace.mcp_server as mcp
+
+    team = "t" + uuid.uuid4().hex[:10]
+    monkeypatch.setenv("MEMPALACE_BACKEND", "postgres")
+    monkeypatch.setenv("MEMPALACE_DATABASE_URL", _dsn())
+    get_backend("postgres")._embedder = _fake_embed
+    try:
+        _use_team(mcp, monkeypatch, team)
+
+        # ── Step 1: reads on a never-written vault return empty shapes ──────────
+        # tool_search → empty_vault shape, schema still absent.
+        res = mcp.tool_search("anything")
+        assert res.get("empty_vault") is True, res
+        assert "error" not in res
+        assert not _schema_exists(team), "schema must not exist after a search-only read"
+
+        # tool_entities → empty_vault shape, schema still absent.
+        ent = mcp.tool_entities(entity="NoSuchEntity")
+        assert ent.get("empty_vault") is True or ent.get("entities") == [], ent
+        assert not _schema_exists(team), "schema must not exist after an entities read"
+
+        # tool_kg_query → empty_vault shape, schema still absent.
+        kq = mcp.tool_kg_query("AnyEntity")
+        assert kq.get("empty_vault") is True, kq
+        assert not _schema_exists(team), "schema must not exist after a kg_query read"
+
+        # ── Step 2: first write creates the schema ────────────────────────────
+        add = mcp.tool_add_drawer(wing="ops", room="r1", content="first entry " + team)
+        assert add.get("success") is True, add
+        assert _schema_exists(team), "schema must exist after the first write"
+
+        # ── Step 3: list_vaults includes the new team ─────────────────────────
+        vaults = mcp.tool_list_vaults()
+        assert team in vaults.get("vaults", []), f"team {team!r} absent from list_vaults: {vaults}"
+
+        # ── Step 4: search now finds the drawer ───────────────────────────────
+        found = mcp.tool_search("first entry", limit=5)
+        texts = " ".join(r.get("text", "") for r in found.get("results", []))
+        assert team in texts or "first entry" in texts, f"drawer not found in search: {found}"
+    finally:
+        get_backend("postgres")._embedder = None
+        mcp._kg_by_path.clear()
+        _drop(team)
