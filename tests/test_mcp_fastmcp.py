@@ -270,3 +270,78 @@ def _extract_text(result) -> str:
     for item in content:
         parts.append(getattr(item, "text", "") or "")
     return "\n".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# T4 — Slice 6: switch_team existence feedback
+# --------------------------------------------------------------------------- #
+
+
+def test_switch_team_existing_vault_reports_exists_true(monkeypatch):
+    """T4-POS: switching to a vault that list_vaults knows about returns
+    exists=True in the response; the switch still succeeds."""
+    ctx = _FakeCtx(_FakeSession())
+    # Monkeypatch _team_exists to simulate a known vault.
+    monkeypatch.setattr(mcp_server, "_team_exists", lambda slug: True)
+    switch = mcp_fastmcp._make_switch_team(lambda: ctx)
+    resp = switch("backend")
+    assert resp["ok"] is True
+    assert resp["active_team"] == "backend"
+    assert resp["exists"] is True
+    # Session must be set.
+    assert mcp_fastmcp._get_or_create_session(ctx).active_team == "backend"
+
+
+def test_switch_team_nonexistent_vault_reports_exists_false_with_known(monkeypatch):
+    """T4-NEG: switching to an unknown vault returns exists=False, known_vaults,
+    and a note; the switch still succeeds (non-blocking — vault created on write)."""
+    ctx = _FakeCtx(_FakeSession())
+    monkeypatch.setattr(mcp_server, "_team_exists", lambda slug: False)
+    # Provide a fake list for the known_vaults fetch inside _make_switch_team.
+    import mempalace.palace as palace_mod
+
+    class _FakeBackend:
+        def list_vaults(self):
+            return ["frontend", "backend"]
+
+    monkeypatch.setattr(palace_mod, "_resolve_backend", lambda cfg: _FakeBackend())
+    switch = mcp_fastmcp._make_switch_team(lambda: ctx)
+    resp = switch("newteam")
+    assert resp["ok"] is True
+    assert resp["active_team"] == "newteam"
+    assert resp["exists"] is False
+    assert "frontend" in resp.get("known_vaults", [])
+    assert "note" in resp
+    assert "created on" in resp["note"] or "first write" in resp["note"]
+    # Switch was still applied.
+    assert mcp_fastmcp._get_or_create_session(ctx).active_team == "newteam"
+
+
+def test_switch_team_chroma_backend_no_exists_key(monkeypatch):
+    """T4-CHROMA: on the chroma backend _team_exists returns None; the response
+    must have no 'exists' key and the switch must still succeed."""
+    ctx = _FakeCtx(_FakeSession())
+    monkeypatch.setattr(mcp_server, "_team_exists", lambda slug: None)
+    switch = mcp_fastmcp._make_switch_team(lambda: ctx)
+    resp = switch("frontend")
+    assert resp["ok"] is True
+    assert resp["active_team"] == "frontend"
+    assert "exists" not in resp
+    assert mcp_fastmcp._get_or_create_session(ctx).active_team == "frontend"
+
+
+def test_switch_team_backend_error_no_exists_key(monkeypatch):
+    """T4-ERR: if _team_exists raises (should not, but defensive), the switch
+    still succeeds and no 'exists' key is present."""
+    ctx = _FakeCtx(_FakeSession())
+
+    def _boom(slug):
+        raise RuntimeError("backend unreachable")
+
+    monkeypatch.setattr(mcp_server, "_team_exists", _boom)
+    switch = mcp_fastmcp._make_switch_team(lambda: ctx)
+    # The switch must not raise even if _team_exists throws.
+    resp = switch("ml")
+    assert resp["ok"] is True
+    assert resp["active_team"] == "ml"
+    assert "exists" not in resp

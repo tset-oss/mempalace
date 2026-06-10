@@ -1712,6 +1712,26 @@ def _search_all_vaults(clean_query, wing, room, limit, dist):
     }
 
 
+def _team_exists(slug: str) -> "bool | None":
+    """Return whether *slug* is a known vault, or ``None`` when unknowable.
+
+    Returns ``None`` on the chroma backend (single implicit vault, no team
+    registry) and on any backend exception so callers always get a safe value.
+    Never raises.
+    """
+    if _config.backend == "chroma":
+        return None
+    try:
+        from .palace import _resolve_backend
+
+        backend = _resolve_backend(_config)
+        teams = backend.list_vaults() if hasattr(backend, "list_vaults") else []
+        return slug in teams
+    except Exception:
+        logger.debug("_team_exists probe failed for %r", slug, exc_info=True)
+        return None
+
+
 def tool_list_vaults():
     """List the team vaults available on the central server.
 

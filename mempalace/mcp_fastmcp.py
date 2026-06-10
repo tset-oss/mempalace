@@ -187,7 +187,26 @@ def _make_switch_team(get_context):
                 ),
             }
         session.active_team = slug
-        return {"ok": True, "active_team": slug}
+        resp: dict = {"ok": True, "active_team": slug}
+        try:
+            exists = _legacy._team_exists(slug)
+        except Exception:
+            exists = None
+        if exists is not None:
+            resp["exists"] = exists
+            if not exists:
+                try:
+                    from .palace import _resolve_backend
+
+                    backend = _resolve_backend(_legacy._config)
+                    known = backend.list_vaults() if hasattr(backend, "list_vaults") else []
+                except Exception:
+                    known = []
+                resp["known_vaults"] = known
+                resp["note"] = (
+                    f"vault {slug!r} does not exist yet; it will be created on the first write"
+                )
+        return resp
 
     return mempalace_switch_team
 
