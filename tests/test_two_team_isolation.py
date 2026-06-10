@@ -708,3 +708,96 @@ def test_cross_backend_cooccurrence_equivalence_scoped(server_pg, monkeypatch):
     finally:
         _pop_caches(team)
         _drop(team)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T1 — diary_write strict-raise (Slice 1).
+# A server-mode diary_write with no active session team RAISES instead of
+# silently writing into a default vault.  Mirrors the sibling test
+# test_server_mode_write_without_team_raises (:592-631).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_diary_write_without_team_raises(server_pg, monkeypatch):
+    """A diary_write with NO active session team RAISES on the postgres backend.
+
+    Strict-writer contract: ``ValueError("no team resolved …")`` fires BEFORE
+    ``_get_collection(create=True)`` and BEFORE ``_wal_log``, so no vault schema
+    is created and no WAL row is written for the attempted call.
+
+    Negative-DB assertions (after the raise, caches evicted):
+      (a) ValueError is raised with the canonical message fragment.
+      (b) No WAL row exists in ``mempalace_audit.write_log`` for the sentinel
+          entry text used in this test (postgres sink is the default when
+          backend=postgres).
+      (c) The ``team_default`` schema — where the entry would have landed under
+          the old _resolve_team() path — does NOT exist in
+          information_schema.schemata after the failed call.
+    """
+    import psycopg
+
+    monkeypatch.setenv("MEMPALACE_TEAM", "team_default")
+    monkeypatch.setattr(
+        m, "_config", __import__("mempalace.config", fromlist=["MempalaceConfig"]).MempalaceConfig()
+    )
+
+    # Sentinel values unique to this test run so WAL / schema assertions are
+    # not confused with rows from other tests.
+    sentinel_entry = "T1_diary_sentinel_" + uuid.uuid4().hex
+    agent = "test_agent_t1"
+
+    token = m._active_team_var.set(None)
+    try:
+        # Sanity: strict resolver sees no team; non-strict would default.
+        assert m._resolve_team_strict() is None
+        assert m._resolve_team() == m._canonical_default_team()
+
+        # (a) The strict raise fires — no write reaches the collection or WAL.
+        with pytest.raises(ValueError, match="no team resolved"):
+            m.tool_diary_write(agent_name=agent, entry=sentinel_entry)
+    finally:
+        m._active_team_var.reset(token)
+
+    # Evict any cached handles so the negative-DB assertions query fresh state.
+    default_team = m._canonical_default_team()
+    _pop_caches(default_team)
+
+    dsn = _dsn()
+
+    # (b) No WAL row for the sentinel entry (postgres is the default WAL sink
+    # when backend=postgres; if the table does not yet exist the assertion is
+    # trivially satisfied — no row can exist).
+    try:
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM mempalace_audit.write_log "
+                    "WHERE operation = 'diary_write' "
+                    "AND params->>'entry_preview' LIKE %s",
+                    (sentinel_entry[:50] + "%",),
+                )
+                row = cur.fetchone()
+                wal_count = row[0] if row else 0
+        assert wal_count == 0, f"Expected no WAL row for the failed diary_write, found {wal_count}"
+    except psycopg.errors.UndefinedTable:
+        # WAL table not yet created — no rows can exist; assertion passes.
+        pass
+    except psycopg.errors.InvalidSchemaName:
+        # mempalace_audit schema not yet created — no rows; assertion passes.
+        pass
+
+    # (c) The team_default schema was NOT created by the failed call.
+    default_schema = __import__(
+        "mempalace.backends.postgres", fromlist=["team_schema"]
+    ).team_schema(default_team)
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = %s",
+                (default_schema,),
+            )
+            schema_count = cur.fetchone()[0]
+    assert schema_count == 0, (
+        f"Schema {default_schema!r} must NOT exist after a failed team-less "
+        f"diary_write, but it was found in information_schema.schemata"
+    )

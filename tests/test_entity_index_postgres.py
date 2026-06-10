@@ -391,6 +391,7 @@ def test_diary_write_indexes_entities_per_vault(backend, team, monkeypatch):
         monkeypatch.setattr("mempalace.palace._resolve_backend", lambda cfg: backend)
         monkeypatch.setattr(m, "_entity_index_by_team", {})
         monkeypatch.setattr(m, "_resolve_team", lambda v=None: team)
+        monkeypatch.setattr(m, "_resolve_team_strict", lambda v=None: team)
         monkeypatch.setattr(m, "_get_collection", lambda *a, **k: col)
 
         res = m.tool_diary_write(

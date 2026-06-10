@@ -3320,6 +3320,11 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     Note: ``agent_name`` is normalized to lowercase before storage so
     that diary reads are case-insensitive (see #1243). "Claude",
     "claude", and "CLAUDE" all resolve to the same agent.
+
+    On the central (postgres) backend a team-less call RAISES
+    ``ValueError("no team resolved …")`` rather than silently writing
+    into a shared default vault — identical to the ``tool_entity_seed``
+    / ``tool_team_fact_add`` strict-writer contract.
     """
     try:
         agent_name = sanitize_name(agent_name, "agent_name").lower()
@@ -3333,9 +3338,16 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     else:
         wing = f"wing_{agent_name.replace(' ', '_')}"
     room = "diary"
-    # Resolve the target vault once so the collection write and the per-vault
-    # entity index below agree on the team. Chroma is single-vault (team None).
-    diary_team = _resolve_team() if _config.backend != "chroma" else None
+    # Resolve the target vault FIRST so a team-less write fails loud
+    # (the entity_seed / team_fact_add pattern): no team means no vault
+    # to write to, so refuse rather than leak into a shared default.
+    # Chroma is single-vault (team None) and skips the strict check.
+    if _config.backend != "chroma":
+        from .link_store import require_write_team
+
+        diary_team = require_write_team(_resolve_team_strict())
+    else:
+        diary_team = None
     col = _get_collection(create=True, team=diary_team)
     if not col:
         return _no_palace()

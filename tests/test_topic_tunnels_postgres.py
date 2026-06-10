@@ -336,7 +336,13 @@ def test_add_drawer_topics_populate_wing_topics(pg_mcp):
 
 def test_diary_topic_wired_to_wing_topics(pg_mcp):
     mcp, t = pg_mcp
-    res = mcp.tool_diary_write(agent_name="claude", entry="worked on the parser", topic="Parsing")
+    token = mcp._active_team_var.set(t)
+    try:
+        res = mcp.tool_diary_write(
+            agent_name="claude", entry="worked on the parser", topic="Parsing"
+        )
+    finally:
+        mcp._active_team_var.reset(token)
     assert res.get("success") is True, res
 
     store = PostgresLinkStore(_pg_backend(), team=t)
@@ -354,7 +360,11 @@ def test_no_host_global_topics_json_on_pg(pg_mcp, tmp_path, monkeypatch):
 
     mcp, t = pg_mcp
     mcp.tool_add_drawer(wing="project", room="api", content="x", topics=["Angular"])
-    mcp.tool_diary_write(agent_name="claude", entry="y", topic="Parsing")
+    token = mcp._active_team_var.set(t)
+    try:
+        mcp.tool_diary_write(agent_name="claude", entry="y", topic="Parsing")
+    finally:
+        mcp._active_team_var.reset(token)
 
     # Nothing in the host-global registry; the labels went to the team vault.
     if registry.exists():

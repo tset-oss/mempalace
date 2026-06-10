@@ -303,7 +303,11 @@ def test_get_logical_id_reassembles_chunked_diary_entry(monkeypatch):
     team = _setup(monkeypatch)
     try:
         body = "diary entry body line. " * 60  # > chunk_size -> chunked
-        d = mcp.tool_diary_write(agent_name="tester", entry=body, topic="rollout")
+        token = mcp._active_team_var.set(team)
+        try:
+            d = mcp.tool_diary_write(agent_name="tester", entry=body, topic="rollout")
+        finally:
+            mcp._active_team_var.reset(token)
         if d.get("chunks", 1) <= 1:
             pytest.skip("diary entry did not chunk in this config")
         got = mcp.tool_get_drawer(d["entry_id"])
