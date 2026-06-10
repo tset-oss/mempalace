@@ -175,8 +175,15 @@ class PostgresKnowledgeGraph:
                         "  source_file text,"
                         "  source_drawer_id text,"
                         "  adapter_name text,"
+                        "  asserted_by text,"
                         "  extracted_at timestamptz DEFAULT now()"
                         ")"
+                    )
+                    # Idempotent migration for vaults created before asserted_by
+                    # was added — ALTER TABLE ... ADD COLUMN IF NOT EXISTS is a
+                    # Postgres-only syntax and is cheap (metadata-only on PG).
+                    cur.execute(
+                        f"ALTER TABLE {self._triples()} ADD COLUMN IF NOT EXISTS asserted_by text"
                     )
                     for col in ("subject", "object", "predicate"):
                         cur.execute(
@@ -231,6 +238,7 @@ class PostgresKnowledgeGraph:
         source_file: str = None,
         source_drawer_id: str = None,
         adapter_name: str = None,
+        asserted_by: str = None,
         *,
         create: bool = True,
     ):
@@ -278,8 +286,9 @@ class PostgresKnowledgeGraph:
                 cur.execute(
                     f"INSERT INTO {self._triples()} ("
                     "  id, subject, predicate, object, valid_from, valid_to,"
-                    "  confidence, source_closet, source_file, source_drawer_id, adapter_name"
-                    ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    "  confidence, source_closet, source_file, source_drawer_id,"
+                    "  adapter_name, asserted_by"
+                    ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     (
                         triple_id,
                         sub_id,
@@ -292,6 +301,7 @@ class PostgresKnowledgeGraph:
                         source_file,
                         source_drawer_id,
                         adapter_name,
+                        asserted_by,
                     ),
                 )
                 return triple_id
@@ -344,7 +354,7 @@ class PostgresKnowledgeGraph:
                 if direction in ("outgoing", "both"):
                     cur.execute(
                         f"SELECT t.predicate, t.valid_from, t.valid_to, t.confidence, "
-                        f"t.source_closet, e.name AS obj_name "
+                        f"t.source_closet, e.name AS obj_name, t.asserted_by "
                         f"FROM {self._triples()} t JOIN {self._entities()} e ON t.object = e.id "
                         f"WHERE t.subject = %s" + temporal_sql,
                         [eid] + temporal_params,
@@ -360,13 +370,14 @@ class PostgresKnowledgeGraph:
                                 "valid_to": r[2],
                                 "confidence": r[3],
                                 "source_closet": r[4],
+                                "asserted_by": r[6],
                                 "current": r[2] is None,
                             }
                         )
                 if direction in ("incoming", "both"):
                     cur.execute(
                         f"SELECT t.predicate, t.valid_from, t.valid_to, t.confidence, "
-                        f"t.source_closet, e.name AS sub_name "
+                        f"t.source_closet, e.name AS sub_name, t.asserted_by "
                         f"FROM {self._triples()} t JOIN {self._entities()} e ON t.subject = e.id "
                         f"WHERE t.object = %s" + temporal_sql,
                         [eid] + temporal_params,
@@ -382,6 +393,7 @@ class PostgresKnowledgeGraph:
                                 "valid_to": r[2],
                                 "confidence": r[3],
                                 "source_closet": r[4],
+                                "asserted_by": r[6],
                                 "current": r[2] is None,
                             }
                         )

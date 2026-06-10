@@ -164,6 +164,7 @@ class KnowledgeGraph:
                 source_file TEXT,
                 source_drawer_id TEXT,
                 adapter_name TEXT,
+                asserted_by TEXT,
                 extracted_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (subject) REFERENCES entities(id),
                 FOREIGN KEY (object) REFERENCES entities(id)
@@ -192,6 +193,8 @@ class KnowledgeGraph:
             conn.execute("ALTER TABLE triples ADD COLUMN source_drawer_id TEXT")
         if "adapter_name" not in existing:
             conn.execute("ALTER TABLE triples ADD COLUMN adapter_name TEXT")
+        if "asserted_by" not in existing:
+            conn.execute("ALTER TABLE triples ADD COLUMN asserted_by TEXT")
 
     def _conn(self):
         if self._connection is None:
@@ -246,6 +249,7 @@ class KnowledgeGraph:
         source_file: str = None,
         source_drawer_id: str = None,
         adapter_name: str = None,
+        asserted_by: str = None,
     ):
         """
         Add a relationship triple: subject → predicate → object.
@@ -253,7 +257,8 @@ class KnowledgeGraph:
         ``source_drawer_id`` and ``adapter_name`` are RFC 002 §5.5 provenance
         fields populated by adapters that advertise ``supports_kg_triples``;
         they default to ``None`` so every existing caller stays
-        source-compatible.
+        source-compatible. ``asserted_by`` records the identity of the caller
+        (e.g. an email address) for provenance and audit purposes.
 
         Examples:
             add_triple("Max", "child_of", "Alice", valid_from="2015-04-01")
@@ -307,8 +312,8 @@ class KnowledgeGraph:
                     """INSERT INTO triples (
                         id, subject, predicate, object, valid_from, valid_to,
                         confidence, source_closet, source_file,
-                        source_drawer_id, adapter_name
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        source_drawer_id, adapter_name, asserted_by
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         triple_id,
                         sub_id,
@@ -321,6 +326,7 @@ class KnowledgeGraph:
                         source_file,
                         source_drawer_id,
                         adapter_name,
+                        asserted_by,
                     ),
                 )
                 return triple_id
@@ -396,6 +402,7 @@ class KnowledgeGraph:
                             "valid_to": row["valid_to"],
                             "confidence": row["confidence"],
                             "source_closet": row["source_closet"],
+                            "asserted_by": row["asserted_by"],
                             "current": row["valid_to"] is None,
                         }
                     )
@@ -418,6 +425,7 @@ class KnowledgeGraph:
                             "valid_to": row["valid_to"],
                             "confidence": row["confidence"],
                             "source_closet": row["source_closet"],
+                            "asserted_by": row["asserted_by"],
                             "current": row["valid_to"] is None,
                         }
                     )

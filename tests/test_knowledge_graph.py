@@ -326,3 +326,72 @@ class TestKnowledgeGraphConnectionCleanup:
         assert kg._connection is None
         with pytest.raises(sqlite3.ProgrammingError):
             conn.execute("SELECT 1")
+
+
+# ---------------------------------------------------------------------------
+# T7 — Slice 7: asserted_by provenance persists and is returned in query facts
+# ---------------------------------------------------------------------------
+
+
+class TestAssertedByProvenance:
+    """SQLite KG: asserted_by stored on add_triple comes back in query_entity."""
+
+    def test_asserted_by_persists_in_query_facts(self, kg):
+        """T7-POS: asserted_by round-trips through add_triple -> query_entity."""
+        kg.add_triple("Dana", "works_at", "Acme", asserted_by="markus.burger@tset.com")
+        facts = kg.query_entity("Dana", direction="outgoing")
+        assert len(facts) == 1
+        assert facts[0]["asserted_by"] == "markus.burger@tset.com"
+
+    def test_asserted_by_incoming_direction(self, kg):
+        """T7-DIR: asserted_by also appears on incoming facts."""
+        kg.add_triple("Acme", "employs", "Dana", asserted_by="audit@example.com")
+        facts = kg.query_entity("Dana", direction="incoming")
+        assert len(facts) == 1
+        assert facts[0]["asserted_by"] == "audit@example.com"
+
+    def test_asserted_by_defaults_to_none(self, kg):
+        """T7-NULL: omitting asserted_by stores NULL -> query returns None."""
+        kg.add_triple("Max", "loves", "chess")
+        facts = kg.query_entity("Max", direction="outgoing")
+        assert len(facts) == 1
+        assert facts[0]["asserted_by"] is None
+
+    def test_asserted_by_migration_on_older_db(self, tmp_path):
+        """T7-MIGRATE: a KG opened on an older sqlite file (no asserted_by
+        column) gains the column via _migrate_schema and can round-trip."""
+        import sqlite3
+
+        db_path = str(tmp_path / "legacy.sqlite3")
+        # Create a minimal triples table WITHOUT asserted_by (simulates old DB).
+        with sqlite3.connect(db_path) as conn:
+            conn.executescript("""
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS entities (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                    type TEXT DEFAULT 'unknown',
+                    properties TEXT DEFAULT '{}',
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS triples (
+                    id TEXT PRIMARY KEY,
+                    subject TEXT NOT NULL, predicate TEXT NOT NULL,
+                    object TEXT NOT NULL,
+                    valid_from TEXT, valid_to TEXT,
+                    confidence REAL DEFAULT 1.0,
+                    source_closet TEXT, source_file TEXT,
+                    source_drawer_id TEXT, adapter_name TEXT,
+                    extracted_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (subject) REFERENCES entities(id),
+                    FOREIGN KEY (object) REFERENCES entities(id)
+                );
+            """)
+
+        from mempalace.knowledge_graph import KnowledgeGraph
+
+        kg = KnowledgeGraph(db_path)
+        # Migration should have added the column; add_triple must succeed.
+        kg.add_triple("Dana", "works_at", "Acme", asserted_by="migrated@example.com")
+        facts = kg.query_entity("Dana", direction="outgoing")
+        assert facts[0]["asserted_by"] == "migrated@example.com"
+        kg.close()

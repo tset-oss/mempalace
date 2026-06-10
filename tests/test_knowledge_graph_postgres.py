@@ -177,3 +177,62 @@ def test_team_isolation(backend):
                 with conn.cursor() as cur:
                     cur.execute(f'DROP SCHEMA IF EXISTS "{team_schema(t)}" CASCADE')
                 conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# T7 — Slice 7: asserted_by provenance persists and is returned in query facts
+# ---------------------------------------------------------------------------
+
+
+def test_add_triple_asserted_by_persists(kg):
+    """T7-POS (postgres): asserted_by stored on add_triple is returned in
+    query_entity facts so the caller can see who asserted each relationship."""
+    tid = kg.add_triple("Dana", "works_at", "Acme", asserted_by="markus.burger@tset.com")
+    assert tid is not None
+
+    facts = kg.query_entity("Dana", direction="outgoing")
+    assert len(facts) == 1
+    assert facts[0]["asserted_by"] == "markus.burger@tset.com"
+
+
+def test_add_triple_asserted_by_defaults_to_none(kg):
+    """T7-NULL (postgres): omitting asserted_by stores NULL and returns None
+    in query_entity facts — existing callers are unaffected."""
+    kg.add_triple("Max", "loves", "chess")
+    facts = kg.query_entity("Max", direction="outgoing")
+    assert len(facts) == 1
+    assert facts[0]["asserted_by"] is None
+
+
+def test_tool_kg_add_asserted_by_via_mcp(monkeypatch):
+    """T7-MCP (postgres): tool_kg_add passes asserted_by through to the KG and
+    it appears in tool_kg_query facts (the full round-trip via mcp_server)."""
+    import mempalace.mcp_server as mcp
+    from mempalace.config import MempalaceConfig
+
+    team = "t" + uuid.uuid4().hex[:10]
+    monkeypatch.setenv("MEMPALACE_BACKEND", "postgres")
+    monkeypatch.setenv("MEMPALACE_TEAM", team)
+    monkeypatch.setenv("MEMPALACE_DATABASE_URL", _dsn())
+    monkeypatch.setattr(mcp, "_config", MempalaceConfig())
+    mcp._kg_by_path.clear()
+    # Replace the module-level ContextVar so strict resolvers see the team.
+    import contextvars
+
+    new_var = contextvars.ContextVar("_active_team_var_test", default=None)
+    new_var.set(team)
+    monkeypatch.setattr(mcp, "_active_team_var", new_var)
+    try:
+        res = mcp.tool_kg_add("Dana", "works_at", "Acme", asserted_by="markus.burger@tset.com")
+        assert res.get("success") is True, res
+
+        qres = mcp.tool_kg_query("Dana", direction="outgoing")
+        assert qres["count"] == 1
+        fact = qres["facts"][0]
+        assert fact["asserted_by"] == "markus.burger@tset.com"
+    finally:
+        mcp._kg_by_path.clear()
+        with psycopg.connect(_dsn()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(f'DROP SCHEMA IF EXISTS "{team_schema(team)}" CASCADE')
+            conn.commit()

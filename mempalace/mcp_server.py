@@ -3338,6 +3338,7 @@ def tool_kg_add(
     source_closet: str = None,
     source_file: str = None,
     source_drawer_id: str = None,
+    asserted_by: str = None,
 ):
     """Add a relationship to the knowledge graph.
 
@@ -3347,6 +3348,9 @@ def tool_kg_add(
 
     Temporal values accept either ``YYYY-MM-DD`` or canonical UTC datetimes in
     the form ``YYYY-MM-DDTHH:MM:SSZ``.
+
+    Pass ``asserted_by`` as the caller's identity (e.g. an email address or
+    username) so facts can be traced back to their source for audit and review.
 
     On the central (postgres) backend a team-less call RAISES
     ``ValueError("no team resolved …")`` rather than silently writing into
@@ -3359,6 +3363,8 @@ def tool_kg_add(
         object = sanitize_kg_value(object, "object")
         valid_from = sanitize_iso_temporal(valid_from, "valid_from")
         valid_to = sanitize_iso_temporal(valid_to, "valid_to")
+        if asserted_by is not None:
+            asserted_by = sanitize_kg_value(asserted_by, "asserted_by")
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
@@ -3381,6 +3387,7 @@ def tool_kg_add(
             "source_closet": source_closet,
             "source_file": source_file,
             "source_drawer_id": source_drawer_id,
+            "asserted_by": asserted_by,
         },
     )
 
@@ -3394,6 +3401,7 @@ def tool_kg_add(
             source_closet=source_closet,
             source_file=source_file,
             source_drawer_id=source_drawer_id,
+            asserted_by=asserted_by,
         )
     )
     return {"success": True, "triple_id": triple_id, "fact": f"{subject} → {predicate} → {object}"}
