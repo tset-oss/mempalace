@@ -801,3 +801,197 @@ def test_diary_write_without_team_raises(server_pg, monkeypatch):
         f"Schema {default_schema!r} must NOT exist after a failed team-less "
         f"diary_write, but it was found in information_schema.schemata"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared helpers for T6a/b and T8-KG negative-DB assertions.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _assert_no_wal_row(operation: str, sentinel: str) -> None:
+    """Assert no WAL row exists for *operation* whose params contain *sentinel*.
+
+    Probes ``mempalace_audit.write_log`` via a direct psycopg connection.
+    If the table or schema does not yet exist the assertion passes trivially —
+    no row can exist.  *sentinel* is matched as a substring of the JSON-encoded
+    ``params`` column so it works across any param key.
+    """
+    try:
+        with psycopg.connect(_dsn()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM mempalace_audit.write_log "
+                    "WHERE operation = %s AND params::text LIKE %s",
+                    (operation, f"%{sentinel[:60]}%"),
+                )
+                row = cur.fetchone()
+                count = row[0] if row else 0
+        assert count == 0, (
+            f"Expected no WAL row for failed {operation!r}, found {count} "
+            f"(sentinel={sentinel[:40]!r})"
+        )
+    except psycopg.errors.UndefinedTable:
+        pass  # table absent → no row possible
+    except psycopg.errors.InvalidSchemaName:
+        pass  # audit schema absent → no row possible
+
+
+def _assert_schema_absent(team: str) -> None:
+    """Assert the postgres vault schema for *team* does NOT exist."""
+    from mempalace.backends.postgres import team_schema
+
+    schema = team_schema(team)
+    with psycopg.connect(_dsn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = %s",
+                (schema,),
+            )
+            count = cur.fetchone()[0]
+    assert count == 0, (
+        f"Schema {schema!r} must NOT exist after a failed team-less write, "
+        f"but it was found in information_schema.schemata"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T6a — kg_add strict-raise (Slice 3).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_kg_add_without_team_raises(server_pg, monkeypatch):
+    """tool_kg_add with NO active session team RAISES on the postgres backend.
+
+    Strict-writer contract: ``ValueError("no team resolved …")`` fires BEFORE
+    ``_wal_log`` and before ``_call_kg``, so no vault schema is created and no
+    WAL row is written.
+
+    Negative-DB assertions:
+      (a) ValueError raised with the canonical message fragment.
+      (b) No WAL row in mempalace_audit.write_log for the sentinel triple.
+      (c) team_default schema absent from information_schema.schemata.
+    """
+    monkeypatch.setenv("MEMPALACE_TEAM", "team_default")
+    monkeypatch.setattr(
+        m, "_config", __import__("mempalace.config", fromlist=["MempalaceConfig"]).MempalaceConfig()
+    )
+
+    sentinel = "T6a_kg_sentinel_" + uuid.uuid4().hex
+
+    token = m._active_team_var.set(None)
+    try:
+        assert m._resolve_team_strict() is None
+
+        # (a) strict raise fires before any side effect
+        with pytest.raises(ValueError, match="no team resolved"):
+            m.tool_kg_add(subject=sentinel, predicate="knows", object="nobody")
+    finally:
+        m._active_team_var.reset(token)
+
+    default_team = m._canonical_default_team()
+    _pop_caches(default_team)
+
+    # (b) no WAL row for the sentinel triple
+    _assert_no_wal_row("kg_add", sentinel)
+
+    # (c) team_default schema was not created
+    _assert_schema_absent(default_team)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T8-KG — no WAL row on team-raise for kg_add (ordering verification).
+# Covered inline in T6a above; this explicit test names the T8-KG criterion
+# so the test run surfaces it by name for audit purposes.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_kg_add_no_wal_row_on_team_raise(server_pg, monkeypatch):
+    """After a team-less kg_add raise, no WAL row exists for the attempt.
+
+    Ordering pin (T8-KG): the strict ``require_write_team`` raise must fire
+    BEFORE ``_wal_log`` so the audit table never sees the aborted write.
+    Uses a unique sentinel triple to avoid any cross-test interference.
+    """
+    monkeypatch.setenv("MEMPALACE_TEAM", "team_default")
+    monkeypatch.setattr(
+        m, "_config", __import__("mempalace.config", fromlist=["MempalaceConfig"]).MempalaceConfig()
+    )
+
+    sentinel = "T8KG_sentinel_" + uuid.uuid4().hex
+
+    token = m._active_team_var.set(None)
+    try:
+        with pytest.raises(ValueError, match="no team resolved"):
+            m.tool_kg_add(subject=sentinel, predicate="tested_by", object="t8kg")
+    finally:
+        m._active_team_var.reset(token)
+
+    _pop_caches(m._canonical_default_team())
+    _assert_no_wal_row("kg_add", sentinel)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T6b — kg_invalidate strict-raise + empty-vault no-op (Slice 3).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_kg_invalidate_without_team_raises(server_pg, monkeypatch):
+    """tool_kg_invalidate with NO active session team RAISES on the postgres backend.
+
+    Negative-DB assertions mirror T6a: ValueError raised, no WAL row, no schema.
+    """
+    monkeypatch.setenv("MEMPALACE_TEAM", "team_default")
+    monkeypatch.setattr(
+        m, "_config", __import__("mempalace.config", fromlist=["MempalaceConfig"]).MempalaceConfig()
+    )
+
+    sentinel_subject = "T6b_inv_sentinel_" + uuid.uuid4().hex
+
+    token = m._active_team_var.set(None)
+    try:
+        assert m._resolve_team_strict() is None
+
+        # (a) strict raise fires before any side effect
+        with pytest.raises(ValueError, match="no team resolved"):
+            m.tool_kg_invalidate(subject=sentinel_subject, predicate="knows", object="nobody")
+    finally:
+        m._active_team_var.reset(token)
+
+    default_team = m._canonical_default_team()
+    _pop_caches(default_team)
+
+    # (b) no WAL row for the sentinel
+    _assert_no_wal_row("kg_invalidate", sentinel_subject)
+
+    # (c) team_default schema was not created
+    _assert_schema_absent(default_team)
+
+
+def test_kg_invalidate_resolved_team_empty_vault_is_noop(server_pg, monkeypatch):
+    """kg_invalidate on a resolved team whose vault has never been written is a no-op.
+
+    With create=False the KG _ensure raises PalaceNotFoundError on an absent
+    schema; tool_kg_invalidate catches that and returns a success/no-op shape.
+    The vault schema must NOT be created as a side effect.
+
+    Negative-DB assertion: the fresh uuid team schema remains absent from
+    information_schema.schemata after the no-op call.
+    """
+    fresh_team = "t6b_noop_" + uuid.uuid4().hex[:12]
+    _pop_caches(fresh_team)
+
+    token = m._active_team_var.set(fresh_team)
+    try:
+        result = m.tool_kg_invalidate(
+            subject="ghost_entity", predicate="never_existed", object="nowhere"
+        )
+    finally:
+        m._active_team_var.reset(token)
+
+    # The call must succeed as a no-op, not raise or error.
+    assert result.get("success") is True, f"Expected success no-op, got: {result}"
+    assert result.get("no_op") is True, f"Expected no_op=True in result, got: {result}"
+
+    # The vault schema must NOT have been created.
+    _pop_caches(fresh_team)
+    _assert_schema_absent(fresh_team)

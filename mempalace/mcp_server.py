@@ -3213,6 +3213,11 @@ def tool_kg_add(
 
     Temporal values accept either ``YYYY-MM-DD`` or canonical UTC datetimes in
     the form ``YYYY-MM-DDTHH:MM:SSZ``.
+
+    On the central (postgres) backend a team-less call RAISES
+    ``ValueError("no team resolved …")`` rather than silently writing into
+    a shared default vault — identical to the ``tool_diary_write`` /
+    ``tool_entity_seed`` strict-writer contract.
     """
     try:
         subject = sanitize_kg_value(subject, "subject")
@@ -3222,6 +3227,14 @@ def tool_kg_add(
         valid_to = sanitize_iso_temporal(valid_to, "valid_to")
     except ValueError as e:
         return {"success": False, "error": str(e)}
+
+    # Resolve the team FIRST so a team-less write fails loud BEFORE _wal_log
+    # and before _call_kg (the diary_write / entity_seed pattern). Chroma is
+    # single-vault and skips the strict check.
+    if _config.backend != "chroma":
+        from .link_store import require_write_team
+
+        require_write_team(_resolve_team_strict())
 
     _wal_log(
         "kg_add",
@@ -3261,6 +3274,13 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
 
     Temporal values accept either ``YYYY-MM-DD`` or canonical UTC datetimes in
     the form ``YYYY-MM-DDTHH:MM:SSZ``.
+
+    On the central (postgres) backend a team-less call RAISES
+    ``ValueError("no team resolved …")`` rather than silently writing into
+    a shared default vault. A resolved team on a vault that has never been
+    written is a legitimate no-op: the fact cannot exist, so invalidating it
+    succeeds without creating the vault schema (``create=False`` is passed to
+    the KG ``_ensure`` so no schema is provisioned for the no-op case).
     """
     try:
         subject = sanitize_kg_value(subject, "subject")
@@ -3272,6 +3292,14 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
 
     resolved_ended = ended or date.today().isoformat()
 
+    # Resolve the team FIRST so a team-less write fails loud BEFORE _wal_log
+    # and before _call_kg (mirrors tool_kg_add / tool_diary_write). Chroma is
+    # single-vault and skips the strict check.
+    if _config.backend != "chroma":
+        from .link_store import require_write_team
+
+        require_write_team(_resolve_team_strict())
+
     _wal_log(
         "kg_invalidate",
         {
@@ -3282,7 +3310,25 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
         },
     )
 
-    _call_kg(lambda kg: kg.invalidate(subject, predicate, object, ended=resolved_ended))
+    from .backends import PalaceNotFoundError
+
+    # Only the postgres KG is create-gated; the sqlite KG (chroma backend) has
+    # no ``create`` kwarg and is single-vault anyway.
+    invalidate_kwargs = {"ended": resolved_ended}
+    if _config.backend != "chroma":
+        invalidate_kwargs["create"] = False
+
+    try:
+        _call_kg(lambda kg: kg.invalidate(subject, predicate, object, **invalidate_kwargs))
+    except PalaceNotFoundError:
+        # Vault never written — the fact cannot exist; invalidating is a no-op.
+        return {
+            "success": True,
+            "fact": f"{subject} → {predicate} → {object}",
+            "ended": resolved_ended,
+            "no_op": True,
+            "reason": "vault does not exist; nothing to invalidate",
+        }
     return {
         "success": True,
         "fact": f"{subject} → {predicate} → {object}",
