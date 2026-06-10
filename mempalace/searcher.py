@@ -819,6 +819,43 @@ def _apply_candidate_strategy(
         )
 
 
+def _open_drawers_collection(palace_path, collection_name, team, query):
+    """Fetch the drawers collection, returning the collection object or an error dict.
+
+    Separates the exception-handling branches from ``search_memories`` to keep
+    that function's cyclomatic complexity within the ruff C901 budget.
+    """
+    try:
+        return get_collection(palace_path, collection_name=collection_name, create=False, team=team)
+    except (PalaceNotFoundError, CollectionNotInitializedError):
+        if team is not None:
+            # Central / postgres path: the vault simply has no entries yet.
+            # Return the empty-vault shape so callers can distinguish "nothing
+            # filed yet" from a real backend error. Other exceptions propagate
+            # (PM#3: a DB outage must NOT look like an empty vault).
+            return {
+                "query": query,
+                "results": [],
+                "vault": team,
+                "empty_vault": True,
+                "reason": (
+                    f"vault {team!r} has no entries yet or does not exist; "
+                    "check the team name or write first"
+                ),
+            }
+        # Chroma / local path: the palace genuinely needs init+mine.
+        logger.error("No palace found at %s", palace_path)
+        return {
+            "error": "No palace found",
+            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
+        }
+    except Exception as e:
+        # Any other exception (DB outage, connection refused, etc.) surfaces as
+        # an error — never silently converted to the empty-vault shape.
+        logger.error("Palace read error at %s: %s", palace_path, e)
+        return {"error": f"palace read error: {e}"}
+
+
 def search_memories(
     query: str,
     palace_path: str,
@@ -897,16 +934,10 @@ def search_memories(
             collection_name=collection_name,
         )
 
-    try:
-        drawers_col = get_collection(
-            palace_path, collection_name=collection_name, create=False, team=team
-        )
-    except Exception as e:
-        logger.error("No palace found at %s: %s", palace_path, e)
-        return {
-            "error": "No palace found",
-            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
-        }
+    drawers_col_or_err = _open_drawers_collection(palace_path, collection_name, team, query)
+    if isinstance(drawers_col_or_err, dict):
+        return drawers_col_or_err
+    drawers_col = drawers_col_or_err
 
     where = build_where_filter(wing, room)
 

@@ -265,3 +265,69 @@ def test_check_duplicate_propagates_backend_error_not_empty_false(monkeypatch):
         get_backend("postgres")._embedder = None
         mcp._kg_by_path.clear()
         _drop(team)
+
+
+# ---------------------------------------------------------------------------
+# T3 — Slice 5: fresh-vault search returns central empty shape, not chroma hint
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_vault_search_returns_central_shape(monkeypatch):
+    """T3-POS: searching a never-written postgres vault returns the central
+    empty_vault shape — no 'error' key, no chroma init/mine hint."""
+    import mempalace.mcp_server as mcp
+
+    team = "t" + uuid.uuid4().hex[:10]
+    monkeypatch.setenv("MEMPALACE_BACKEND", "postgres")
+    monkeypatch.setenv("MEMPALACE_DATABASE_URL", _dsn())
+    get_backend("postgres")._embedder = _fake_embed
+    try:
+        _use_team(mcp, monkeypatch, team)
+
+        res = mcp.tool_search("anything")
+
+        # Must use the central empty-vault envelope.
+        assert "error" not in res, f"unexpected error key: {res}"
+        assert res.get("empty_vault") is True, res
+        assert res.get("results") == [], res
+        assert res.get("vault") == team, res
+        reason = res.get("reason", "")
+        assert team in reason or "no entries" in reason or "does not exist" in reason
+        # Chroma hint must NOT appear.
+        assert "mempalace init" not in res.get("reason", "")
+        assert "mempalace init" not in str(res.get("hint", ""))
+    finally:
+        get_backend("postgres")._embedder = None
+        mcp._kg_by_path.clear()
+        _drop(team)
+
+
+def test_fresh_vault_search_transient_error_surfaces_as_error(monkeypatch):
+    """T3-NEG: a transient backend error during search must surface as an error
+    dict, NOT be silently swallowed into the empty_vault shape (PM#3 invariant)."""
+    import mempalace.mcp_server as mcp
+    import mempalace.searcher as searcher_mod
+
+    team = "t" + uuid.uuid4().hex[:10]
+    monkeypatch.setenv("MEMPALACE_BACKEND", "postgres")
+    monkeypatch.setenv("MEMPALACE_DATABASE_URL", _dsn())
+    get_backend("postgres")._embedder = _fake_embed
+    try:
+        _use_team(mcp, monkeypatch, team)
+
+        # Patch the get_collection name inside searcher (module-level import) to
+        # raise a non-palace exception, simulating a DB outage.
+        def _raise_db(*args, **kwargs):
+            raise RuntimeError("simulated DB outage")
+
+        monkeypatch.setattr(searcher_mod, "get_collection", _raise_db)
+
+        res = mcp.tool_search("anything")
+
+        # Must surface as an error, not an empty_vault.
+        assert "error" in res, f"expected error key, got: {res}"
+        assert res.get("empty_vault") is None or res.get("empty_vault") is False
+    finally:
+        get_backend("postgres")._embedder = None
+        mcp._kg_by_path.clear()
+        _drop(team)
