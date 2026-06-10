@@ -126,19 +126,22 @@ class PostgresKnowledgeGraph:
             if not create:
                 with self._backend._conn() as conn:
                     with conn.cursor() as cur:
+                        # Probe the KG table itself (not just the schema): the
+                        # entity-registry, link-store, or another sub-system may
+                        # have created the team schema independently without ever
+                        # materialising the KG tables. Schema-only presence is not
+                        # sufficient — we must confirm the KG surface exists.
                         cur.execute(
-                            "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
-                            (self._schema,),
+                            "SELECT to_regclass(%s)",
+                            (f"{self._schema}.kg_triples",),
                         )
-                        schema_exists = cur.fetchone() is not None
-                if not schema_exists:
-                    # Never create, never set _ensured: an unmaterialized schema
+                        table_exists = cur.fetchone()[0] is not None
+                if not table_exists:
+                    # Never create, never set _ensured: an unmaterialized KG
                     # under create=False must raise on EVERY call.
-                    raise PalaceNotFoundError(f"team vault {self._schema!r} does not exist")
-                # Schema present -> its tables were created by whoever materialized
-                # it (the only writer of this schema is this class's create=True
-                # branch, which always creates the tables atomically below). Mark
-                # ensured and return without issuing any DDL.
+                    raise PalaceNotFoundError(f"team vault {self._schema!r} has no KG tables yet")
+                # KG table present -> schema and tables are fully initialized.
+                # Mark ensured and return without issuing any DDL.
                 self._ensured = True
                 return
             # Backstop (PM#7): never CREATE SCHEMA off a None-derived/empty team.

@@ -1816,6 +1816,11 @@ def tool_entities(
     only, default 2) filters one-off extraction noise; pass 1 to see everything.
     On the local chroma backend the entity index does not exist (use
     ``mempalace mine`` + search there).
+
+    On the central (postgres) backend this read never materializes the vault
+    schema. A vault that has had no writes yet returns an empty success shape
+    (``empty_vault: True``) rather than creating the schema as a side effect.
+    Genuine DB/connection errors still surface as exceptions.
     """
     if _config.backend == "chroma":
         return {
@@ -1829,10 +1834,12 @@ def tool_entities(
     except ValueError as e:
         return {"error": str(e)}
     team = _resolve_team(vault)
+    from .backends import PalaceNotFoundError
+
     try:
         idx = _get_entity_index(team)
         if entity:
-            rows = idx.drawers_for_entity(entity)
+            rows = idx.drawers_for_entity(entity, create=False)
             # Per-chunk tagging narrows the index to the chunks that actually
             # mention the entity, so a chunked drawer whose entity appears in
             # only one chunk would otherwise surface as a lone chunk — not the
@@ -1851,7 +1858,10 @@ def tool_entities(
                 "hint": f"Pass entity='{entity}' to mempalace_search for the verbatim content.",
             }
         top = idx.top_entities(
-            wing=wing, min_count=max(1, int(min_count)), limit=max(1, min(int(limit), 500))
+            wing=wing,
+            min_count=max(1, int(min_count)),
+            limit=max(1, min(int(limit), 500)),
+            create=False,
         )
         return {
             "backend": _config.backend,
@@ -1859,6 +1869,18 @@ def tool_entities(
             "wing": wing or "all",
             "entities": top,
             "count": len(top),
+        }
+    except PalaceNotFoundError:
+        # Vault never written — return the check_duplicate-style empty shape.
+        # Never materializes the schema as a side effect (create=False above).
+        return {
+            "entities": [],
+            "vault": team,
+            "empty_vault": True,
+            "reason": (
+                f"vault {team!r} has no entries yet or does not exist; "
+                "check the team name or write first"
+            ),
         }
     except Exception as e:
         return {"error": str(e)}
@@ -3126,7 +3148,13 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 
 
 def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
-    """Query the knowledge graph for an entity's relationships."""
+    """Query the knowledge graph for an entity's relationships.
+
+    On the central (postgres) backend this read never materializes the vault
+    schema. A vault that has had no writes yet returns an empty success shape
+    (``empty_vault: True``) rather than creating the schema as a side effect.
+    Genuine DB/connection errors still surface as exceptions.
+    """
     try:
         entity = sanitize_kg_value(entity, "entity")
         as_of = sanitize_iso_temporal(as_of, "as_of")
@@ -3136,7 +3164,26 @@ def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
     if direction not in ("outgoing", "incoming", "both"):
         return {"error": "direction must be 'outgoing', 'incoming', or 'both'"}
 
-    results = _call_kg(lambda kg: kg.query_entity(entity, as_of=as_of, direction=direction))
+    if _config.backend != "chroma":
+        from .backends import PalaceNotFoundError
+
+        try:
+            results = _call_kg(
+                lambda kg: kg.query_entity(entity, as_of=as_of, direction=direction, create=False)
+            )
+        except PalaceNotFoundError:
+            team = _resolve_team()
+            return {
+                "entity": entity,
+                "as_of": as_of,
+                "facts": [],
+                "count": 0,
+                "empty_vault": True,
+                "vault": team,
+                "reason": f"vault {team!r} has no entries yet or does not exist; write first",
+            }
+    else:
+        results = _call_kg(lambda kg: kg.query_entity(entity, as_of=as_of, direction=direction))
     return {"entity": entity, "as_of": as_of, "facts": results, "count": len(results)}
 
 
@@ -3156,6 +3203,10 @@ def tool_kg_neighbors(
     (outgoing, incoming, or both); ``as_of`` restricts every hop to facts valid
     at that point in time; ``target`` keeps only paths that reach a named
     entity; ``predicates`` limits every hop to specific relationship types.
+
+    On the central (postgres) backend this read never materializes the vault
+    schema. A vault that has had no writes yet returns an empty success shape
+    (``empty_vault: True``). Genuine DB/connection errors still surface.
     """
     try:
         entity = sanitize_kg_value(entity, "entity")
@@ -3170,19 +3221,51 @@ def tool_kg_neighbors(
 
     depth = max(1, min(depth, 4))
 
-    try:
-        result = _call_kg(
-            lambda kg: kg.neighbors(
-                entity,
-                depth=depth,
-                direction=direction,
-                as_of=as_of,
-                target=target,
-                predicates=predicates,
+    if _config.backend != "chroma":
+        from .backends import PalaceNotFoundError
+
+        try:
+            result = _call_kg(
+                lambda kg: kg.neighbors(
+                    entity,
+                    depth=depth,
+                    direction=direction,
+                    as_of=as_of,
+                    target=target,
+                    predicates=predicates,
+                    create=False,
+                )
             )
-        )
-    except NotImplementedError as e:
-        return {"error": str(e), "unsupported": True}
+        except PalaceNotFoundError:
+            team = _resolve_team()
+            return {
+                "entity": entity,
+                "depth": depth,
+                "direction": direction,
+                "as_of": as_of,
+                "neighbors": [],
+                "count": 0,
+                "truncated": False,
+                "empty_vault": True,
+                "vault": team,
+                "reason": f"vault {team!r} has no entries yet or does not exist; write first",
+            }
+        except NotImplementedError as e:
+            return {"error": str(e), "unsupported": True}
+    else:
+        try:
+            result = _call_kg(
+                lambda kg: kg.neighbors(
+                    entity,
+                    depth=depth,
+                    direction=direction,
+                    as_of=as_of,
+                    target=target,
+                    predicates=predicates,
+                )
+            )
+        except NotImplementedError as e:
+            return {"error": str(e), "unsupported": True}
 
     return {
         "entity": entity,
@@ -3337,18 +3420,62 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
 
 
 def tool_kg_timeline(entity: str = None):
-    """Get chronological timeline of facts, optionally for one entity."""
+    """Get chronological timeline of facts, optionally for one entity.
+
+    On the central (postgres) backend this read never materializes the vault
+    schema. A vault that has had no writes yet returns an empty success shape
+    (``empty_vault: True``). Genuine DB/connection errors still surface.
+    """
     if entity is not None:
         try:
             entity = sanitize_kg_value(entity, "entity")
         except ValueError as e:
             return {"error": str(e)}
-    results = _call_kg(lambda kg: kg.timeline(entity))
+
+    if _config.backend != "chroma":
+        from .backends import PalaceNotFoundError
+
+        try:
+            results = _call_kg(lambda kg: kg.timeline(entity, create=False))
+        except PalaceNotFoundError:
+            team = _resolve_team()
+            return {
+                "entity": entity or "all",
+                "timeline": [],
+                "count": 0,
+                "empty_vault": True,
+                "vault": team,
+                "reason": f"vault {team!r} has no entries yet or does not exist; write first",
+            }
+    else:
+        results = _call_kg(lambda kg: kg.timeline(entity))
     return {"entity": entity or "all", "timeline": results, "count": len(results)}
 
 
 def tool_kg_stats():
-    """Knowledge graph overview: entities, triples, relationship types."""
+    """Knowledge graph overview: entities, triples, relationship types.
+
+    On the central (postgres) backend this read never materializes the vault
+    schema. A vault that has had no writes yet returns an empty success shape
+    (``empty_vault: True``). Genuine DB/connection errors still surface.
+    """
+    if _config.backend != "chroma":
+        from .backends import PalaceNotFoundError
+
+        try:
+            return _call_kg(lambda kg: kg.stats(create=False))
+        except PalaceNotFoundError:
+            team = _resolve_team()
+            return {
+                "entities": 0,
+                "triples": 0,
+                "current_facts": 0,
+                "expired_facts": 0,
+                "relationship_types": [],
+                "empty_vault": True,
+                "vault": team,
+                "reason": f"vault {team!r} has no entries yet or does not exist; write first",
+            }
     return _call_kg(lambda kg: kg.stats())
 
 
