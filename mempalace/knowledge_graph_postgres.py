@@ -28,6 +28,7 @@ from .config import sanitize_iso_temporal
 from .knowledge_graph import _temporal_end_key, _temporal_start_key
 
 # Reuse identifier quoting + schema naming from the storage backend.
+from .backends import PalaceNotFoundError
 from .backends.postgres import _qi, team_schema
 
 
@@ -98,12 +99,54 @@ class PostgresKnowledgeGraph:
     def _triples(self) -> str:
         return f"{_qi(self._schema)}.{_qi('kg_triples')}"
 
-    def _ensure(self) -> None:
+    def _ensure(self, *, create: bool = True) -> None:
+        """Ensure the team vault's KG tables exist, gated per-call on ``create``.
+
+        Mirrors ``PostgresBackend._ensure_collection``'s discipline: ``create=
+        False`` on a never-materialized schema RAISES ``PalaceNotFoundError`` and
+        never runs ``CREATE SCHEMA`` — reads must degrade to the central empty
+        shape, not silently provision a tenant vault.
+
+        ``create`` is a PER-CALL flag and is NEVER stored on the instance. This
+        handle is cached per-team in ``mcp_server._kg_by_path`` and shared across
+        read AND write requests, so a stored mode would alias: a read that arrived
+        first could pin ``create=False`` and break the writer (PM#8). ``_ensured``
+        may fast-path ONLY the materialized case — once the schema is known to
+        exist, both modes are satisfied. While ``_ensured`` is False, a ``create=
+        False`` call probes existence on EVERY call and raises if absent.
+        """
         if self._ensured:
+            # Schema is known materialized; both create=True and create=False are
+            # satisfied. Do NOT branch on ``create`` here — see the docstring's
+            # cache-aliasing note.
             return
         with self._lock:
             if self._ensured:
                 return
+            if not create:
+                with self._backend._conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+                            (self._schema,),
+                        )
+                        schema_exists = cur.fetchone() is not None
+                if not schema_exists:
+                    # Never create, never set _ensured: an unmaterialized schema
+                    # under create=False must raise on EVERY call.
+                    raise PalaceNotFoundError(f"team vault {self._schema!r} does not exist")
+                # Schema present -> its tables were created by whoever materialized
+                # it (the only writer of this schema is this class's create=True
+                # branch, which always creates the tables atomically below). Mark
+                # ensured and return without issuing any DDL.
+                self._ensured = True
+                return
+            # Backstop (PM#7): never CREATE SCHEMA off a None-derived/empty team.
+            # team_schema(None) -> "team_default"; an empty slug would yield a bare
+            # "team_" which must never be materialized as a vault.
+            slug = self._schema[len("team_") :] if self._schema.startswith("team_") else ""
+            if not slug:
+                raise ValueError("no team resolved for KG schema materialization")
             with self._backend._conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(f"CREATE SCHEMA IF NOT EXISTS {_qi(self._schema)}")
@@ -185,8 +228,10 @@ class PostgresKnowledgeGraph:
         source_file: str = None,
         source_drawer_id: str = None,
         adapter_name: str = None,
+        *,
+        create: bool = True,
     ):
-        self._ensure()
+        self._ensure(create=create)
         valid_from = sanitize_iso_temporal(valid_from, "valid_from")
         valid_to = sanitize_iso_temporal(valid_to, "valid_to")
         if (
@@ -248,8 +293,10 @@ class PostgresKnowledgeGraph:
                 )
                 return triple_id
 
-    def invalidate(self, subject: str, predicate: str, obj: str, ended: str = None):
-        self._ensure()
+    def invalidate(
+        self, subject: str, predicate: str, obj: str, ended: str = None, *, create: bool = True
+    ):
+        self._ensure(create=create)
         sub_id = self._entity_id(subject)
         obj_id = self._entity_id(obj)
         pred = predicate.lower().replace(" ", "_")
@@ -278,8 +325,10 @@ class PostgresKnowledgeGraph:
                 )
 
     # -- queries ----------------------------------------------------------
-    def query_entity(self, name: str, as_of: str = None, direction: str = "outgoing"):
-        self._ensure()
+    def query_entity(
+        self, name: str, as_of: str = None, direction: str = "outgoing", *, create: bool = True
+    ):
+        self._ensure(create=create)
         as_of = sanitize_iso_temporal(as_of, "as_of")
         eid = self._entity_id(name)
         results = []
@@ -345,6 +394,8 @@ class PostgresKnowledgeGraph:
         predicates: Optional[list] = None,
         limit: int = 500,
         expand_cap: int = 50,
+        *,
+        create: bool = True,
     ):
         """Bounded multi-hop neighborhood walk over the temporal triples.
 
@@ -376,7 +427,7 @@ class PostgresKnowledgeGraph:
         This is a read-only walk; it issues no DDL and never mutates the
         relational source of truth.
         """
-        self._ensure()
+        self._ensure(create=create)
         as_of = sanitize_iso_temporal(as_of, "as_of")
         if direction not in ("outgoing", "incoming", "both"):
             raise ValueError(
@@ -571,8 +622,8 @@ class PostgresKnowledgeGraph:
                     )
         return results
 
-    def timeline(self, entity_name: str = None):
-        self._ensure()
+    def timeline(self, entity_name: str = None, *, create: bool = True):
+        self._ensure(create=create)
         base = (
             f"SELECT t.predicate, t.valid_from, t.valid_to, s.name AS sub_name, o.name AS obj_name "
             f"FROM {self._triples()} t "
@@ -603,8 +654,8 @@ class PostgresKnowledgeGraph:
             for r in rows
         ]
 
-    def stats(self):
-        self._ensure()
+    def stats(self, *, create: bool = True):
+        self._ensure(create=create)
         with self._backend._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {self._entities()}")

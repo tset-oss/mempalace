@@ -25,6 +25,7 @@ import time
 from typing import Iterable, Optional
 
 # Reuse identifier quoting + schema naming from the storage backend.
+from .backends import PalaceNotFoundError
 from .backends.postgres import _qi, team_schema
 
 # The per-vault known-entity set seeds extraction. It is queried on the write
@@ -62,12 +63,51 @@ class PostgresEntityIndex:
     def _table(self) -> str:
         return f"{_qi(self._schema)}.{_qi('entity_occurrences')}"
 
-    def _ensure(self) -> None:
+    def _ensure(self, *, create: bool = True) -> None:
+        """Ensure the team vault's entity-index table exists, gated on ``create``.
+
+        Mirrors ``PostgresBackend._ensure_collection`` and the KG ``_ensure``:
+        ``create=False`` on a never-materialized schema RAISES
+        ``PalaceNotFoundError`` and never runs ``CREATE SCHEMA`` — reads must
+        degrade to the central empty shape, not silently provision a vault.
+
+        ``create`` is a PER-CALL flag and is NEVER stored on the instance. This
+        handle is cached per-team in ``mcp_server._entity_index_by_team`` and
+        shared across read AND write requests, so a stored mode would alias: a
+        read arriving first could pin ``create=False`` and break the writer
+        (PM#8). ``_ensured`` may fast-path ONLY the materialized case — once the
+        schema is known to exist, both modes are satisfied. While ``_ensured`` is
+        False, a ``create=False`` call probes existence on EVERY call and raises
+        if absent.
+        """
         if self._ensured:
+            # Schema is known materialized; both modes satisfied. Do NOT branch on
+            # ``create`` here — see the docstring's cache-aliasing note.
             return
         with self._lock:
             if self._ensured:
                 return
+            if not create:
+                with self._backend._conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+                            (self._schema,),
+                        )
+                        schema_exists = cur.fetchone() is not None
+                if not schema_exists:
+                    # Never create, never set _ensured: an unmaterialized schema
+                    # under create=False must raise on EVERY call.
+                    raise PalaceNotFoundError(f"team vault {self._schema!r} does not exist")
+                # Schema present -> its table was created by whoever materialized
+                # it (this class's create=True branch always creates the table
+                # atomically below). Mark ensured and return without any DDL.
+                self._ensured = True
+                return
+            # Backstop (PM#7): never CREATE SCHEMA off a None-derived/empty team.
+            slug = self._schema[len("team_") :] if self._schema.startswith("team_") else ""
+            if not slug:
+                raise ValueError("no team resolved for entity-index schema materialization")
             with self._backend._conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(f"CREATE SCHEMA IF NOT EXISTS {_qi(self._schema)}")
@@ -110,6 +150,8 @@ class PostgresEntityIndex:
         wing: Optional[str],
         room: Optional[str],
         is_topic: bool = False,
+        *,
+        create: bool = True,
     ) -> int:
         """Insert (entity, drawer_id, wing, room) rows. Idempotent per pair.
 
@@ -132,7 +174,7 @@ class PostgresEntityIndex:
         if not ids or not ents:
             return 0
         rows = [(e, d, wing, room, is_topic) for d in ids for e in ents]
-        self._ensure()
+        self._ensure(create=create)
         with self._backend._conn() as conn:
             with conn.cursor() as cur:
                 cur.executemany(
@@ -206,7 +248,7 @@ class PostgresEntityIndex:
         self._known_cache_at = now
         return self._known_cache
 
-    def drawers_for_entity(self, entity: str) -> list[dict]:
+    def drawers_for_entity(self, entity: str, *, create: bool = True) -> list[dict]:
         """Physical drawer ids (+ wing/room) that mention ``entity``.
 
         Case-insensitive match so a query for ``Dana`` finds rows stamped
@@ -214,7 +256,7 @@ class PostgresEntityIndex:
         """
         if not entity:
             return []
-        self._ensure()
+        self._ensure(create=create)
         with self._backend._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -246,7 +288,12 @@ class PostgresEntityIndex:
                 return [r[0] for r in cur.fetchall() if r[0]]
 
     def top_entities(
-        self, wing: Optional[str] = None, min_count: int = 1, limit: int = 100
+        self,
+        wing: Optional[str] = None,
+        min_count: int = 1,
+        limit: int = 100,
+        *,
+        create: bool = True,
     ) -> list[dict]:
         """Most-mentioned entities in the vault (optionally scoped to a wing).
 
@@ -257,7 +304,7 @@ class PostgresEntityIndex:
         ``entity=``; this surface reflects organically-extracted entities. The
         ``_ensure`` above guarantees the column exists (this index owns it).
         """
-        self._ensure()
+        self._ensure(create=create)
         clauses = ["is_topic = false"]
         params: list = []
         if wing:
