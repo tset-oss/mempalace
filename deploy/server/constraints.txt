@@ -1,0 +1,16 @@
+# pip constraints for the server image build (referenced by deploy/server/Dockerfile).
+#
+# The image installs ".[postgres,serve]" with floating transitive pins, so a
+# single bad or half-propagated release on PyPI can make resolution impossible
+# at build time (seen 2026-06-11: ResolutionImpossible cycling on
+# "httpx depends on httpcore==1.*" while backtracking through chromadb, on the
+# stale pip shipped in a cached python:3.12-slim). Constraints only BOUND
+# versions — they never add packages — so this file just keeps the volatile
+# HTTP stack inside the ranges every consumer in the graph (chromadb, mcp,
+# sse-starlette) is known to support, giving the resolver a small, valid space
+# instead of an open-ended backtrack.
+#
+# Revisit when httpx 0.29+/1.0 ships and the mcp SDK + chromadb declare
+# support for it.
+httpx>=0.27,<0.29
+httpcore>=1.0,<2

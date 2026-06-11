@@ -13,5 +13,9 @@ htmlcov
 *.egg-info
 .omc
 deploy
+# Re-include ONLY the pip constraints file the server Dockerfile consumes —
+# deploy/ stays excluded so a local deploy/.env (bearer token) never enters
+# the image.
+!deploy/server/constraints.txt
 tests
 benchmarks

@@ -16,7 +16,14 @@ COPY . /app
 
 # psycopg[binary], chromadb, tokenizers, onnxruntime and the mcp SDK all publish
 # manylinux wheels, so no compiler toolchain is needed on slim.
-RUN pip install ".[postgres,serve]"
+#
+# Upgrade pip first: a months-old cached python:3.12-slim ships a pip whose
+# resolver gives up (ResolutionImpossible) on dependency graphs that current
+# pip solves — exactly what broke this build on 2026-06-11. The constraints
+# file bounds the volatile httpx/httpcore stack so one bad transitive release
+# cannot make the floating-resolution build unsolvable.
+RUN pip install --upgrade pip && \
+    pip install -c deploy/server/constraints.txt ".[postgres,serve]"
 
 # Pre-bake the embeddinggemma-300m ONNX model (~300 MB) into the image so the
 # server never downloads it from HuggingFace at request time (no runtime egress
