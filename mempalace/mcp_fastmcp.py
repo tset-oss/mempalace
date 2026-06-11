@@ -167,7 +167,13 @@ def _make_switch_team(get_context):
             return {
                 "ok": True,
                 "active_team": None,
-                "note": "reset to the configured default (header / server default)",
+                "note": (
+                    "reset to the configured default (header / server default). "
+                    "NOTE: 'default' is a reset alias, not a writable vault — if "
+                    "this machine ships no team header, writes will still raise "
+                    "'no team resolved' until you switch_team to a real team "
+                    "from mempalace_list_vaults."
+                ),
             }
         if raw == "all":
             return {

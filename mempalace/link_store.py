@@ -204,9 +204,13 @@ def require_write_team(team: Optional[str]) -> str:
     """
     if team is None:
         raise ValueError(
-            "no team resolved for a team-scoped link-store write; refusing to "
-            "fall back to a default vault (would leak across teams). Set an "
-            "explicit team or an active session team."
+            "no team resolved for a team-scoped write; refusing to fall back "
+            "to a shared default vault (would leak across teams). Fix: call "
+            "mempalace_switch_team(team='<your-team>') once, or pass "
+            "vault='<your-team>' on this call — using your REAL team name "
+            "from mempalace_list_vaults. Note that 'default', 'primary' and "
+            "'all' are reset/sweep aliases, NOT writable vaults: passing "
+            "them resolves to no team and lands back on this error."
         )
     return team
 

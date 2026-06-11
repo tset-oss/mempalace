@@ -1759,7 +1759,11 @@ def tool_list_vaults():
         "mode": "central",
         "primary": primary,
         "vaults": teams,
-        "hint": "Pass vault='<team>' to read/write another team's vault, or vault='all' to search across all.",
+        "hint": (
+            "Pass vault='<team>' to read/write another team's vault, or vault='all' "
+            "to search across all. 'default' is a reset alias, not a writable "
+            "target — writes need a real team name from this list."
+        ),
     }
 
 
