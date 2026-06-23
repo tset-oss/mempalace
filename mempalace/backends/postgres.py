@@ -870,33 +870,57 @@ class PostgresBackend(BaseBackend):
             if self._bootstrapped:
                 return
             with self._conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-                    # pg_trgm backs the trigram GIN on ``document`` and is a
-                    # REQUIRED path (the keyword-candidate retrieval substrate),
-                    # unlike the optional pg_search/age below. It is core to
-                    # Postgres and always available, so a failure here must
-                    # surface (propagate) rather than be swallowed and warned.
-                    cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-                    for ext in ("pg_search", "age"):
+                # Bootstrap DDL runs in autocommit so each CREATE EXTENSION is
+                # its own unit of work. This is load-bearing: in a single shared
+                # transaction, a missing OPTIONAL extension (pg_search/age) hit
+                # ``conn.rollback()`` which ALSO discarded the already-run
+                # REQUIRED ``vector``/``pg_trgm`` creates, leaving a database
+                # with no ``vector`` type on any image lacking the optionals
+                # (e.g. a stock pgvector image without ParadeDB/AGE). Per-
+                # statement autocommit isolates each create so an optional
+                # failure can never undo the required pair. Restore
+                # autocommit=False on exit: psycopg_pool normalises transaction
+                # status but not the autocommit attribute, so the next consumer
+                # would otherwise inherit autocommit=True and lose atomicity.
+                conn.autocommit = True
+                try:
+                    with conn.cursor() as cur:
+                        # Required. pg_trgm backs the trigram GIN on ``document``
+                        # (the keyword-candidate retrieval substrate); both are
+                        # core/bundled, so a failure here must surface (propagate)
+                        # rather than be swallowed and warned.
+                        cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                        cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+                        # Optional. Under autocommit each create is independent,
+                        # so an unavailable extension is warned and skipped
+                        # without touching the required pair or the others.
+                        for ext in ("pg_search", "age"):
+                            try:
+                                cur.execute(f"CREATE EXTENSION IF NOT EXISTS {ext}")
+                            except Exception as e:  # pragma: no cover - optional extensions
+                                logger.warning("optional extension %s unavailable: %s", ext, e)
+                        # Provision the AGE graph for traversal / future KG use
+                        # (optional; only when the age extension loaded above).
                         try:
-                            cur.execute(f"CREATE EXTENSION IF NOT EXISTS {ext}")
-                        except Exception as e:  # pragma: no cover - optional extensions
-                            conn.rollback()
-                            logger.warning("optional extension %s unavailable: %s", ext, e)
-                    # Provision the AGE graph for traversal / future KG use.
-                    try:
-                        cur.execute("LOAD 'age'")
-                        cur.execute("SET search_path = ag_catalog, public")
-                        cur.execute(
-                            "SELECT 1 FROM ag_catalog.ag_graph WHERE name = %s", (_AGE_GRAPH,)
-                        )
-                        if cur.fetchone() is None:
-                            cur.execute("SELECT create_graph(%s)", (_AGE_GRAPH,))
-                        cur.execute("RESET search_path")
-                    except Exception as e:  # pragma: no cover - AGE optional at this stage
-                        conn.rollback()
-                        logger.warning("AGE graph provisioning skipped: %s", e)
+                            cur.execute("LOAD 'age'")
+                            cur.execute("SET search_path = ag_catalog, public")
+                            try:
+                                cur.execute(
+                                    "SELECT 1 FROM ag_catalog.ag_graph WHERE name = %s",
+                                    (_AGE_GRAPH,),
+                                )
+                                if cur.fetchone() is None:
+                                    cur.execute("SELECT create_graph(%s)", (_AGE_GRAPH,))
+                            finally:
+                                # SET search_path is session-level under
+                                # autocommit (not transactional), so reset it
+                                # explicitly even on failure — a rollback would
+                                # not undo it before the connection is reused.
+                                cur.execute("RESET search_path")
+                        except Exception as e:  # pragma: no cover - AGE optional at this stage
+                            logger.warning("AGE graph provisioning skipped: %s", e)
+                finally:
+                    conn.autocommit = False
             self._bootstrapped = True
 
     # -- DDL --------------------------------------------------------------

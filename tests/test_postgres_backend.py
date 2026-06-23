@@ -445,3 +445,76 @@ def test_wal_append_round_trip(backend):
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM mempalace_audit.write_log WHERE operation = %s", (op,))
             conn.commit()
+
+
+# --------------------------------------------------------------------------
+# Bootstrap resilience (OPS-2142 regression)
+# --------------------------------------------------------------------------
+
+
+def test_bootstrap_survives_missing_optional_extensions():
+    """Regression (OPS-2142): bootstrap must create the REQUIRED vector + pg_trgm
+    extensions even when the OPTIONAL pg_search / age extensions are unavailable.
+
+    The previous single-transaction bootstrap called ``conn.rollback()`` on an
+    optional-extension failure, which also discarded the already-run required
+    ``CREATE EXTENSION vector`` / ``pg_trgm`` — leaving a database with no
+    ``vector`` type, so every subsequent collection create failed on any image
+    lacking ParadeDB/AGE (e.g. a stock pgvector image). This drives the real
+    backend against a FRESH throwaway database with no extensions pre-installed;
+    on a stock pgvector server the optional creates genuinely fail, so the
+    optional-extension-missing path is exercised end to end.
+    """
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    admin_dsn = _dsn()
+    dbname = "mp_boot_" + uuid.uuid4().hex[:12]
+
+    # CREATE DATABASE cannot run inside a transaction block -> autocommit.
+    try:
+        with psycopg.connect(admin_dsn, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute(f'CREATE DATABASE "{dbname}"')
+    except psycopg.errors.InsufficientPrivilege:
+        pytest.skip("test role lacks CREATEDB; cannot provision a fresh bootstrap database")
+
+    fresh = conninfo_to_dict(admin_dsn)
+    fresh["dbname"] = dbname
+    fresh_dsn = make_conninfo(**fresh)
+
+    try:
+        be = PostgresBackend(dsn=fresh_dsn, vector_dim=DIM, embedder=_fake_embed)
+        try:
+            name = "t" + uuid.uuid4().hex[:8]
+            col = be.get_collection(
+                palace=PalaceRef(id=name, namespace=name),
+                collection_name=COLLECTION,
+                create=True,
+            )
+            # A round-trip proves the ``embedding vector(N)`` column type
+            # resolved — i.e. the required ``vector`` extension survived
+            # bootstrap rather than being rolled back with the optionals.
+            col.add(documents=["hello world"], ids=["d1"], metadatas=[{"k": "v"}])
+            assert col.count() == 1
+
+            with psycopg.connect(fresh_dsn) as check:
+                with check.cursor() as cur:
+                    cur.execute(
+                        "SELECT extname FROM pg_extension WHERE extname IN ('vector', 'pg_trgm')"
+                    )
+                    present = {r[0] for r in cur.fetchall()}
+            assert present == {"vector", "pg_trgm"}, (
+                f"required extensions missing after bootstrap: {present}"
+            )
+        finally:
+            be.close()
+    finally:
+        # Drop the throwaway database; terminate lingering pool connections first.
+        with psycopg.connect(admin_dsn, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname = %s AND pid <> pg_backend_pid()",
+                    (dbname,),
+                )
+                cur.execute(f'DROP DATABASE IF EXISTS "{dbname}"')
