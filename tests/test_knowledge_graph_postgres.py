@@ -187,12 +187,12 @@ def test_team_isolation(backend):
 def test_add_triple_asserted_by_persists(kg):
     """T7-POS (postgres): asserted_by stored on add_triple is returned in
     query_entity facts so the caller can see who asserted each relationship."""
-    tid = kg.add_triple("Dana", "works_at", "Acme", asserted_by="markus.burger@tset.com")
+    tid = kg.add_triple("Dana", "works_at", "Acme", asserted_by="dana@example.com")
     assert tid is not None
 
     facts = kg.query_entity("Dana", direction="outgoing")
     assert len(facts) == 1
-    assert facts[0]["asserted_by"] == "markus.burger@tset.com"
+    assert facts[0]["asserted_by"] == "dana@example.com"
 
 
 def test_add_triple_asserted_by_defaults_to_none(kg):
@@ -223,13 +223,13 @@ def test_tool_kg_add_asserted_by_via_mcp(monkeypatch):
     new_var.set(team)
     monkeypatch.setattr(mcp, "_active_team_var", new_var)
     try:
-        res = mcp.tool_kg_add("Dana", "works_at", "Acme", asserted_by="markus.burger@tset.com")
+        res = mcp.tool_kg_add("Dana", "works_at", "Acme", asserted_by="dana@example.com")
         assert res.get("success") is True, res
 
         qres = mcp.tool_kg_query("Dana", direction="outgoing")
         assert qres["count"] == 1
         fact = qres["facts"][0]
-        assert fact["asserted_by"] == "markus.burger@tset.com"
+        assert fact["asserted_by"] == "dana@example.com"
     finally:
         mcp._kg_by_path.clear()
         with psycopg.connect(_dsn()) as conn:

@@ -338,10 +338,10 @@ class TestAssertedByProvenance:
 
     def test_asserted_by_persists_in_query_facts(self, kg):
         """T7-POS: asserted_by round-trips through add_triple -> query_entity."""
-        kg.add_triple("Dana", "works_at", "Acme", asserted_by="markus.burger@tset.com")
+        kg.add_triple("Dana", "works_at", "Acme", asserted_by="dana@example.com")
         facts = kg.query_entity("Dana", direction="outgoing")
         assert len(facts) == 1
-        assert facts[0]["asserted_by"] == "markus.burger@tset.com"
+        assert facts[0]["asserted_by"] == "dana@example.com"
 
     def test_asserted_by_incoming_direction(self, kg):
         """T7-DIR: asserted_by also appears on incoming facts."""
