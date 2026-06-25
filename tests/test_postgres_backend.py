@@ -448,12 +448,12 @@ def test_wal_append_round_trip(backend):
 
 
 # --------------------------------------------------------------------------
-# Bootstrap resilience (OPS-2142 regression)
+# Bootstrap resilience regression
 # --------------------------------------------------------------------------
 
 
 def test_bootstrap_survives_missing_optional_extensions():
-    """Regression (OPS-2142): bootstrap must create the REQUIRED vector + pg_trgm
+    """Regression: bootstrap must create the REQUIRED vector + pg_trgm
     extensions even when the OPTIONAL pg_search / age extensions are unavailable.
 
     The previous single-transaction bootstrap called ``conn.rollback()`` on an

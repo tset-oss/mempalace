@@ -12,17 +12,17 @@ triggers:
   - vault
 ---
 
-# /tset:mempalace — team-vaulted agent memory
+# /mempalace — team-vaulted agent memory
 
 <Purpose>
 
 MemPalace is the team's shared long-term memory: a central server (one Postgres
 instance, team-isolated vaults) that every engineer's Claude Code reaches over
-MCP. The `tset` plugin ships the connection, so if the plugin is installed you
+MCP. The MemPalace plugin ships the connection, so if the plugin is installed you
 are already connected — there is nothing to install locally.
 
 This skill is the usage protocol. For the full reference (deployment, every
-tool, troubleshooting) see [`docs/mcp/mempalace.md`](../../../docs/mcp/mempalace.md).
+tool, troubleshooting) see [`deploy/README.md`](../../../../deploy/README.md).
 
 </Purpose>
 
@@ -39,16 +39,16 @@ tool, troubleshooting) see [`docs/mcp/mempalace.md`](../../../docs/mcp/mempalace
 
 - Throwaway/scratch state that only matters this task — do not file it.
 - Secrets, credentials, tokens, or PII — never file them; vaults are team-shared.
-- Live code-structure questions ("who calls X") — that is Serena/LSP, not remembered knowledge.
-- As a system of record — link to Jira/Slite for authoritative docs instead of copying them wholesale.
+- Live code-structure questions ("who calls X") — that is your LSP / code-navigation tool, not remembered knowledge.
+- As a system of record — link to your issue tracker / docs system for authoritative docs instead of copying them wholesale.
 - Rot-prone implementation detail (file:line refs, code mechanics) the repo already records — git/commit/PR/plan is the source of truth. Distill the durable decision or runbook and reference the code; do not re-narrate it (line numbers go stale fast).
 
 </Do_Not_Use_When>
 
 <Scripts_And_References>
 
-- [`docs/mcp/mempalace.md`](../../../docs/mcp/mempalace.md) — full client reference: connection, every tool, team routing, troubleshooting, and the per-repo / per-machine default-team override recipes.
-- [`docs/mcp/README.md`](../../../docs/mcp/README.md) — how MCP servers work in Claude Code and the other servers tset standardises on.
+- [`deploy/README.md`](../../../../deploy/README.md) — full deployment + client reference: connection, team routing, troubleshooting, and the per-repo / per-machine default-team override recipes.
+- [`README.md`](../../../../README.md#central-team-vaults-postgresql) — how the central team-vaulted server is set up and consumed over MCP.
 
 </Scripts_And_References>
 
@@ -118,7 +118,7 @@ distinct** — do not conflate them:
 `mempalace_kg_add` triples** (`subject → predicate → object`, e.g. "Dana
 owns ingest-pipeline"). Queryable via kg_query / kg_timeline / kg_neighbors.
 Always pass `asserted_by` as `<operator-email> (<model-id>)` (e.g.
-`markus.burger@tset.com (claude-opus-4-8)`) so the triple records who asserted
+`you@example.com (claude-opus-4-8)`) so the triple records who asserted
 it. Call `mempalace_kg_invalidate` when a fact stops being true. Both
 **raise** without a resolved team. File a drawer about the same
 person/system, then add the matching triple so it surfaces in graph queries.
@@ -128,8 +128,8 @@ person/system, then add the matching triple so it surfaces in graph queries.
 `available:false` on local). Seed the team's entity registry with known people,
 projects, and aliases. **The registry starts EMPTY in production — agents are
 the sole labelers; seed early and re-seed as you learn new names.** Aliases go in
-ONE direction: `aliases={"MB": "Markus Burger"}` (key = alias, value = canonical),
-or embedded per person as `people=[{"name": "Markus Burger", "aliases": ["MB"]}]`
+ONE direction: `aliases={"DR": "Dana Rivera"}` (key = alias, value = canonical),
+or embedded per person as `people=[{"name": "Dana Rivera", "aliases": ["DR"]}]`
 — there is no reverse form, and every name must be a non-empty string or the call
 raises. `entity_seed` is read-merge-write (nothing overwritten); it **raises**
 without a resolved team. Use `mempalace_disambiguate` to resolve a surface form
@@ -166,21 +166,21 @@ backend a `topics=` label also makes the drawer findable via
 the label never appears in the content — so tagging is the deterministic way to
 make a drawer recallable by a name the prose doesn't spell out. Always pass
 `added_by` as the **human operator plus the model that wrote it** — e.g.
-`added_by="markus.burger@tset.com (claude-opus-4-8)"`: the operator's corporate
+`added_by="you@example.com (claude-opus-4-8)"`: the operator's corporate
 email (the address the harness surfaces to you, NOT `git config user.email`,
 which may be a personal one) followed by your model id in parentheses. It
 defaults to the constant `'mcp'`, and passing your model id alone (e.g.
 `"claude"`) erases who is accountable for the memory in a shared vault — the
 human operator is the author, the model tag is provenance. If the harness does
 not surface your email (e.g. a headless pipeline), use your operator handle alone
-(e.g. `markus.burger`), never the default `mcp`. Like every team-scoped writer,
+(e.g. `your-handle`), never the default `mcp`. Like every team-scoped writer,
 `add_drawer` **raises** without a resolved team (`switch_team`, header, or an
 explicit `vault=`) — a team-less call fails loud instead of silently landing
 in a shared default vault.
 
 **Lane 5 — Session checkpoint →
 `mempalace_diary_write(agent_name, entry, topic=<tag>)`**. Set `agent_name` to
-the **human operator's handle** (e.g. `agent_name="markus.burger"`), NOT your
+the **human operator's handle** (e.g. `agent_name="your-handle"`), NOT your
 model id. The server auto-derives the diary's wing as `wing_<agent_name>`, so a
 model id spawns a throwaway `wing_claude-sonnet-4-6` that fragments anew on every
 model version, whereas an operator handle keeps each person's diaries converging
@@ -234,7 +234,7 @@ set yours explicitly:
 
 For a persistent default, use the per-repo `.mcp.json` or per-machine
 `claude mcp add --scope user` recipes in
-[`docs/mcp/mempalace.md`](../../../docs/mcp/mempalace.md).
+[`deploy/README.md`](../../../../deploy/README.md).
 
 </Workflow>
 

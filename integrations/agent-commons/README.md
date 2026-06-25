@@ -1,10 +1,10 @@
 # agent-commons integration (reference)
 
-Reference copies of the **consumer-side** MemPalace integration as it is wired
-into an internal Claude Code plugin (`agent-commons`). They are kept here so a
-reader of this repo can see how a real client drives the central, team-vaulted
-MemPalace server over MCP — the recall/save habits, the team-routing protocol,
-and the two hooks that nudge an agent to recall and to file.
+Reference copies of the **consumer-side** MemPalace integration as it can be
+wired into a Claude Code plugin. They are kept here so a reader of this repo can
+see how a real client drives the central, team-vaulted MemPalace server over
+MCP — the recall/save habits, the team-routing protocol, and the two hooks that
+nudge an agent to recall and to file.
 
 These files are **documentation, not runtime code for this package**. Nothing
 here is imported by `mempalace/`, run by its CLI, or exercised by its tests. The
@@ -40,24 +40,19 @@ the plugin root):
 The server's *own* hooks (the ones this package ships for local/Chroma palaces)
 are separate and live in the top-level [`hooks/`](../../hooks/) directory.
 
-## Provenance & caveats (read before publishing)
+## Adapting these for your environment
 
-- **Source:** copied verbatim from the internal `agent-commons` repo on
-  2026-06-23. They are not the canonical copy — the canonical copy lives there.
-- **Internal-flavored content.** The skill is namespaced `/tset:mempalace` and
-  refers to "tset's shared memory", the `tset` plugin, and internal tooling
-  (Jira, Slite, Serena). Generalize this naming if these files are meant to be
-  followed by external users rather than just read as an example.
-- **Example email.** `markus.burger@tset.com` appears in `SKILL.md` and
-  `mempalace-nudge-hook.py` as the illustrative `added_by` / `asserted_by`
-  format (`<operator-email> (<model-id>)`). It is an example, not a credential —
-  swap it for a placeholder (e.g. `you@example.com`) before a public release if
-  you prefer not to ship a real address.
-- **Dangling links.** `SKILL.md`/`README.md` link to `docs/mcp/mempalace.md` and
-  `docs/mcp/README.md`, which live in `agent-commons`, not here. Those links do
-  not resolve in this repo by design — these are reference excerpts, not the full
-  client doc set.
-- **No secrets.** These four files contain no tokens, passwords, connection
-  strings, or internal hostnames. (The bearer token and `*.internal` host
-  references that exist elsewhere in `agent-commons` deploy docs were
-  deliberately **not** copied.)
+These files are a **generalized reference, not a turnkey drop-in.** Adapt them to
+your own setup before wiring them into a plugin:
+
+- **Skill namespace.** The skill is namespaced `/mempalace`; rename it to your
+  plugin's namespace if needed.
+- **Authorship convention.** The skill and the Stop hook use placeholder author
+  values — `you@example.com` for the operator email and `your-handle` for the
+  operator handle. Substitute your team's convention for crediting who filed a
+  memory (the harness-surfaced operator email plus the model id).
+- **Tool references.** Where the skill says "your LSP / code-navigation tool" or
+  "your issue tracker / docs system", plug in whatever your team actually uses.
+- **No secrets.** These files contain no tokens, passwords, connection strings,
+  or hostnames. Wire those through your plugin config / environment per
+  [`../../deploy/README.md`](../../deploy/README.md).

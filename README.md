@@ -13,6 +13,9 @@ Local-first AI memory. Verbatim storage, pluggable backend, 96.6% R@5 raw on Lon
 
 </div>
 
+> [!NOTE]
+> **This is the [tset-oss](https://github.com/tset-oss/mempalace) fork of MemPalace.** It tracks the upstream project at **[MemPalace/mempalace](https://github.com/MemPalace/mempalace)** and adds a **central, multi-team PostgreSQL backend** so an engineering org can run one shared, team-vaulted memory server (see [Central, team vaults (PostgreSQL)](#central-team-vaults-postgresql) below). Everything else mirrors upstream; for the original local-first project, use upstream.
+
 > [!CAUTION]
 > **Beware of impostor sites.** MemPalace has no other official websites. The **only** official sources are this **[GitHub repository](https://github.com/MemPalace/mempalace)**, the **[PyPI package](https://pypi.org/project/mempalace/)**, and the docs at **[mempalaceofficial.com](https://mempalaceofficial.com)**. Any other domain (including `.tech`, `.net`, or other `.com` variants) is an impostor and may distribute malware. Details and timeline: [docs/HISTORY.md](docs/HISTORY.md).
 
@@ -194,8 +197,9 @@ committed default); `mempalace_switch_team` overrides it for the session; a
 The HTTP server is gated by a **shared static bearer token** (internal network
 only). `mempalace serve` also runs over stdio for a local install.
 
-Full setup and operations: [deploy/README.md](deploy/README.md). Client wiring
-for the org: `~/tset/agent-commons/docs/mcp/mempalace.md`.
+Full setup and operations: [deploy/README.md](deploy/README.md). A reference
+consumer-side integration (the recall/save hooks and the in-session usage skill)
+is vendored under [integrations/agent-commons/](integrations/agent-commons/).
 
 ## Agents
 

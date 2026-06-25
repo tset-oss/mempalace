@@ -1,4 +1,4 @@
-# /tset:mempalace
+# /mempalace
 
 The agent-facing usage protocol for the central, team-vaulted **MemPalace**
 memory server. It teaches Claude Code when to recall durable team knowledge,
@@ -6,8 +6,8 @@ when to file it, and how to route reads and writes to the right team vault.
 
 ## What is this skill?
 
-MemPalace is tset's shared long-term agent memory: one central Postgres-backed
-server with a separate **vault** per team, reached over MCP. The `tset` plugin
+MemPalace is the team's shared long-term agent memory: one central Postgres-backed
+server with a separate **vault** per team, reached over MCP. The MemPalace plugin
 ships the connection (plus a session-start recall nudge and a Stop-hook
 auto-save nudge), so every engineer who
 installs the plugin is connected with **zero local install** — there is no
@@ -15,7 +15,7 @@ installs the plugin is connected with **zero local install** — there is no
 
 This `SKILL.md` is the short protocol the agent follows in-session. The
 exhaustive human reference — deployment, the full tool list, troubleshooting —
-lives in [`docs/mcp/mempalace.md`](../../../docs/mcp/mempalace.md).
+lives in [`deploy/README.md`](../../../../deploy/README.md).
 
 ## Why this exists
 
@@ -34,7 +34,7 @@ encodes the two habits that make team memory pay off:
 ## How to use it
 
 It triggers on memory-related intents ("what do we know about…", "remember
-this", "switch team") or explicitly via `/tset:mempalace`. There is nothing to
+this", "switch team") or explicitly via `/mempalace`. There is nothing to
 run — it points the agent at the right `mempalace_*` tool for the moment:
 
 - `mempalace_search`, `mempalace_kg_query` for recall.
@@ -47,15 +47,15 @@ In an autonomous (auto-permission) run, Claude Code's auto-mode classifier may
 auto-deny *unrequested* writes to the shared vault, so a Stop-nudge-driven save
 can be refused. If proactive filing is blocked, allow the `mempalace_*` write
 tools in `~/.claude/settings.json` (`permissions.allow`) or approve the call
-interactively — see the troubleshooting table in
-[`docs/mcp/mempalace.md`](../../../docs/mcp/mempalace.md).
+interactively — see the troubleshooting notes in
+[`deploy/README.md`](../../../../deploy/README.md).
 
 ## When to use / NOT to use
 
 Use it when you want the agent to remember or recall durable context across
 sessions and teammates. Do **not** use it for throwaway state, secrets, live
-code-structure questions (that is Serena/LSP), or as a system of record (link
-to Jira/Slite instead).
+code-structure questions (that is your LSP / code-navigation tool), or as a
+system of record (link to your issue tracker / docs system instead).
 
 The in-session protocol — recall-first, file-durable-only, the routing
 precedence, and the common mistakes — lives in
@@ -63,7 +63,7 @@ precedence, and the common mistakes — lives in
 
 ## See also
 
-- [`docs/mcp/mempalace.md`](../../../docs/mcp/mempalace.md) — full client
+- [`deploy/README.md`](../../../../deploy/README.md) — full deployment + client
   reference and the per-repo / per-machine default-team override recipes.
-- [`docs/mcp/README.md`](../../../docs/mcp/README.md) — MCP in Claude Code and
-  the other servers tset standardises on.
+- [`README.md`](../../../../README.md#central-team-vaults-postgresql) — how the
+  central team-vaulted server is set up and consumed over MCP.

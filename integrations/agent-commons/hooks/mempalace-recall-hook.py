@@ -19,7 +19,7 @@ RECALL_NUDGE = (
     "MemPalace session start — before re-deriving anything, recall what the "
     "team already knows. First confirm the vault: run mempalace_list_vaults "
     "and, if you are not pointed at the team that owns this work, "
-    "mempalace_switch_team (engineering is the default here). Then, for the "
+    "mempalace_switch_team. Then, for the "
     "task at hand, pull the durable context that already exists — "
     "mempalace_search / mempalace_entities for the people, services, and "
     "topics in play, and mempalace_get_drawer for any decision or runbook a "

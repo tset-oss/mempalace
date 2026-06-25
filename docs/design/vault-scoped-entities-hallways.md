@@ -124,7 +124,7 @@ AGE provisioning.
 
 ### Committed caller (so the data is not inert again)
 
-In the same change, update the `/tset:mempalace` skill: *when the user names a
+In the same change, update the `/mempalace` skill: *when the user names a
 specific person, project, or service, set `entity=<name>` on `mempalace_search`
 to scope recall.* This is the named caller whose absence sank the prior
 proposal; without it we do not ship the navigator.
@@ -150,7 +150,7 @@ proposal; without it we do not ship the navigator.
   unit tests for extraction injection + `importorskip`-guarded integration
   tests for the index.
 - **G004**: `entity=` filter on `mempalace_search` (`restrict_ids` plumbing) +
-  noise-gated `mempalace_entities` navigator + the `/tset:mempalace` skill
+  noise-gated `mempalace_entities` navigator + the `/mempalace` skill
   caller. Tests.
 - **G005** (repurposed from "hallways"): one-time per-vault backfill of
   `entity_occurrences` from existing drawers + the noise-gating thresholds.

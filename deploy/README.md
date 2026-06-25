@@ -17,7 +17,9 @@ server (port 8080) is gated by a **shared static bearer token**
 reverse proxy before exposing it.
 
 The client wiring engineers run (the `claude mcp add` recipes, team routing) is
-documented in **`~/tset/agent-commons/docs/mcp/mempalace.md`**.
+in section 2 below; a reference consumer-side integration (recall/save hooks and
+the in-session usage skill) is vendored under
+[`../integrations/agent-commons/`](../integrations/agent-commons/).
 
 ## Layout
 
@@ -77,8 +79,9 @@ curl -s -X POST http://localhost:8080/mcp \
 The central server is consumed as a **thin HTTP MCP client** — engineers do not
 install the fork. The MCP config carries the bearer token and the team vault:
 `user` scope = the developer's machine-wide default, `project` scope (committed
-`.mcp.json`) = a repo's default. Full recipes and team-routing details live in
-[`~/tset/agent-commons/docs/mcp/mempalace.md`](../../../agent-commons/docs/mcp/mempalace.md).
+`.mcp.json`) = a repo's default. Full recipes and team-routing details are in
+the in-session skill under
+[`../integrations/agent-commons/skills/mempalace/SKILL.md`](../integrations/agent-commons/skills/mempalace/SKILL.md).
 The short version:
 
 ```bash

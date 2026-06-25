@@ -13,7 +13,7 @@ individual sections as reference for later maintenance.
 
 Agents connect via two values: the server URL and the shared bearer token.
 
-**The committed plugin entry** (`agent-commons/.claude-plugin/plugin.json`,
+**The committed plugin entry** (your plugin's `.claude-plugin/plugin.json`,
 key `mcpServers.mempalace.url`) currently holds the placeholder
 `https://mempalace.internal/mcp`. Replace it with the actual endpoint once the
 server is reachable:
@@ -55,7 +55,7 @@ Rotate both together:
 3. Update the `Authorization: Bearer` value in `plugin.json` (and any
    per-repo `.mcp.json` files) and push the change.
 
-Engineers pick up the new token when they pull `agent-commons`.
+Engineers pick up the new token when they pull the updated plugin config.
 
 Confirm auth is working:
 
