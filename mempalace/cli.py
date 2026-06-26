@@ -1711,6 +1711,59 @@ def cmd_reindex_entities(args):
     print("reindex-entities complete.")
 
 
+def cmd_backfill_embedder_identity(args):
+    """Record the current embedder identity into existing team vaults (postgres only).
+
+    Production-safe additive backfill (RFC 001 / A4) for a fork upgrade that adds
+    the per-team ``embedder_identity`` slot: stamps the CURRENTLY configured
+    embedder identity (e.g. ``embeddinggemma``/384) onto vaults that already hold
+    drawers but predate the slot.
+
+    Enumerates EXISTING team vaults only — ``team_<slug>`` schemas whose
+    ``mempalace_drawers`` table already exists; empty/non-vault team schemas are
+    skipped. Each existing vault is opened ``create=False`` so the pass NEVER
+    materialises a ``mempalace_drawers`` table on a vault that never had one.
+    Idempotent and safe to re-run.
+    """
+    cfg = MempalaceConfig()
+    if cfg.backend == "chroma":
+        print(
+            "backfill-embedder-identity is for the central postgres backend only "
+            "(set MEMPALACE_BACKEND=postgres)."
+        )
+        return
+
+    from .embedding import get_embedder_identity
+    from .palace import _resolve_backend
+
+    backend = _resolve_backend(cfg)
+    if not hasattr(backend, "backfill_embedder_identity"):
+        print("backend does not support embedder-identity backfill.")
+        return
+
+    teams = None if getattr(args, "all_vaults", False) else [args.vault or cfg.team or "default"]
+    identity = get_embedder_identity()
+    if not identity.model_name:
+        print(
+            "no embedder model configured: set MEMPALACE_EMBEDDING_MODEL "
+            "so there is an identity to record."
+        )
+        return
+
+    results = backend.backfill_embedder_identity(
+        identity, teams=teams, collection=cfg.collection_name
+    )
+    if not results:
+        print("No existing vaults to backfill.")
+        return
+    for r in results:
+        print(f"  {r['team']}: recorded {r['model_name']} (dim={r['dimension']})")
+    print(
+        f"backfill-embedder-identity complete "
+        f"({len(results)} vault{'s' if len(results) != 1 else ''})."
+    )
+
+
 def cmd_topic_coverage(args):
     """Per-team topic-coverage report (postgres only, read-only).
 
@@ -2345,6 +2398,23 @@ def main():
         help="Reindex every team vault on the central server",
     )
 
+    p_backfill_id = sub.add_parser(
+        "backfill-embedder-identity",
+        help=(
+            "Record the current embedder identity into existing team vaults "
+            "(central postgres mode; never creates a drawers table)"
+        ),
+    )
+    p_backfill_id.add_argument(
+        "--vault", help="Team vault to backfill (default: this machine's configured team)"
+    )
+    p_backfill_id.add_argument(
+        "--all-vaults",
+        dest="all_vaults",
+        action="store_true",
+        help="Backfill every existing team vault on the central server",
+    )
+
     p_topic = sub.add_parser(
         "topic-coverage",
         help="Report per-team topic-label coverage (central postgres mode, read-only)",
@@ -2418,6 +2488,7 @@ def main():
         "status": cmd_status,
         "serve": cmd_serve,
         "reindex-entities": cmd_reindex_entities,
+        "backfill-embedder-identity": cmd_backfill_embedder_identity,
         "topic-coverage": cmd_topic_coverage,
     }
     dispatch[args.command](args)

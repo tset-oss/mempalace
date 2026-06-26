@@ -788,16 +788,15 @@ class PostgresCollection(BaseCollection):
         enforcement while the suite still shows green. Idempotent upsert keyed on
         the collection table name; ensures the slot exists first so a re-record
         on a legacy vault (e.g. ``--force`` after a model swap) succeeds.
+
+        The identity slot is ensured via
+        :meth:`PostgresBackend._ensure_embedder_identity_table` — decoupled from
+        ``mempalace_drawers`` creation so recording identity never materialises a
+        drawers table (the production-backfill safety invariant).
         """
+        self._backend._ensure_embedder_identity_table(self._schema)
         with self._backend._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    f"CREATE TABLE IF NOT EXISTS {_qi(self._schema)}.{_qi('embedder_identity')} ("
-                    "  collection text PRIMARY KEY,"
-                    "  model_name text NOT NULL,"
-                    "  dimension integer NOT NULL DEFAULT 0"
-                    ")"
-                )
                 cur.execute(
                     f"INSERT INTO {_qi(self._schema)}.{_qi('embedder_identity')} "
                     "(collection, model_name, dimension) VALUES (%s, %s, %s) "
@@ -1103,7 +1102,7 @@ class PostgresBackend(BaseBackend):
                     )
 
                 # Per-team embedder-identity slot (RFC 001). One row per
-                # collection table in this schema. Created here, idempotently and
+                # collection table in this schema. Ensured here, idempotently and
                 # additively — ``CREATE TABLE IF NOT EXISTS`` so existing,
                 # populated vaults gain the slot on their next open with NO
                 # destructive DDL and no re-embed (A10). Upstream's identity
@@ -1111,7 +1110,12 @@ class PostgresBackend(BaseBackend):
                 # ``local_path=None`` server, so identity lives in the team
                 # schema instead. Runs even when ``table_exists`` (the drawers
                 # table predates this slot) so identity enforcement is available
-                # to every vault, not just freshly-created ones.
+                # to every vault, not just freshly-created ones. The DDL itself
+                # lives in :meth:`_ensure_embedder_identity_table` so the same,
+                # drawers-independent ensure is reusable by the production
+                # embedder-identity backfill (which must NOT create a drawers
+                # table on vaults that never had one); inlined into this txn so a
+                # fresh collection's slot is created atomically with the table.
                 cur.execute(
                     f"CREATE TABLE IF NOT EXISTS {_qi(schema)}.{_qi('embedder_identity')} ("
                     "  collection text PRIMARY KEY,"
@@ -1217,6 +1221,114 @@ class PostgresBackend(BaseBackend):
                 # to the pool. The connection is IDLE in autocommit here (all DDL
                 # committed individually via autocommit), so this is safe.
                 conn.autocommit = False
+
+    def _ensure_embedder_identity_table(self, schema: str) -> None:
+        """Idempotently ensure ``{schema}.embedder_identity`` exists.
+
+        Decoupled from :meth:`_ensure_collection` so ensuring/using the identity
+        slot does NOT require — and never creates — a ``mempalace_drawers``
+        collection. This is the production-safety invariant the embedder-identity
+        backfill depends on: a naive "open every vault with ``create=True`` to
+        record identity" pass would materialise EMPTY drawers tables on vaults
+        that never had one (``_ensure_collection`` creates ``mempalace_drawers``
+        when ``create=True``). Recording identity must touch only the additive
+        slot.
+
+        ``CREATE TABLE IF NOT EXISTS`` (additive, no destructive DDL) and a
+        ``CREATE SCHEMA IF NOT EXISTS`` guard so a brand-new schema can carry the
+        slot; both are no-ops when already present, so this is safe to call on
+        every write and re-runnable for the backfill.
+        """
+        _qi(schema)  # validate identifier (defence-in-depth)
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"CREATE SCHEMA IF NOT EXISTS {_qi(schema)}")
+                cur.execute(
+                    f"CREATE TABLE IF NOT EXISTS {_qi(schema)}.{_qi('embedder_identity')} ("
+                    "  collection text PRIMARY KEY,"
+                    "  model_name text NOT NULL,"
+                    "  dimension integer NOT NULL DEFAULT 0"
+                    ")"
+                )
+
+    def _existing_vault_teams(self, collection: str) -> list[str]:
+        """Team names whose vault schema already holds a ``{collection}`` table.
+
+        "Existing vault only" enumeration for the backfill: a ``team_<slug>``
+        schema counts as a real vault iff its drawers collection table exists
+        (``to_regclass`` is not NULL). Empty/non-vault ``team_<slug>`` schemas
+        (created by some side path but never populated with a drawers table) are
+        skipped, so the backfill never records identity into — nor materialises a
+        drawers table within — a schema that is not a real vault.
+        """
+        _qi(collection)  # validate identifier
+        out: list[str] = []
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT schema_name FROM information_schema.schemata "
+                    "WHERE schema_name LIKE 'team\\_%' ORDER BY schema_name"
+                )
+                schemas = [r[0] for r in cur.fetchall()]
+                for schema in schemas:
+                    cur.execute("SELECT to_regclass(%s)", (f"{schema}.{collection}",))
+                    if cur.fetchone()[0] is not None:
+                        out.append(schema[len("team_") :])
+        return out
+
+    def backfill_embedder_identity(
+        self,
+        identity: EmbedderIdentity,
+        *,
+        teams: Optional[list[str]] = None,
+        collection: str = "mempalace_drawers",
+    ) -> list[dict]:
+        """Record *identity* into every EXISTING team vault's identity slot.
+
+        Production-safe additive backfill (RFC 001 / A4): for a fork upgrade that
+        adds the per-team ``embedder_identity`` slot, stamp the CURRENT embedder
+        identity onto vaults that already hold drawers but predate the slot.
+
+        Enumerates EXISTING vaults only (``team_<slug>`` schemas whose
+        ``{collection}`` table already exists) — empty/non-vault team schemas are
+        skipped. For each, ensures the identity slot
+        (:meth:`_ensure_embedder_identity_table`) and upserts *identity* via the
+        collection's :meth:`PostgresCollection.set_embedder_identity`, opening the
+        collection with ``create=False`` so NO new drawers table is ever
+        materialised. Idempotent and re-runnable (``ON CONFLICT DO UPDATE``).
+
+        ``teams``: restrict to these names (still filtered to those that are real
+        existing vaults); ``None`` backfills every existing vault.
+
+        Returns one ``{"team", "recorded", "model_name", "dimension"}`` dict per
+        vault touched (skipped non-vaults are absent from the result).
+        """
+        self._ensure_bootstrap()
+        existing = self._existing_vault_teams(collection)
+        if teams is not None:
+            wanted = set(teams)
+            existing = [t for t in existing if t in wanted]
+        results: list[dict] = []
+        for team in existing:
+            schema = team_schema(team)
+            # Ensure the additive slot WITHOUT creating a drawers table, then
+            # open the existing collection create=False and record identity.
+            self._ensure_embedder_identity_table(schema)
+            col = self.get_collection(
+                palace=PalaceRef(id=team, namespace=team),
+                collection_name=collection,
+                create=False,
+            )
+            col.set_embedder_identity(identity)
+            results.append(
+                {
+                    "team": team,
+                    "recorded": True,
+                    "model_name": identity.model_name,
+                    "dimension": int(identity.dimension or 0),
+                }
+            )
+        return results
 
     # -- contract ---------------------------------------------------------
     def get_collection(self, *args, **kwargs) -> PostgresCollection:
