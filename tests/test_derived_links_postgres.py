@@ -566,7 +566,8 @@ def test_cross_backend_equivalence_same_chunks_same_known_set(backend, team, mon
 
     # --- chroma side: same chunks, same known set, hallways.py compute ---
     hallway_file = str(uuid.uuid4()) + ".json"  # never written (we read return)
-    monkeypatch.setattr(hallways_mod, "_HALLWAY_FILE", "/tmp/" + hallway_file)
+    monkeypatch.setattr(hallways_mod, "_get_hallway_file", lambda *a, **kw: "/tmp/" + hallway_file)
+    monkeypatch.setattr(hallways_mod, "_legacy_hallway_file", lambda: "/tmp/legacy-" + hallway_file)
     drawers = []
     for text in chunk_texts:
         ents_str = _extract_entities_for_metadata(text, known=known)

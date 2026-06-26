@@ -128,9 +128,7 @@ def _count_human_messages(transcript_path: str) -> int:
                     continue
                 content = msg.get("content", "")
                 if isinstance(content, list):
-                    content = " ".join(
-                        b.get("text", "") for b in content if isinstance(b, dict)
-                    )
+                    content = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
                 if not isinstance(content, str):
                     content = ""
                 # Slash-command envelopes are not conversational progress.

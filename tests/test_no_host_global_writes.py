@@ -431,13 +431,6 @@ ALLOWLIST: dict[tuple[str, str], str] = {
         "config.py",
         "self._people_map_file",
     ): "personal ~/.mempalace/people_map.json; CLI/onboarding only",
-    # Derived cross-wing tunnel/hallway JSON — gated behind backend=="chroma" at
-    # the call sites; the postgres path derives links into the per-team vault.
-    (
-        "hallways.py",
-        "_HALLWAY_FILE",
-    ): "chroma-only hallways.json; postgres derives hallways into the per-team vault",
-    ("hallways.py", "directory"): "parent dir of the chroma-only hallways.json",
     # SQLite knowledge graph — the local/chroma KG backend. The central deploy
     # uses the per-team PostgresKnowledgeGraph; this SQLite file is local-only.
     (

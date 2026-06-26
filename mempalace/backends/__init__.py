@@ -17,6 +17,7 @@ Public surface:
 from .base import (
     BackendClosedError,
     BackendError,
+    BackendMismatchError,
     BaseBackend,
     BaseCollection,
     CollectionNotInitializedError,
@@ -24,15 +25,25 @@ from .base import (
     EmbedderIdentityMismatchError,
     GetResult,
     HealthStatus,
+    LexicalHit,
+    LexicalResult,
+    MaintenanceResult,
     PalaceNotFoundError,
     PalaceRef,
     QueryResult,
+    UnsupportedCapabilityError,
     UnsupportedFilterError,
+    UnsupportedMaintenanceKindError,
 )
 from .chroma import ChromaBackend, ChromaCollection
+from .pgvector import PgVectorBackend, PgVectorCollection
 from .postgres import PostgresBackend, PostgresCollection
+from .qdrant import QdrantBackend, QdrantCollection
+from .sqlite_exact import SQLiteExactBackend, SQLiteExactCollection
 from .registry import (
     available_backends,
+    detect_backend_for_path,
+    detect_backends_for_path,
     get_backend,
     get_backend_class,
     register,
@@ -44,6 +55,7 @@ from .registry import (
 __all__ = [
     "BackendClosedError",
     "BackendError",
+    "BackendMismatchError",
     "BaseBackend",
     "BaseCollection",
     "ChromaBackend",
@@ -53,13 +65,26 @@ __all__ = [
     "EmbedderIdentityMismatchError",
     "GetResult",
     "HealthStatus",
+    "LexicalHit",
+    "LexicalResult",
+    "MaintenanceResult",
     "PalaceNotFoundError",
     "PalaceRef",
+    "PgVectorBackend",
+    "PgVectorCollection",
     "PostgresBackend",
     "PostgresCollection",
+    "QdrantBackend",
+    "QdrantCollection",
     "QueryResult",
+    "SQLiteExactBackend",
+    "SQLiteExactCollection",
+    "UnsupportedCapabilityError",
     "UnsupportedFilterError",
+    "UnsupportedMaintenanceKindError",
     "available_backends",
+    "detect_backend_for_path",
+    "detect_backends_for_path",
     "get_backend",
     "get_backend_class",
     "register",

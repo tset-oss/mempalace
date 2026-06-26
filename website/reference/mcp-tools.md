@@ -177,6 +177,51 @@ Update an existing drawer's content and/or metadata (wing, room). Fetches the ex
 
 ---
 
+### `mempalace_mine`
+
+Mine a directory into the palace — the MCP equivalent of `mempalace mine`. Runs synchronously and returns the miner's summary as `output`. The palace write lock is automatic; a concurrent mine returns a structured already-running error. Orphan cleanup is separate — use `mempalace_sync`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `source` | string | **Yes** | Directory to mine |
+| `mode` | string | No | Ingest mode: `projects` (code/docs, default), `convos` (chat transcripts), `extract` (office documents — PDF/DOCX/RTF, requires the `mempalace[extract]` extra) |
+| `wing` | string | No | Target wing (default: source directory name) |
+| `agent` | string | No | Recorded on every drawer (default: `mempalace`) |
+| `limit` | integer | No | Max files to process (`0` = all). Default: `0` |
+| `dry_run` | boolean | No | Report what would be filed without writing. Default: `false` |
+| `extract` | string | No | Convos extraction strategy: `exchange` (default) or `general`. Ignored by other modes |
+
+**Returns:** `{ success, mode, dry_run, output }`. A very large summary is tail-truncated to ~4000 chars with `output_truncated: true`. On failure: `{ success: false, error, error_class }`.
+
+---
+
+### `mempalace_delete_by_source`
+
+Bulk-delete every drawer mined from one `source_file` (exact match). Use to clean up benchmark/test data accidentally mined into a user wing. Returns a dry-run match count and sample by default; pass `dry_run=false` to commit. Irreversible.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `source_file` | string | **Yes** | Exact `source_file` metadata value to remove (e.g. the full path that was mined) |
+| `dry_run` | boolean | No | Preview the match count without deleting; default `true`. Pass `false` to actually delete |
+
+**Returns (dry-run):** `{ success, dry_run: true, source_file, match_count, closet_match_count, sample, hint }`. **Returns (applied):** `{ success, dry_run: false, source_file, deleted, closets_deleted }`.
+
+---
+
+### `mempalace_checkpoint`
+
+Save a whole session in one call: semantic-dedups each item, files the non-duplicates as drawers, then writes one diary entry. Use this instead of many separate `check_duplicate` / `add_drawer` / `diary_write` calls — it renders as a single tool-call card in the host UI.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `items` | array of object | **Yes** | Verbatim items to file. Each is `{ wing, room, content }` — content is the exact words, never summarized |
+| `diary` | object | No | Optional diary entry written after filing: `{ agent_name, entry, topic?, wing? }`. `entry` is AAAK-format |
+| `dedup_threshold` | number | No | Similarity threshold 0–1 for the per-item dedup check (default: `0.9`) |
+
+**Returns:** `{ added: [...], duplicates: [...], errors: [...], diary? }`.
+
+---
+
 ## Knowledge Graph Tools
 
 ### `mempalace_kg_query`
@@ -355,6 +400,30 @@ Follow tunnels from a room to see what it connects to in other wings. Returns co
 | `room` | string | **Yes** | Room to follow tunnels from |
 
 **Returns:** `[{ wing, room, label, previews }]`
+
+---
+
+### `mempalace_list_hallways`
+
+List within-wing hallway records (entity-to-entity co-occurrence links built at mine time). Optionally filter by wing.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `wing` | string | No | Filter hallways by wing |
+
+**Returns:** `[{ hallway_id, wing, ... }]` — the matching hallway records.
+
+---
+
+### `mempalace_delete_hallway`
+
+Delete a hallway record by its ID.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `hallway_id` | string | **Yes** | Hallway ID to delete |
+
+**Returns:** `{ deleted }` — `true` when a record was removed, `false` when the ID was not found.
 
 ---
 

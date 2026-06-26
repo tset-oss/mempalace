@@ -698,7 +698,9 @@ def test_cross_backend_cooccurrence_equivalence_scoped(server_pg, monkeypatch):
         )
 
         # --- chroma side: same chunks, same known set, hallways.py compute ---
-        monkeypatch.setattr(hallways_mod, "_HALLWAY_FILE", "/tmp/" + uuid.uuid4().hex + ".json")
+        _hf = "/tmp/" + uuid.uuid4().hex + ".json"
+        monkeypatch.setattr(hallways_mod, "_get_hallway_file", lambda *a, **kw: _hf)
+        monkeypatch.setattr(hallways_mod, "_legacy_hallway_file", lambda: _hf + ".legacy")
         drawers = [
             {
                 "wing": "wing_aria",

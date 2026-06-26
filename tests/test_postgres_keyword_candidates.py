@@ -325,11 +325,17 @@ def test_contains_uses_bitmap_index_scan_on_doc_trgm(backend, team):
     index_name = COLLECTION + "_doc_trgm"
 
     # Build the exact $contains / where_document query shape the backend issues,
-    # then EXPLAIN it. Disable seqscan-only plans is NOT needed — with enough
-    # rows + a rare needle the planner already prefers the GIN; but we assert the
-    # plan text rather than force it, to mirror real query behaviour.
+    # then EXPLAIN it. On this small (~200-row) fixture the planner's row-cost
+    # estimate for a Seq Scan is below the GIN bitmap path, so it picks a Seq
+    # Scan (identical results) and the plan assertion flakes on table size, not
+    # on whether the GIN exists. ``SET LOCAL enable_seqscan = off`` makes the
+    # choice deterministic WITHOUT weakening the assertion: if the trigram GIN
+    # were missing, Postgres would fall back to a (penalized) Seq Scan even with
+    # seqscan disabled, so the "Bitmap Index Scan"/no-"Seq Scan" assertions below
+    # still go RED. It only removes the table-size sensitivity, not the GIN check.
     with psycopg.connect(_dsn()) as conn:
         with conn.cursor() as cur:
+            cur.execute("SET LOCAL enable_seqscan = off")
             cur.execute(
                 f'EXPLAIN SELECT id FROM "{schema}"."{COLLECTION}" WHERE document ILIKE %s',
                 ("%zylophonics%",),
@@ -420,17 +426,22 @@ def test_candidates_survive_union_merge_dedup(backend, team):
 def test_union_merger_dispatches_to_postgres_keyword_candidates(backend, team):
     """``_merge_bm25_union_candidates`` routes through the live postgres handle.
 
-    G003 threads the live collection into the merger and dispatches on
-    ``supports_keyword_candidates``. Driven against a real ``PostgresCollection``
-    the merger must (1) inject the lexically-exact rare-token drawer that a
-    vector-only hit list missed, and (2) tag every injected candidate scoreless
-    (``distance=None``, ``effective_distance=None``, ``closet_boost=0.0``).
+    G003 threads the live collection into the merger and dispatches on the
+    backend's lexical seam. v3.5.0 retyped that seam to
+    ``lexical_search() -> LexicalResult``; the fork's PostgresCollection
+    implements it as a thin adapter over its scoreless ``keyword_candidates``,
+    so the merger dispatches through ``collection.lexical_search`` here. Driven
+    against a real ``PostgresCollection`` the merger must (1) inject the
+    lexically-exact rare-token drawer that a vector-only hit list missed, and
+    (2) tag every injected candidate scoreless (``distance=None``,
+    ``effective_distance=None``, ``closet_boost=0.0``).
     """
     from mempalace.searcher import _merge_bm25_union_candidates
 
     col = _col(backend, team, create=True)
     _seed(col)
     assert col.supports_keyword_candidates() is True
+    assert col.supports_lexical_search() is True
 
     # A starting hit list that does NOT contain the rare-token drawer.
     hits = [
@@ -442,9 +453,10 @@ def test_union_merger_dispatches_to_postgres_keyword_candidates(backend, team):
             "_chunk_index": 0,
         }
     ]
-    _merge_bm25_union_candidates(
-        hits, "zylophonics report", "/ignored", None, None, 5, collection=col
-    )
+    # Merged (v3.5.0) signature: (hits, drawers_col, query, wing, room,
+    # n_results, ...). The fork threads the live handle as ``collection``; pass
+    # ``col`` for both so the union merger dispatches on its lexical seam.
+    _merge_bm25_union_candidates(hits, col, "zylophonics report", None, None, 5, collection=col)
     texts = [h["text"] for h in hits]
     assert any("zylophonics" in t for t in texts), (
         "union merger must inject the lexically-exact postgres keyword candidate"
@@ -474,10 +486,11 @@ def test_union_merger_max_distance_skips_postgres_candidates(backend, team):
         }
     ]
     before = list(hits)
+    # Merged (v3.5.0) signature: (hits, drawers_col, query, wing, room, n_results, ...).
     _merge_bm25_union_candidates(
         hits,
+        col,
         "zylophonics report",
-        "/ignored",
         None,
         None,
         5,

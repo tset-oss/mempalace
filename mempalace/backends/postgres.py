@@ -47,8 +47,11 @@ from .base import (
     BackendClosedError,
     CollectionNotInitializedError,
     DimensionMismatchError,
+    EmbedderIdentity,
     GetResult,
     HealthStatus,
+    LexicalHit,
+    LexicalResult,
     PalaceNotFoundError,
     PalaceRef,
     QueryResult,
@@ -683,6 +686,126 @@ class PostgresCollection(BaseCollection):
         """Postgres collections implement the trigram-GIN keyword path (G002)."""
         return True
 
+    def lexical_search(
+        self,
+        *,
+        query: str,
+        n_results: int = 10,
+        where=None,
+        restrict_ids=None,
+    ) -> LexicalResult:
+        """Upstream's RFC-001 lexical seam, adapted over ``keyword_candidates``.
+
+        v3.5.0 renamed the scoreless keyword surface to ``lexical_search() ->
+        LexicalResult(hits=[LexicalHit])`` and dispatches the searcher's union
+        merger on it. This is a thin TYPE adapter over the fork's existing
+        trigram-GIN ``keyword_candidates`` (G002): each scoreless candidate
+        becomes a ``LexicalHit`` whose ``metadata`` preserves
+        ``source_file``/``chunk_index`` for the merger's chunk-precise dedup
+        key. ``score`` is ``0.0`` — the candidate carries no in-DB score; the
+        union merger sets ``distance=None`` so ``searcher._hybrid_rank``
+        recomputes BM25 from ``document`` (cosine arithmetic is byte-identical,
+        so ranking is unchanged by construction).
+
+        ``restrict_ids`` is the fork's team/closet candidate-scoping argument —
+        wider than upstream's ABC ``lexical_search`` signature; the searcher
+        only threads it for a backend advertising ``supports_keyword_candidates``
+        (this one).
+        """
+        candidates = self.keyword_candidates(
+            query=query,
+            n_results=n_results,
+            where=where,
+            restrict_ids=restrict_ids,
+        )
+        hits = [
+            LexicalHit(
+                id="",
+                document=c.get("text", "") or "",
+                metadata={
+                    "source_file": c.get("_source_file_full", "") or "",
+                    "chunk_index": c.get("_chunk_index"),
+                    "wing": c.get("wing", "unknown"),
+                    "room": c.get("room", "unknown"),
+                    "filed_at": c.get("created_at", "unknown"),
+                },
+                score=0.0,
+            )
+            for c in candidates
+        ]
+        return LexicalResult(hits=hits)
+
+    def supports_lexical_search(self) -> bool:
+        """Postgres collections implement the RFC-001 lexical seam (adapter)."""
+        return True
+
+    @property
+    def distance_metric(self) -> str:
+        """Postgres collections store cosine-distance vectors (HNSW
+        ``vector_cosine_ops``), so ``distances`` are reported in cosine space —
+        identical to chroma. Overriding the defaulted property explicitly keeps
+        ``searcher._metric_for_collection`` routing to the cosine branch even if
+        the inherited default ever changes upstream.
+        """
+        return "cosine"
+
+    # -- embedder identity (RFC 001) -------------------------------------
+    def get_stored_embedder_identity(self) -> Optional[EmbedderIdentity]:
+        """Read the recorded embedder identity from ``{schema}.embedder_identity``.
+
+        Returns ``None`` when nothing is recorded — a legacy vault opened before
+        this slot existed, or one never written. Core treats ``None`` as the
+        ``unknown`` state (warn, do not fail). A missing identity table (a vault
+        opened ``create=False`` that predates the slot) is also ``None``.
+        """
+        sql = (
+            f"SELECT model_name, dimension FROM {_qi(self._schema)}.{_qi('embedder_identity')} "
+            "WHERE collection = %s"
+        )
+        try:
+            with self._backend._conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (self._table,))
+                    row = cur.fetchone()
+        except Exception:
+            # No identity slot yet (legacy vault) or a transient read issue:
+            # report unknown rather than failing the open. Enforcement stays
+            # safe (warn-not-fail) until an identity is recorded.
+            logger.debug(
+                "embedder-identity read failed for %s.%s", self._schema, self._table, exc_info=True
+            )
+            return None
+        if row is None:
+            return None
+        return EmbedderIdentity(model_name=row[0], dimension=int(row[1] or 0))
+
+    def set_embedder_identity(self, identity: EmbedderIdentity) -> None:
+        """Persist this collection's embedder identity into ``{schema}.embedder_identity``.
+
+        REAL persistence — the fork must NOT inherit the no-op
+        :meth:`BaseCollection.set_embedder_identity` default (RFC 001 / A4),
+        which would leave every vault permanently ``unknown`` and silently drop
+        enforcement while the suite still shows green. Idempotent upsert keyed on
+        the collection table name; ensures the slot exists first so a re-record
+        on a legacy vault (e.g. ``--force`` after a model swap) succeeds.
+        """
+        with self._backend._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"CREATE TABLE IF NOT EXISTS {_qi(self._schema)}.{_qi('embedder_identity')} ("
+                    "  collection text PRIMARY KEY,"
+                    "  model_name text NOT NULL,"
+                    "  dimension integer NOT NULL DEFAULT 0"
+                    ")"
+                )
+                cur.execute(
+                    f"INSERT INTO {_qi(self._schema)}.{_qi('embedder_identity')} "
+                    "(collection, model_name, dimension) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (collection) DO UPDATE SET "
+                    "model_name = EXCLUDED.model_name, dimension = EXCLUDED.dimension",
+                    (self._table, identity.model_name, int(identity.dimension or 0)),
+                )
+
     def get(
         self,
         *,
@@ -809,6 +932,7 @@ class PostgresBackend(BaseBackend):
             # indexed ≥3-char case.
             "supports_contains_fast",
             "supports_keyword_candidates",
+            "supports_lexical_search",
             "server_mode",
             "multi_tenant",
         }
@@ -977,6 +1101,24 @@ class PostgresBackend(BaseBackend):
                         f"CREATE INDEX IF NOT EXISTS {_qi(table + '_doc_trgm')} "
                         f"ON {_qi(schema)}.{_qi(table)} USING gin (document gin_trgm_ops)"
                     )
+
+                # Per-team embedder-identity slot (RFC 001). One row per
+                # collection table in this schema. Created here, idempotently and
+                # additively — ``CREATE TABLE IF NOT EXISTS`` so existing,
+                # populated vaults gain the slot on their next open with NO
+                # destructive DDL and no re-embed (A10). Upstream's identity
+                # sidecar is ``local_path``-keyed and unusable by the central
+                # ``local_path=None`` server, so identity lives in the team
+                # schema instead. Runs even when ``table_exists`` (the drawers
+                # table predates this slot) so identity enforcement is available
+                # to every vault, not just freshly-created ones.
+                cur.execute(
+                    f"CREATE TABLE IF NOT EXISTS {_qi(schema)}.{_qi('embedder_identity')} ("
+                    "  collection text PRIMARY KEY,"
+                    "  model_name text NOT NULL,"
+                    "  dimension integer NOT NULL DEFAULT 0"
+                    ")"
+                )
         # Existing-vault migration: a table created before the trigram GIN was
         # introduced has no ``{table}_doc_trgm`` index. Add it WITHOUT holding an
         # ACCESS EXCLUSIVE lock on the (possibly large, live) table — i.e. with

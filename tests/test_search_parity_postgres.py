@@ -612,10 +612,13 @@ def test_scoreless_dedup_shape_parity(parity_env):
     _check(chroma_cands, "chroma")
 
     # Both candidate sets survive the merger's dedup into a starting hit list.
+    # v3.5.0 merger signature: (hits, drawers_col, query, wing, room, n_results,
+    # ...); the fork threads the live handle as ``collection`` and dispatches on
+    # its lexical seam (PostgresCollection.lexical_search adapts keyword_candidates).
     for cands, col, label in ((pg_cands, pg_col, "postgres"), (chroma_cands, chroma_col, "chroma")):
         hits: list[dict] = []
         _merge_bm25_union_candidates(
-            hits, f"{RARE_TOKEN} report", parity_env["palace_path"], None, None, 10, collection=col
+            hits, col, f"{RARE_TOKEN} report", None, None, 10, collection=col
         )
         assert any(RARE_TOKEN in h["text"] for h in hits), (
             f"{label}: merger dropped the rare-token candidate (silent None-drop?)"

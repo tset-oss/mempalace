@@ -55,12 +55,14 @@ def main() -> None:
         _emit({})
         return
 
-    _emit({
-        "hookSpecificOutput": {
-            "hookEventName": "SessionStart",
-            "additionalContext": RECALL_NUDGE,
+    _emit(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": RECALL_NUDGE,
+            }
         }
-    })
+    )
 
 
 if __name__ == "__main__":

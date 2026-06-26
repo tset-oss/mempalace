@@ -82,6 +82,8 @@ from .palace import (
 # mempalace.format_miner.<name>. Lazy imports inside functions would not
 # expose these as attributes of this module, breaking the test seams.
 from .config import MempalaceConfig, normalize_wing_name
+from .collision_scan import assert_no_collisions
+from .ids import ID_RECIPE, make_drawer_id_from_chunk
 from .miner import (
     _compute_topic_tunnels_for_wing,
     chunk_text,
@@ -505,7 +507,7 @@ def scan_formats(directory: Union[Path, str]) -> list[Path]:
 
 
 def _print_mine_summary(
-    files: list,
+    files_seen: int,
     files_with_text: int,
     files_skipped: int,
     files_errored: int,
@@ -521,7 +523,7 @@ def _print_mine_summary(
     print(f"\n{'=' * 55}")
     print("  Summary")
     print(f"{'-' * 55}")
-    print(f"  Files seen:        {len(files)}")
+    print(f"  Files seen:        {files_seen}")
     print(f"  Files extracted:   {files_with_text}")
     print(f"  Files skipped:     {files_skipped}")
     print(f"  Files errored:     {files_errored}")
@@ -531,6 +533,46 @@ def _print_mine_summary(
         for name, count in sorted(status_counts.items(), key=lambda kv: -kv[1]):
             print(f"    {name:30} {count}")
     print(f"{'=' * 55}\n")
+
+
+def _finalize_format_mine_postloop(*, dry_run, palace_config, wing, palace_path) -> None:
+    """Post-loop finalization for a clean ``mine_formats`` run.
+
+    Factored out of ``mine_formats`` to keep the orchestrator under the
+    project's mccabe complexity ceiling (max-complexity=25 in pyproject.toml).
+    Runs only when every file was processed without interruption. No behavior
+    change.
+
+    Computes cross-wing topic tunnels linking this wing to others that share
+    confirmed topics (mirrors the post-loop tunnel block in
+    ``miner._mine_impl``: tunnel-compute failures must never fail a mine, so any
+    exception is logged and skipped quietly). The host-global
+    ``~/.mempalace/tunnels.json`` write is gated to chroma — on the central,
+    multi-team postgres deployment that single host file is a cross-tenant leak,
+    so the server owns and derives the link layer per team instead. Then runs
+    the end-of-mine FTS5 integrity check (#1537), which raises
+    ``MineValidationError`` to ``cmd_mine`` if ``PRAGMA quick_check`` finds
+    malformed FTS5 rows so a corrupted palace cannot silently exit Done on the
+    ``--mode extract`` path that bypasses ``_mine_impl``.
+    """
+    if not dry_run and palace_config.backend == "chroma":
+        try:
+            tunnels_added = _compute_topic_tunnels_for_wing(wing)
+            if tunnels_added:
+                print(f"\n  Topic tunnels: +{tunnels_added} cross-wing link(s)")
+        except Exception as exc:
+            logger.warning(
+                "mine_formats: topic tunnel computation skipped — %s: %s",
+                type(exc).__name__,
+                str(exc)[:200],
+            )
+            print(
+                f"\n  WARNING: topic tunnel computation skipped — {exc}",
+                file=sys.stderr,
+            )
+
+    if not dry_run:
+        _validate_palace_fts5_after_mine(palace_path)
 
 
 def _register_skip_sentinel_if_appropriate(
@@ -640,8 +682,7 @@ def _file_chunks_locked(
             batch_ids: list = []
             batch_metas: list = []
             for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                key = (source_file + str(chunk["chunk_index"])).encode()
-                drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256(key).hexdigest()[:24]}"
+                drawer_id = make_drawer_id_from_chunk(wing, room, source_file, chunk["chunk_index"])
                 content = chunk["content"]
                 meta: dict = {
                     "wing": wing,
@@ -654,6 +695,7 @@ def _file_chunks_locked(
                     "extract_mode": "format",
                     "normalize_version": NORMALIZE_VERSION,
                     "hall": detect_hall(content),
+                    "id_recipe": ID_RECIPE,
                 }
                 if source_mtime is not None:
                     meta["source_mtime"] = source_mtime
@@ -674,6 +716,7 @@ def _file_chunks_locked(
                 batch_docs.append(content)
                 batch_ids.append(drawer_id)
                 batch_metas.append(meta)
+            assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
             try:
                 collection.upsert(
                     documents=batch_docs,
@@ -786,9 +829,11 @@ def mine_formats(
     files: list = []
     collection = None
     total_drawers = 0
+    files_mined = 0
     files_skipped = 0
     files_with_text = 0
     files_errored = 0
+    files_processed = 0
     status_counts: dict = defaultdict(int)
 
     try:
@@ -796,15 +841,14 @@ def mine_formats(
         # ``~/docs`` and relative inputs work consistently. Per PR #1555 review
         # (Copilot #10).
         files = scan_formats(format_path)
-        if limit > 0:
-            files = files[:limit]
 
         print(f"\n{'=' * 55}")
         print("  MemPalace Mine — Format extraction")
         print(f"{'=' * 55}")
         print(f"  Wing:    {wing}")
         print(f"  Source:  {format_path}")
-        print(f"  Files:   {len(files)}")
+        limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
+        print(f"  Files:   {len(files)}{limit_suffix}")
         print(f"  Palace:  {palace_path}")
         if dry_run:
             print("  DRY RUN — nothing will be filed")
@@ -813,6 +857,7 @@ def mine_formats(
         collection = get_collection(palace_path) if not dry_run else None
 
         for i, filepath in enumerate(files, 1):
+            files_processed = i
             source_file = str(filepath)
 
             # Per-file try/except so one bad file can't crash the whole mine.
@@ -873,6 +918,9 @@ def mine_formats(
                 if dry_run:
                     print(f"    [DRY RUN] {filepath.name} → {len(chunks)} drawers")
                     total_drawers += len(chunks)
+                    files_mined += 1
+                    if limit > 0 and files_mined >= limit:
+                        break
                     continue
 
                 drawers_added, skipped = _file_chunks_locked(
@@ -890,7 +938,10 @@ def mine_formats(
                     continue
 
                 total_drawers += drawers_added
+                files_mined += 1
                 print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
+                if limit > 0 and files_mined >= limit:
+                    break
             except Exception as exc:
                 # Log and continue — one malformed file shouldn't kill the
                 # whole mine. Mirrors miner.py's per-file recovery.
@@ -927,38 +978,14 @@ def mine_formats(
             file=sys.stderr,
         )
     else:
-        # All files processed without interruption — compute cross-wing topic
-        # tunnels linking this wing to others that share confirmed topics.
-        # Mirrors the post-loop tunnel block in miner._mine_impl: tunnel-compute
-        # failures must never fail a mine, so any exception is logged and
-        # skipped quietly. The host-global ``~/.mempalace/tunnels.json`` write is
-        # gated to chroma — on the central, multi-team postgres deployment that
-        # single host file is a cross-tenant leak, so the server owns and
-        # derives the link layer per team instead (mirrors miner._mine_impl).
-        if not dry_run and palace_config.backend == "chroma":
-            try:
-                tunnels_added = _compute_topic_tunnels_for_wing(wing)
-                if tunnels_added:
-                    print(f"\n  Topic tunnels: +{tunnels_added} cross-wing link(s)")
-            except Exception as exc:
-                logger.warning(
-                    "mine_formats: topic tunnel computation skipped — %s: %s",
-                    type(exc).__name__,
-                    str(exc)[:200],
-                )
-                print(
-                    f"\n  WARNING: topic tunnel computation skipped — {exc}",
-                    file=sys.stderr,
-                )
-
-        if not dry_run:
-            # End-of-mine FTS5 integrity check (#1537). Mirrors _mine_impl;
-            # raises MineValidationError to cmd_mine if PRAGMA quick_check
-            # finds malformed FTS5 rows so a corrupted palace cannot silently
-            # exit Done on the --mode extract path that bypasses _mine_impl.
-            # Sits outside the per-file try/except in the for-loop body, so
-            # caught per-file errors do not mask the integrity result.
-            _validate_palace_fts5_after_mine(palace_path)
+        # All files processed without interruption — run the post-loop
+        # finalization (cross-wing topic tunnels + FTS5 integrity check).
+        _finalize_format_mine_postloop(
+            dry_run=dry_run,
+            palace_config=palace_config,
+            wing=wing,
+            palace_path=palace_path,
+        )
     finally:
         # Hook-spawned mines write a PID file that miner.py's
         # _cleanup_mine_pid_file() clears; we mirror that so format-mode
@@ -974,7 +1001,7 @@ def mine_formats(
                 logger.debug("mine_formats: _cleanup_mine_pid_file failed", exc_info=True)
 
     _print_mine_summary(
-        files=files,
+        files_seen=files_processed,
         files_with_text=files_with_text,
         files_skipped=files_skipped,
         files_errored=files_errored,
