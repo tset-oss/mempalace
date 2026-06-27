@@ -208,7 +208,24 @@ def _parse_args():
         default=8765,
         help="HTTP port to bind when --transport=http (default: 8765)",
     )
-    args, unknown = parser.parse_known_args()
+    # This runs at import time (see ``_args = _parse_args()`` below). mcp_server
+    # is also imported as a LIBRARY by mcp_fastmcp for the ``mempalace serve``
+    # central path, where the process argv belongs to the OUTER ``mempalace`` CLI
+    # (e.g. ``serve --transport streamable-http``) and is not meant for this
+    # parser. ``parse_known_args`` tolerates *unknown* flags but still exits the
+    # whole process on an *invalid value of a known* flag (``streamable-http`` is
+    # not in this parser's ``{stdio,http}`` choices). Swallow that and fall back
+    # to defaults so importing this module can never kill the host program. The
+    # ``mempalace-mcp`` entry owns these flags; ``mempalace serve`` configures the
+    # server itself and never relies on this import-time parse.
+    import contextlib
+    import io
+
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            args, unknown = parser.parse_known_args()
+    except SystemExit:
+        return parser.parse_args([])
     if unknown:
         logger.debug("Ignoring unknown args: %s", unknown)
     return args
